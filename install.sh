@@ -334,7 +334,7 @@ else
   prompt POSITION_MODE "Position mode preference (one-way recommended)" "$POSITION_MODE"
 fi
 
-# Baseline config used for optimization seed (most values will be optimized).
+# Baseline config used for optimization seed (most strategy knobs will be optimized).
 TOP_N_BY_VOLUME="${XS_TOP_N_BY_VOLUME:-80}"
 REBALANCE_TIME_UTC="${XS_REBALANCE_TIME_UTC:-00:05}"
 MAX_SPREAD_BPS="${XS_MAX_SPREAD_BPS:-15}"
@@ -360,27 +360,13 @@ else
   KILL_SWITCH_ENABLED_PY="False"
 fi
 
-OPT_FAST="true"
+OPT_FAST="${XS_OPT_FAST:-true}"
+OPT_FAST="${OPT_FAST,,}"
+if [[ "$OPT_FAST" != "true" && "$OPT_FAST" != "false" ]]; then
+  OPT_FAST="true"
+fi
 if [[ $NON_INTERACTIVE -eq 0 ]]; then
-  # We optimize strategy knobs automatically; only ask for high-level universe/risk baselines and optimization depth.
-  prompt TOP_N_BY_VOLUME "Universe top_n_by_volume (used for optimization + live)" "$TOP_N_BY_VOLUME"
-  prompt REBALANCE_TIME_UTC "Rebalance time UTC (HH:MM)" "$REBALANCE_TIME_UTC"
-  prompt MAX_SPREAD_BPS "Live filter max_spread_bps" "$MAX_SPREAD_BPS"
-  prompt MIN_OB_DEPTH_USD "Live filter min_orderbook_depth_usd" "$MIN_OB_DEPTH_USD"
-  prompt DAILY_LOSS_LIMIT_PCT "Risk daily_loss_limit_pct" "$DAILY_LOSS_LIMIT_PCT"
-  prompt MAX_DRAWDOWN_PCT "Risk max_drawdown_pct" "$MAX_DRAWDOWN_PCT"
-  prompt_bool KILL_SWITCH_ENABLED "Enable kill switch?" "$KILL_SWITCH_ENABLED"
-  KILL_SWITCH_ENABLED="${KILL_SWITCH_ENABLED,,}"
-  if [[ "$KILL_SWITCH_ENABLED" != "true" && "$KILL_SWITCH_ENABLED" != "false" ]]; then
-    warn "XS_KILL_SWITCH_ENABLED must be true/false; defaulting to true"
-    KILL_SWITCH_ENABLED="true"
-  fi
-  if [[ "$KILL_SWITCH_ENABLED" == "true" ]]; then
-    KILL_SWITCH_ENABLED_PY="True"
-  else
-    KILL_SWITCH_ENABLED_PY="False"
-  fi
-  prompt_bool OPT_FAST "Run FAST optimization grid (recommended on install)?" "true"
+  prompt_bool OPT_FAST "Run FAST optimization grid (recommended on install)?" "$OPT_FAST"
 fi
 
 ############################
@@ -579,17 +565,17 @@ if [[ "$MODE" == "venv" ]]; then
   # shellcheck disable=SC1091
   source "$PROJECT_DIR/.venv/bin/activate"
   if [[ "${OPT_FAST}" == "true" ]]; then
-    bybit-xsreversal optimize --config "$CONFIG_PATH" --fast
+    bybit-xsreversal --config "$CONFIG_PATH" optimize --fast
   else
-    bybit-xsreversal optimize --config "$CONFIG_PATH"
+    bybit-xsreversal --config "$CONFIG_PATH" optimize
   fi
 else
   # Docker mode: run optimizer inside container using compose if available
   if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     if [[ "${OPT_FAST}" == "true" ]]; then
-      docker compose run --rm bot bash -lc "pip install -e . && bybit-xsreversal optimize --config config/config.yaml --fast"
+      docker compose run --rm bot bash -lc "pip install -e . && bybit-xsreversal --config config/config.yaml optimize --fast"
     else
-      docker compose run --rm bot bash -lc "pip install -e . && bybit-xsreversal optimize --config config/config.yaml"
+      docker compose run --rm bot bash -lc "pip install -e . && bybit-xsreversal --config config/config.yaml optimize"
     fi
   else
     warn "Docker compose not available; skipping optimization in docker mode."

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -38,6 +39,34 @@ def _build_market_data(cfg) -> MarketData:
     client = BybitClient(auth=auth, testnet=cfg.exchange.testnet)
     return MarketData(client=client, config=cfg, cache_dir=cfg.backtest.cache_dir)
 
+def _normalize_argv(argv: list[str]) -> list[str]:
+    """
+    Argparse requires global options (like --config) to appear before the subcommand.
+    Users often run: `bybit-xsreversal optimize --config config/config.yaml`.
+    Make this ergonomic by moving `--config PATH` (and `--log-level LEVEL`) to the front if needed.
+    """
+    if not argv:
+        return argv
+
+    subcmds = {"backtest", "optimize", "live"}
+    if argv[0] not in subcmds:
+        return argv
+
+    out = list(argv)
+    for flag in ("--config", "--log-level"):
+        if flag in out:
+            i = out.index(flag)
+            # Need a value after the flag
+            if i + 1 >= len(out):
+                continue
+            if i > 0:
+                val = out[i + 1]
+                # remove flag+val
+                del out[i : i + 2]
+                # insert at front
+                out = [flag, val] + out
+    return out
+
 
 def main() -> None:
     load_dotenv()
@@ -57,7 +86,8 @@ def main() -> None:
     lv = sub.add_parser("live", help="Run live trader (scheduler)")
     lv.add_argument("--dry-run", action="store_true", help="Print intended orders without placing them")
 
-    args = p.parse_args()
+    argv = _normalize_argv(sys.argv[1:])
+    args = p.parse_args(argv)
 
     cfg = load_config(args.config)
     setup_logging(Path("outputs") / "logs", level=args.log_level)

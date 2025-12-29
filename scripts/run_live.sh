@@ -21,6 +21,6 @@ else
 fi
 
 CFG="${CFG_PATH:-config/config.yaml}"
-exec "$BIN" live --config "$CFG" "$@"
+exec "$BIN" --config "$CFG" live "$@"
 
 

@@ -26,10 +26,17 @@ def _max_drawdown(equity: pd.Series) -> float:
 def _cagr(equity: pd.Series, periods_per_year: int = 365) -> float:
     if len(equity) < 2:
         return 0.0
-    total = float(equity.iloc[-1] / equity.iloc[0])
+    e0 = float(equity.iloc[0])
+    e1 = float(equity.iloc[-1])
+    # Robustness: if equity goes non-positive, CAGR is not well-defined.
+    if e0 <= 0.0 or e1 <= 0.0:
+        return -1.0
+    total = e1 / e0
     years = (len(equity) - 1) / periods_per_year
     if years <= 0:
         return 0.0
+    if total <= 0.0:
+        return -1.0
     return float(total ** (1.0 / years) - 1.0)
 
 

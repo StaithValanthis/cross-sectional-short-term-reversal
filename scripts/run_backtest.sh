@@ -21,6 +21,6 @@ else
 fi
 
 CFG="${CFG_PATH:-config/config.yaml}"
-exec "$BIN" backtest --config "$CFG" "$@"
+exec "$BIN" --config "$CFG" backtest "$@"
 
 

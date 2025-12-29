@@ -58,10 +58,16 @@ def _buffer_days(cfg: BotConfig) -> int:
 
 
 def _calendar_from_any(candles: dict[str, pd.DataFrame], start: datetime, end: datetime) -> pd.DatetimeIndex:
-    idx_sets = [set(df.index) for df in candles.values() if not df.empty]
-    if not idx_sets:
+    """
+    Build a robust daily calendar.
+    Avoid using full intersection across all symbols (too brittle when some symbols have sparse history).
+    Prefer the longest available history among the downloaded candle sets.
+    """
+    non_empty = [df for df in candles.values() if df is not None and not df.empty]
+    if not non_empty:
         return pd.DatetimeIndex([])
-    cal = pd.DatetimeIndex(sorted(set.intersection(*idx_sets)))
+    df_best = max(non_empty, key=lambda d: len(d.index))
+    cal = pd.DatetimeIndex(df_best.index)
     cal = cal[(cal >= start) & (cal <= end)].sort_values()
     return cal
 
@@ -176,7 +182,11 @@ def optimize_config(
             except Exception as e:
                 logger.warning("Market proxy unavailable: {}", e)
 
-        cal = _calendar_from_any(candles, start, end)
+        if market_df is not None and not market_df.empty:
+            cal = market_df.index
+            cal = cal[(cal >= start) & (cal <= end)].sort_values()
+        else:
+            cal = _calendar_from_any(candles, start, end)
         if len(cal) < 30:
             raise ValueError("Not enough aligned daily bars for optimization window.")
 
@@ -194,6 +204,12 @@ def optimize_config(
 
             eq, dr, to = _simulate(cfg=trial, candles=candles, market_df=market_df, calendar=cal)
             m = compute_metrics(eq, dr, to)
+
+            # Hard reject pathological candidates (equity blowups, nonsensical DD)
+            if eq.empty or float(eq.min()) <= 0.0:
+                continue
+            if float(m.max_drawdown) < -0.95:
+                continue
 
             # Objective: Sharpe, with penalty for big drawdown and high turnover
             dd_pen = max(0.0, abs(m.max_drawdown) - (trial.risk.max_drawdown_pct / 100.0))
@@ -214,7 +230,20 @@ def optimize_config(
                 best = (cand, row)
 
         if best is None:
-            raise RuntimeError("No feasible candidate produced a score.")
+            out = Path(output_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "optimization_results.json").write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
+            logger.error(
+                "Optimization found no feasible candidates. Leaving config unchanged. Results: {}",
+                (out / "optimization_results.json").resolve(),
+            )
+            return {
+                "status": "no_feasible_candidate",
+                "output_dir": str(out.resolve()),
+                "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
+                "universe_size": len(symbols),
+                "candidates": len(rows),
+            }
 
         best_cand, best_row = best
 

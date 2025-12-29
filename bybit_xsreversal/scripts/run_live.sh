@@ -2,6 +2,6 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-bybit-xsreversal live --config config/config.yaml
+bybit-xsreversal --config config/config.yaml live
 
 
