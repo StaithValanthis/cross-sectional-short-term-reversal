@@ -25,7 +25,16 @@ def _parse_date(d: str) -> datetime:
 
 def _buffer_days(cfg: BotConfig) -> int:
     rf = cfg.filters.regime_filter
-    return int(max(cfg.sizing.vol_lookback_days + 10, cfg.signal.lookback_days + 5, rf.ema_slow + 20, 40))
+    # Include min_history_days so the first backtest rebalance doesn't throw "Universe too small".
+    return int(
+        max(
+            cfg.sizing.vol_lookback_days + 10,
+            cfg.signal.lookback_days + 5,
+            rf.ema_slow + 20,
+            int(cfg.universe.min_history_days) + 5,
+            40,
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -124,6 +133,7 @@ def run_backtest(cfg: BotConfig, md: MarketData, outputs_dir: str | Path) -> Bac
                     if ser is not None and not ser.empty and day_key in ser.index:
                         fr_today[s] = float(ser.loc[day_key])
 
+        try:
             targets, _snap = compute_targets_from_daily_candles(
                 candles=day_candles,
                 config=cfg,
@@ -133,6 +143,11 @@ def run_backtest(cfg: BotConfig, md: MarketData, outputs_dir: str | Path) -> Bac
                 current_weights=prev_weights,
                 funding_daily_rate=fr_today if fr_today else None,
             )
+        except ValueError as e:
+            if "Universe too small" in str(e):
+                # Hold prior weights; treat as "no rebalance possible today"
+                continue
+            raise
             w = targets.weights
         else:
             w = dict(prev_weights)

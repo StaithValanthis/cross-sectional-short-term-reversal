@@ -72,7 +72,17 @@ def _ensure_backtest_range(cfg: BotConfig) -> tuple[datetime, datetime]:
 
 def _buffer_days(cfg: BotConfig) -> int:
     rf = cfg.filters.regime_filter
-    return int(max(cfg.sizing.vol_lookback_days + 10, cfg.signal.lookback_days + 5, rf.ema_slow + 20, 40))
+    # Must include enough pre-history to satisfy cfg.universe.min_history_days,
+    # otherwise the first rebalance day will produce an empty universe and stage2 rejects all candidates.
+    return int(
+        max(
+            cfg.sizing.vol_lookback_days + 10,
+            cfg.signal.lookback_days + 5,
+            rf.ema_slow + 20,
+            int(cfg.universe.min_history_days) + 5,
+            40,
+        )
+    )
 
 
 def _calendar_from_any(candles: dict[str, pd.DataFrame], start: datetime, end: datetime) -> pd.DatetimeIndex:
@@ -217,6 +227,12 @@ def _simulate_candidate_full(
                 funding_daily_rate=fr_today if fr_today else None,
             )
             w = targets.weights
+        except ValueError as e:
+            # Robustness: if this particular day has too few eligible symbols (e.g. sparse history),
+            # just hold current weights and continue rather than rejecting the entire candidate.
+            if "Universe too small" in str(e):
+                continue
+            raise
         else:
             w = dict(prev_w)
         syms = set(prev_w) | set(w)
