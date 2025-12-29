@@ -776,6 +776,70 @@ def optimize_config(
             ) as p2:
                 t2 = p2.add_task("stage2", total=len(stage2_candidates), best_sharpe="n/a", best_dd="n/a", best_cagr="n/a")
                 for cand2 in stage2_candidates:
+                    try:
+                        trial = cfg.model_copy(deep=True)
+                        trial.signal.lookback_days = int(cand2.lookback_days)  # type: ignore[assignment]
+                        trial.signal.long_quantile = float(cand2.long_quantile)
+                        trial.signal.short_quantile = float(cand2.short_quantile)
+                        trial.sizing.target_gross_leverage = float(cand2.target_gross_leverage)
+                        trial.sizing.vol_lookback_days = int(cand2.vol_lookback_days)
+                        trial.rebalance.time_utc = str(cand2.rebalance_time_utc)
+                        trial.rebalance.interval_days = int(cand2.interval_days)
+                        trial.rebalance.rebalance_fraction = float(cand2.rebalance_fraction)
+                        trial.rebalance.min_weight_change_bps = float(cand2.min_weight_change_bps)
+                        trial.filters.regime_filter.action = str(cand2.regime_action)  # type: ignore[assignment]
+                        trial.funding.filter.enabled = bool(cand2.funding_filter_enabled)
+                        trial.funding.filter.max_abs_daily_funding_rate = float(cand2.funding_max_abs_daily_rate)
+
+                        eq2, dr2, to2 = _simulate_candidate_full(cfg=trial, candles=candles, market_df=market_df, calendar=cal, funding_daily=funding_daily)
+                        m2 = compute_metrics(eq2, dr2, to2)
+                        row2 = {
+                            "candidate": cand2.__dict__,
+                            "sharpe": m2.sharpe,
+                            "cagr": m2.cagr,
+                            "max_drawdown": m2.max_drawdown,
+                            "avg_daily_turnover": m2.avg_daily_turnover,
+                        }
+                        stage2_rows.append(row2)
+                        key2 = (-float(m2.sharpe), -float(m2.cagr), abs(float(m2.max_drawdown)), float(m2.avg_daily_turnover))
+                        if stage2_best_key is None or key2 < stage2_best_key:
+                            stage2_best_key = key2
+                            stage2_best = (cand2, row2)
+                            p2.update(
+                                t2,
+                                best_sharpe=fmt_or_na(float(row2.get("sharpe", float("nan"))), ".3f"),
+                                best_dd=fmt_or_na(float(row2.get("max_drawdown", float("nan"))), ".2%"),
+                                best_cagr=fmt_or_na(float(row2.get("cagr", float("nan"))), ".2%"),
+                            )
+                    except (ValueError, KeyError, IndexError) as e:
+                        logger.debug("Stage2 candidate {} rejected: {}", cand2.__dict__, e)
+                        row2 = {
+                            "candidate": cand2.__dict__,
+                            "rejected": True,
+                            "error": str(e),
+                            "sharpe": float("nan"),
+                            "cagr": float("nan"),
+                            "max_drawdown": float("nan"),
+                            "avg_daily_turnover": float("nan"),
+                        }
+                        stage2_rows.append(row2)
+                    except Exception as e:
+                        logger.warning("Stage2 candidate {} failed with unexpected error: {}", cand2.__dict__, e)
+                        row2 = {
+                            "candidate": cand2.__dict__,
+                            "rejected": True,
+                            "error": str(e),
+                            "sharpe": float("nan"),
+                            "cagr": float("nan"),
+                            "max_drawdown": float("nan"),
+                            "avg_daily_turnover": float("nan"),
+                        }
+                        stage2_rows.append(row2)
+                    finally:
+                        p2.advance(t2, 1)
+        else:
+            for cand2 in stage2_candidates:
+                try:
                     trial = cfg.model_copy(deep=True)
                     trial.signal.lookback_days = int(cand2.lookback_days)  # type: ignore[assignment]
                     trial.signal.long_quantile = float(cand2.long_quantile)
@@ -804,51 +868,40 @@ def optimize_config(
                     if stage2_best_key is None or key2 < stage2_best_key:
                         stage2_best_key = key2
                         stage2_best = (cand2, row2)
-                        p2.update(
-                            t2,
-                            best_sharpe=fmt_or_na(float(row2.get("sharpe", float("nan"))), ".3f"),
-                            best_dd=fmt_or_na(float(row2.get("max_drawdown", float("nan"))), ".2%"),
-                            best_cagr=fmt_or_na(float(row2.get("cagr", float("nan"))), ".2%"),
-                        )
-                    p2.advance(t2, 1)
-        else:
-            for cand2 in stage2_candidates:
-                trial = cfg.model_copy(deep=True)
-                trial.signal.lookback_days = int(cand2.lookback_days)  # type: ignore[assignment]
-                trial.signal.long_quantile = float(cand2.long_quantile)
-                trial.signal.short_quantile = float(cand2.short_quantile)
-                trial.sizing.target_gross_leverage = float(cand2.target_gross_leverage)
-                trial.sizing.vol_lookback_days = int(cand2.vol_lookback_days)
-                trial.rebalance.time_utc = str(cand2.rebalance_time_utc)
-                trial.rebalance.interval_days = int(cand2.interval_days)
-                trial.rebalance.rebalance_fraction = float(cand2.rebalance_fraction)
-                trial.rebalance.min_weight_change_bps = float(cand2.min_weight_change_bps)
-                trial.filters.regime_filter.action = str(cand2.regime_action)  # type: ignore[assignment]
-                trial.funding.filter.enabled = bool(cand2.funding_filter_enabled)
-                trial.funding.filter.max_abs_daily_funding_rate = float(cand2.funding_max_abs_daily_rate)
-
-                eq2, dr2, to2 = _simulate_candidate_full(cfg=trial, candles=candles, market_df=market_df, calendar=cal, funding_daily=funding_daily)
-                m2 = compute_metrics(eq2, dr2, to2)
-                row2 = {
-                    "candidate": cand2.__dict__,
-                    "sharpe": m2.sharpe,
-                    "cagr": m2.cagr,
-                    "max_drawdown": m2.max_drawdown,
-                    "avg_daily_turnover": m2.avg_daily_turnover,
-                }
-                stage2_rows.append(row2)
-                key2 = (-float(m2.sharpe), -float(m2.cagr), abs(float(m2.max_drawdown)), float(m2.avg_daily_turnover))
-                if stage2_best_key is None or key2 < stage2_best_key:
-                    stage2_best_key = key2
-                    stage2_best = (cand2, row2)
+                except (ValueError, KeyError, IndexError) as e:
+                    logger.debug("Stage2 candidate {} rejected: {}", cand2.__dict__, e)
+                    row2 = {
+                        "candidate": cand2.__dict__,
+                        "rejected": True,
+                        "error": str(e),
+                        "sharpe": float("nan"),
+                        "cagr": float("nan"),
+                        "max_drawdown": float("nan"),
+                        "avg_daily_turnover": float("nan"),
+                    }
+                    stage2_rows.append(row2)
+                except Exception as e:
+                    logger.warning("Stage2 candidate {} failed with unexpected error: {}", cand2.__dict__, e)
+                    row2 = {
+                        "candidate": cand2.__dict__,
+                        "rejected": True,
+                        "error": str(e),
+                        "sharpe": float("nan"),
+                        "cagr": float("nan"),
+                        "max_drawdown": float("nan"),
+                        "avg_daily_turnover": float("nan"),
+                    }
+                    stage2_rows.append(row2)
 
         (out / "stage2_results.json").write_text(json.dumps(stage2_rows, indent=2, sort_keys=True), encoding="utf-8")
 
+        # Use Stage 2 best if available, otherwise fall back to Stage 1
         if stage2_best is not None:
             best_cand, best_row = stage2_best
             logger.info("Stage2 selected best candidate based on full backtest metrics.")
         else:
             logger.warning("Stage2 had no results; falling back to stage1 selection.")
+            # best_cand and best_row are already set from Stage 1 above
 
         # Helpful transparency: show top-by-sharpe in logs (stage2 if available).
         try:
