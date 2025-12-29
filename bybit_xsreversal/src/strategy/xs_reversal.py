@@ -263,7 +263,9 @@ def compute_targets_from_daily_candles(
     )
 
     if not notionals:
-        logger.warning("All targets filtered out; no notionals to trade.")
+        # This can be normal (e.g., min notional filter, partial-rebalance threshold, regime scaling).
+        # Keep it at DEBUG to avoid flooding logs during backtests/optimization.
+        logger.debug("All targets filtered out; no notionals to trade.")
 
     return PortfolioTargets(weights=final_weights, notionals_usd=notionals, meta=meta), snap
 

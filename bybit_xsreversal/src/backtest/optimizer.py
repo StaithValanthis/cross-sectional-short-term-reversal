@@ -839,7 +839,9 @@ def optimize_config(
 
                         eq2, dr2, to2 = _simulate_candidate_full(cfg=trial, candles=candles_stage2, market_df=market_df, calendar=cal, funding_daily=funding_daily)
                         m2 = compute_metrics(eq2, dr2, to2)
-                        if eq2.empty or dr2.empty or not _metrics_ok(m2):
+                        # Reject degenerate curves: if we barely traded / produced too few daily points,
+                        # annualized metrics (especially CAGR) can become meaningless.
+                        if eq2.empty or dr2.empty or len(eq2) < 90 or len(dr2) < 90 or not _metrics_ok(m2):
                             raise ValueError("stage2_invalid_metrics")
                         key2 = (-float(m2.sharpe), -float(m2.cagr), abs(float(m2.max_drawdown)), float(m2.avg_daily_turnover))
                         row2 = {
@@ -917,7 +919,7 @@ def optimize_config(
 
                     eq2, dr2, to2 = _simulate_candidate_full(cfg=trial, candles=candles_stage2, market_df=market_df, calendar=cal, funding_daily=funding_daily)
                     m2 = compute_metrics(eq2, dr2, to2)
-                    if eq2.empty or dr2.empty or not _metrics_ok(m2):
+                    if eq2.empty or dr2.empty or len(eq2) < 90 or len(dr2) < 90 or not _metrics_ok(m2):
                         raise ValueError("stage2_invalid_metrics")
                     key2 = (-float(m2.sharpe), -float(m2.cagr), abs(float(m2.max_drawdown)), float(m2.avg_daily_turnover))
                     row2 = {
