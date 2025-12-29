@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -163,7 +164,18 @@ def optimize_config(
     fetch_start = start - timedelta(days=buf)
     fetch_end = end + timedelta(days=2)
 
-    client = BybitClient(auth=None, testnet=cfg.exchange.testnet)
+    # Optimization should generally use MAINNET historical data even if you trade on testnet.
+    # Some testnet instruments have sparse/absent history, which makes optimization unreliable.
+    opt_testnet_env = os.getenv("BYBIT_OPT_TESTNET", "").strip().lower()
+    if opt_testnet_env in ("1", "true", "yes", "y"):
+        data_testnet = True
+    elif opt_testnet_env in ("0", "false", "no", "n"):
+        data_testnet = False
+    else:
+        data_testnet = False
+    client = BybitClient(auth=None, testnet=data_testnet)
+    if data_testnet != cfg.exchange.testnet:
+        logger.warning("Optimizer using testnet={} for market data (trading testnet={})", data_testnet, cfg.exchange.testnet)
     md = MarketData(client=client, config=cfg, cache_dir=cfg.backtest.cache_dir)
     try:
         symbols = md.get_liquidity_ranked_symbols()
