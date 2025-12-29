@@ -5,9 +5,19 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+#
+# NOTE: This file is a TEMPLATE.
+# The installer (`install.sh`) will generate a concrete unit at:
+#   /etc/systemd/system/bybit_xsreversal.service
+# with the correct WorkingDirectory/EnvironmentFile/ExecStart for your install path.
+#
+# If you install manually, set these to your actual PROJECT_DIR:
+# WorkingDirectory=/home/ubuntu/cross-sectional-short-term-reversal/bybit_xsreversal
+# EnvironmentFile=/home/ubuntu/cross-sectional-short-term-reversal/bybit_xsreversal/.env
+# ExecStart=/home/ubuntu/cross-sectional-short-term-reversal/bybit_xsreversal/.venv/bin/bybit-xsreversal --config /home/ubuntu/cross-sectional-short-term-reversal/bybit_xsreversal/config/config.yaml live
 WorkingDirectory=/opt/bybit_xsreversal/bybit_xsreversal
 EnvironmentFile=/opt/bybit_xsreversal/bybit_xsreversal/.env
-ExecStart=/opt/bybit_xsreversal/bybit_xsreversal/.venv/bin/bybit-xsreversal live --config config/config.yaml
+ExecStart=/opt/bybit_xsreversal/bybit_xsreversal/.venv/bin/bybit-xsreversal --config /opt/bybit_xsreversal/bybit_xsreversal/config/config.yaml live
 Restart=on-failure
 RestartSec=5
 

@@ -606,7 +606,32 @@ if [[ "$SYSTEMD_INSTALL" == "true" ]]; then
   local_unit="/etc/systemd/system/bybit_xsreversal.service"
   log "Installing systemd unit to $local_unit"
   sudo mkdir -p /etc/systemd/system
-  sudo cp "$ROOT_DIR/systemd/bybit_xsreversal.service" "$local_unit"
+  # Generate a concrete unit with correct absolute paths for this install.
+  # The template under systemd/ is informational; do not copy it verbatim.
+  sudo tee "$local_unit" >/dev/null <<UNIT
+[Unit]
+Description=Bybit XS Reversal Bot (daily rebalance)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${USER}
+Group=${USER}
+WorkingDirectory=${PROJECT_DIR}
+EnvironmentFile=${ENV_PATH}
+Environment=PYTHONUNBUFFERED=1
+ExecStart=${PROJECT_DIR}/.venv/bin/bybit-xsreversal --config ${CONFIG_PATH} live
+Restart=on-failure
+RestartSec=5
+
+# Light hardening (safe for installs under /home/*)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
   sudo systemctl daemon-reload
   if [[ $ASSUME_YES -eq 1 ]]; then
     sudo systemctl enable --now bybit_xsreversal.service || true
