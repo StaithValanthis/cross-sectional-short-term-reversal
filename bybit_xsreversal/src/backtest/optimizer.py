@@ -610,10 +610,6 @@ def optimize_config(
             cal = _calendar_from_any(candles, start, end)
         if len(cal) < 30:
             raise ValueError("Not enough aligned daily bars for optimization window.")
-        # For stage2, use calendar based on the optimization symbol subset (more stable).
-        cal_stage2 = _calendar_from_any(candles_stage2, start, end)
-        if len(cal_stage2) >= 30:
-            cal = cal_stage2
 
         # Prepare data matrix once for fast candidate evaluation
         # Use candidate-independent history requirement based on max LB
@@ -622,6 +618,11 @@ def optimize_config(
         opt_symbols = list(close.columns) if close is not None and not close.empty else list(candles.keys())
         # Keep stage2 universe consistent with stage1 (reduces sparse-history issues in stage2)
         candles_stage2 = {s: candles[s] for s in opt_symbols if s in candles and candles[s] is not None and not candles[s].empty}
+
+        # For stage2, use calendar based on the optimization symbol subset (more stable).
+        cal_stage2 = _calendar_from_any(candles_stage2, start, end)
+        if len(cal_stage2) >= 30:
+            cal = cal_stage2
 
         # Funding daily rates cache for stage2 (and for optional funding filter)
         funding_daily: dict[str, pd.Series] = {}
