@@ -82,6 +82,7 @@ def main() -> None:
     opt = sub.add_parser("optimize", help="Optimize strategy parameters (small grid search) and write best back to config.yaml")
     opt.add_argument("--output-dir", default=None, help="Output directory (default outputs/optimize/<ts>)")
     opt.add_argument("--fast", action="store_true", help="Run a smaller/faster grid")
+    opt.add_argument("--no-progress", action="store_true", help="Disable progress bar/ETA output")
 
     lv = sub.add_parser("live", help="Run live trader (scheduler)")
     lv.add_argument("--dry-run", action="store_true", help="Print intended orders without placing them")
@@ -104,7 +105,7 @@ def main() -> None:
 
     if args.cmd == "optimize":
         out_dir = Path(args.output_dir) if args.output_dir else _ts_dir(Path("outputs") / "optimize")
-        optimize_config(config_path=args.config, output_dir=out_dir, fast=bool(args.fast))
+        optimize_config(config_path=args.config, output_dir=out_dir, fast=bool(args.fast), show_progress=not bool(args.no_progress))
         logger.info("Config updated: {}", Path(args.config).resolve())
         return
 

@@ -11,6 +11,15 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 from loguru import logger
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 
 from src.backtest.metrics import compute_metrics
 from src.config import BotConfig, load_config, load_yaml_config
@@ -154,6 +163,7 @@ def optimize_config(
     config_path: str | Path,
     output_dir: str | Path,
     fast: bool,
+    show_progress: bool = True,
 ) -> dict[str, Any]:
     """
     Optimize a small parameter grid and write best params back to config.yaml.
@@ -207,40 +217,101 @@ def optimize_config(
         best_score = -float("inf")
         rows: list[dict[str, Any]] = []
 
-        for cand in _candidates(fast=fast, default_time_utc=cfg.rebalance.time_utc):
-            trial = cfg.model_copy(deep=True)
-            trial.signal.lookback_days = int(cand.lookback_days)  # type: ignore[assignment]
-            trial.signal.long_quantile = float(cand.long_quantile)
-            trial.signal.short_quantile = float(cand.short_quantile)
-            trial.sizing.target_gross_leverage = float(cand.target_gross_leverage)
-            trial.rebalance.time_utc = str(cand.rebalance_time_utc)
+        candidates = list(_candidates(fast=fast, default_time_utc=cfg.rebalance.time_utc))
 
-            eq, dr, to = _simulate(cfg=trial, candles=candles, market_df=market_df, calendar=cal)
-            m = compute_metrics(eq, dr, to)
+        # Progress bar + ETA
+        progress_ctx = (
+            Progress(
+                SpinnerColumn(),
+                TextColumn("[bold]optimize[/bold]"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+                TextColumn("best_sharpe={task.fields[best_sharpe]}"),
+                TextColumn("best_dd={task.fields[best_dd]}"),
+                transient=False,
+            )
+            if show_progress
+            else None
+        )
 
-            # Hard reject pathological candidates (equity blowups, nonsensical DD)
-            if eq.empty or float(eq.min()) <= 0.0:
-                continue
-            if float(m.max_drawdown) < -0.95:
-                continue
+        def fmt_or_na(x: float | None, fmt: str) -> str:
+            if x is None or not np.isfinite(x):
+                return "n/a"
+            return format(float(x), fmt)
 
-            # Objective: Sharpe, with penalty for big drawdown and high turnover
-            dd_pen = max(0.0, abs(m.max_drawdown) - (trial.risk.max_drawdown_pct / 100.0))
-            score = float(m.sharpe) - 2.0 * float(dd_pen) - 0.1 * float(m.avg_daily_turnover)
+        if progress_ctx is None:
+            task_id = None
+        else:
+            progress_ctx.start()
+            task_id = progress_ctx.add_task(
+                "optimize",
+                total=len(candidates),
+                best_sharpe="n/a",
+                best_dd="n/a",
+            )
 
-            row = {
-                "candidate": cand.__dict__,
-                "score": score,
-                "sharpe": m.sharpe,
-                "cagr": m.cagr,
-                "max_drawdown": m.max_drawdown,
-                "avg_daily_turnover": m.avg_daily_turnover,
-            }
-            rows.append(row)
+        try:
+            for cand in candidates:
+                trial = cfg.model_copy(deep=True)
+                trial.signal.lookback_days = int(cand.lookback_days)  # type: ignore[assignment]
+                trial.signal.long_quantile = float(cand.long_quantile)
+                trial.signal.short_quantile = float(cand.short_quantile)
+                trial.sizing.target_gross_leverage = float(cand.target_gross_leverage)
+                trial.rebalance.time_utc = str(cand.rebalance_time_utc)
 
-            if score > best_score and np.isfinite(score):
-                best_score = score
-                best = (cand, row)
+                eq, dr, to = _simulate(cfg=trial, candles=candles, market_df=market_df, calendar=cal)
+                m = compute_metrics(eq, dr, to)
+
+                # Record candidate metrics even if rejected (for debugging)
+                row = {
+                    "candidate": cand.__dict__,
+                    "sharpe": m.sharpe,
+                    "cagr": m.cagr,
+                    "max_drawdown": m.max_drawdown,
+                    "avg_daily_turnover": m.avg_daily_turnover,
+                    "rejected": False,
+                    "reject_reason": None,
+                }
+
+                # Hard reject pathological candidates (equity blowups, nonsensical DD)
+                if eq.empty or float(eq.min()) <= 0.0:
+                    row["rejected"] = True
+                    row["reject_reason"] = "equity_non_positive_or_empty"
+                    rows.append(row)
+                    if progress_ctx is not None and task_id is not None:
+                        progress_ctx.advance(task_id, 1)
+                    continue
+                if float(m.max_drawdown) < -0.95:
+                    row["rejected"] = True
+                    row["reject_reason"] = "max_dd_too_large"
+                    rows.append(row)
+                    if progress_ctx is not None and task_id is not None:
+                        progress_ctx.advance(task_id, 1)
+                    continue
+
+                # Objective: Sharpe, with penalty for big drawdown and high turnover
+                dd_pen = max(0.0, abs(m.max_drawdown) - (trial.risk.max_drawdown_pct / 100.0))
+                score = float(m.sharpe) - 2.0 * float(dd_pen) - 0.1 * float(m.avg_daily_turnover)
+                row["score"] = score
+                rows.append(row)
+
+                if score > best_score and np.isfinite(score):
+                    best_score = score
+                    best = (cand, row)
+                    if progress_ctx is not None and task_id is not None:
+                        progress_ctx.update(
+                            task_id,
+                            best_sharpe=fmt_or_na(float(row.get("sharpe", float("nan"))), ".3f"),
+                            best_dd=fmt_or_na(float(row.get("max_drawdown", float("nan"))), ".2%"),
+                        )
+
+                if progress_ctx is not None and task_id is not None:
+                    progress_ctx.advance(task_id, 1)
+        finally:
+            if progress_ctx is not None:
+                progress_ctx.stop()
 
         if best is None:
             out = Path(output_dir)
@@ -259,6 +330,35 @@ def optimize_config(
             }
 
         best_cand, best_row = best
+
+        # Guardrail: don't write params that are statistically/financially "worse than nothing".
+        # Default: reject negative Sharpe (BYBIT_OPT_MIN_SHARPE=0.0).
+        min_sharpe_env = os.getenv("BYBIT_OPT_MIN_SHARPE", "").strip()
+        try:
+            min_sharpe = float(min_sharpe_env) if min_sharpe_env else 0.0
+        except Exception:
+            min_sharpe = 0.0
+        best_sharpe = float(best_row.get("sharpe", 0.0))
+        if not np.isfinite(best_sharpe) or best_sharpe < min_sharpe:
+            out = Path(output_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "optimization_results.json").write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
+            (out / "best.json").write_text(json.dumps(best_row, indent=2, sort_keys=True), encoding="utf-8")
+            logger.warning(
+                "Optimizer best Sharpe {:.3f} < min {:.3f}; leaving config unchanged. Best: {}",
+                best_sharpe,
+                min_sharpe,
+                (out / "best.json").resolve(),
+            )
+            return {
+                "status": "rejected_by_threshold",
+                "min_sharpe": min_sharpe,
+                "best": best_row,
+                "output_dir": str(out.resolve()),
+                "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
+                "universe_size": len(symbols),
+                "candidates": len(rows),
+            }
 
         # Patch config.yaml (deep merge)
         raw = load_yaml_config(config_path)

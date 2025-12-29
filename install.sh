@@ -456,9 +456,17 @@ payload = {
   "universe": {
     "top_n_by_volume": int(${TOP_N_BY_VOLUME}),
   },
-  # signal/sizing fields will be optimized; we only seed minimal defaults
+  # signal/sizing fields will be optimized; seed sane defaults so the bot is runnable even if optimization is rejected
+  "signal": {
+    "lookback_days": int(${SEED_LOOKBACK_DAYS}),
+    "long_quantile": float(${SEED_LONG_Q}),
+    "short_quantile": float(${SEED_SHORT_Q}),
+  },
   "rebalance": {
     "time_utc": "${REBALANCE_TIME_UTC}",
+  },
+  "sizing": {
+    "target_gross_leverage": float(${SEED_TARGET_GROSS_LEVERAGE}),
   },
   "filters": {
     "max_spread_bps": float(${MAX_SPREAD_BPS}),
@@ -566,6 +574,8 @@ if [[ "$MODE" == "venv" ]]; then
   source "$PROJECT_DIR/.venv/bin/activate"
   # Use a shorter rolling window on install to ensure enough symbols have history.
   export BYBIT_OPT_WINDOW_DAYS="${BYBIT_OPT_WINDOW_DAYS:-180}"
+  # Reject negative Sharpe on install so we don't overwrite defaults with worse params.
+  export BYBIT_OPT_MIN_SHARPE="${BYBIT_OPT_MIN_SHARPE:-0.0}"
   if [[ "${OPT_FAST}" == "true" ]]; then
     bybit-xsreversal --config "$CONFIG_PATH" optimize --fast
   else
@@ -575,9 +585,9 @@ else
   # Docker mode: run optimizer inside container using compose if available
   if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     if [[ "${OPT_FAST}" == "true" ]]; then
-      docker compose run --rm bot bash -lc "export BYBIT_OPT_WINDOW_DAYS=${BYBIT_OPT_WINDOW_DAYS:-180} && pip install -e . && bybit-xsreversal --config config/config.yaml optimize --fast"
+      docker compose run --rm bot bash -lc "export BYBIT_OPT_WINDOW_DAYS=${BYBIT_OPT_WINDOW_DAYS:-180} BYBIT_OPT_MIN_SHARPE=${BYBIT_OPT_MIN_SHARPE:-0.0} && pip install -e . && bybit-xsreversal --config config/config.yaml optimize --fast"
     else
-      docker compose run --rm bot bash -lc "export BYBIT_OPT_WINDOW_DAYS=${BYBIT_OPT_WINDOW_DAYS:-180} && pip install -e . && bybit-xsreversal --config config/config.yaml optimize"
+      docker compose run --rm bot bash -lc "export BYBIT_OPT_WINDOW_DAYS=${BYBIT_OPT_WINDOW_DAYS:-180} BYBIT_OPT_MIN_SHARPE=${BYBIT_OPT_MIN_SHARPE:-0.0} && pip install -e . && bybit-xsreversal --config config/config.yaml optimize"
     fi
   else
     warn "Docker compose not available; skipping optimization in docker mode."
