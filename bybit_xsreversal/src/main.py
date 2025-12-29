@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from src.backtest.backtester import run_backtest
+from src.backtest.optimizer import optimize_config
 from src.config import load_config
 from src.data.bybit_client import BybitAuth, BybitClient
 from src.data.market_data import MarketData
@@ -49,6 +50,10 @@ def main() -> None:
     bt = sub.add_parser("backtest", help="Run backtest")
     bt.add_argument("--output-dir", default=None, help="Output directory (default outputs/backtest/<ts>)")
 
+    opt = sub.add_parser("optimize", help="Optimize strategy parameters (small grid search) and write best back to config.yaml")
+    opt.add_argument("--output-dir", default=None, help="Output directory (default outputs/optimize/<ts>)")
+    opt.add_argument("--fast", action="store_true", help="Run a smaller/faster grid")
+
     lv = sub.add_parser("live", help="Run live trader (scheduler)")
     lv.add_argument("--dry-run", action="store_true", help="Print intended orders without placing them")
 
@@ -65,6 +70,12 @@ def main() -> None:
             run_backtest(cfg, md, out_dir)
         finally:
             md.client.close()
+        return
+
+    if args.cmd == "optimize":
+        out_dir = Path(args.output_dir) if args.output_dir else _ts_dir(Path("outputs") / "optimize")
+        optimize_config(config_path=args.config, output_dir=out_dir, fast=bool(args.fast))
+        logger.info("Config updated: {}", Path(args.config).resolve())
         return
 
     if args.cmd == "live":

@@ -38,8 +38,8 @@ Non-interactive env vars (recommended):
   BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET
 
 Optional env overrides for config (non-interactive):
-  XS_TOP_N_BY_VOLUME, XS_LOOKBACK_DAYS, XS_LONG_Q, XS_SHORT_Q, XS_REBALANCE_TIME_UTC
-  XS_TARGET_GROSS_LEVERAGE, XS_MAX_SPREAD_BPS, XS_MIN_ORDERBOOK_DEPTH_USD
+  XS_TOP_N_BY_VOLUME, XS_REBALANCE_TIME_UTC
+  XS_MAX_SPREAD_BPS, XS_MIN_ORDERBOOK_DEPTH_USD
   XS_DAILY_LOSS_LIMIT_PCT, XS_MAX_DRAWDOWN_PCT, XS_KILL_SWITCH_ENABLED
 USAGE
 }
@@ -293,9 +293,29 @@ BYBIT_TESTNET="${BYBIT_TESTNET:-true}"
 if [[ -n "$FORCE_TESTNET" ]]; then
   BYBIT_TESTNET="$FORCE_TESTNET"
 fi
+BYBIT_TESTNET="${BYBIT_TESTNET,,}"
+if [[ "$BYBIT_TESTNET" != "true" && "$BYBIT_TESTNET" != "false" ]]; then
+  warn "BYBIT_TESTNET must be true/false; defaulting to true"
+  BYBIT_TESTNET="true"
+fi
+if [[ "$BYBIT_TESTNET" == "true" ]]; then
+  BYBIT_TESTNET_PY="True"
+else
+  BYBIT_TESTNET_PY="False"
+fi
 
 if [[ $NON_INTERACTIVE -eq 0 ]]; then
   prompt_bool BYBIT_TESTNET "Use Bybit testnet?" "$BYBIT_TESTNET"
+  BYBIT_TESTNET="${BYBIT_TESTNET,,}"
+  if [[ "$BYBIT_TESTNET" != "true" && "$BYBIT_TESTNET" != "false" ]]; then
+    warn "BYBIT_TESTNET must be true/false; defaulting to true"
+    BYBIT_TESTNET="true"
+  fi
+  if [[ "$BYBIT_TESTNET" == "true" ]]; then
+    BYBIT_TESTNET_PY="True"
+  else
+    BYBIT_TESTNET_PY="False"
+  fi
 fi
 
 BYBIT_API_KEY="${BYBIT_API_KEY:-}"
@@ -314,33 +334,53 @@ else
   prompt POSITION_MODE "Position mode preference (one-way recommended)" "$POSITION_MODE"
 fi
 
-# Strategy + risk prompts
+# Baseline config used for optimization seed (most values will be optimized).
 TOP_N_BY_VOLUME="${XS_TOP_N_BY_VOLUME:-80}"
-LOOKBACK_DAYS="${XS_LOOKBACK_DAYS:-1}"
-LONG_Q="${XS_LONG_Q:-0.1}"
-SHORT_Q="${XS_SHORT_Q:-0.1}"
 REBALANCE_TIME_UTC="${XS_REBALANCE_TIME_UTC:-00:05}"
-TARGET_GROSS_LEVERAGE="${XS_TARGET_GROSS_LEVERAGE:-1.0}"
 MAX_SPREAD_BPS="${XS_MAX_SPREAD_BPS:-15}"
 MIN_OB_DEPTH_USD="${XS_MIN_ORDERBOOK_DEPTH_USD:-50000}"
+
+# Seeds used only if we must generate a brand new config (e.g., PyYAML missing in docker-mode host python).
+SEED_LOOKBACK_DAYS="${XS_SEED_LOOKBACK_DAYS:-1}"
+SEED_LONG_Q="${XS_SEED_LONG_Q:-0.1}"
+SEED_SHORT_Q="${XS_SEED_SHORT_Q:-0.1}"
+SEED_TARGET_GROSS_LEVERAGE="${XS_SEED_TARGET_GROSS_LEVERAGE:-1.0}"
 
 DAILY_LOSS_LIMIT_PCT="${XS_DAILY_LOSS_LIMIT_PCT:-2.0}"
 MAX_DRAWDOWN_PCT="${XS_MAX_DRAWDOWN_PCT:-20.0}"
 KILL_SWITCH_ENABLED="${XS_KILL_SWITCH_ENABLED:-true}"
+KILL_SWITCH_ENABLED="${KILL_SWITCH_ENABLED,,}"
+if [[ "$KILL_SWITCH_ENABLED" != "true" && "$KILL_SWITCH_ENABLED" != "false" ]]; then
+  warn "XS_KILL_SWITCH_ENABLED must be true/false; defaulting to true"
+  KILL_SWITCH_ENABLED="true"
+fi
+if [[ "$KILL_SWITCH_ENABLED" == "true" ]]; then
+  KILL_SWITCH_ENABLED_PY="True"
+else
+  KILL_SWITCH_ENABLED_PY="False"
+fi
 
+OPT_FAST="true"
 if [[ $NON_INTERACTIVE -eq 0 ]]; then
-  prompt TOP_N_BY_VOLUME "Universe top_n_by_volume" "$TOP_N_BY_VOLUME"
-  prompt LOOKBACK_DAYS "Signal lookback_days (1/2/3/5)" "$LOOKBACK_DAYS"
-  prompt LONG_Q "Signal long_quantile" "$LONG_Q"
-  prompt SHORT_Q "Signal short_quantile" "$SHORT_Q"
+  # We optimize strategy knobs automatically; only ask for high-level universe/risk baselines and optimization depth.
+  prompt TOP_N_BY_VOLUME "Universe top_n_by_volume (used for optimization + live)" "$TOP_N_BY_VOLUME"
   prompt REBALANCE_TIME_UTC "Rebalance time UTC (HH:MM)" "$REBALANCE_TIME_UTC"
-  prompt TARGET_GROSS_LEVERAGE "Sizing target_gross_leverage" "$TARGET_GROSS_LEVERAGE"
-  prompt MAX_SPREAD_BPS "Filters max_spread_bps" "$MAX_SPREAD_BPS"
-  prompt MIN_OB_DEPTH_USD "Filters min_orderbook_depth_usd" "$MIN_OB_DEPTH_USD"
-
+  prompt MAX_SPREAD_BPS "Live filter max_spread_bps" "$MAX_SPREAD_BPS"
+  prompt MIN_OB_DEPTH_USD "Live filter min_orderbook_depth_usd" "$MIN_OB_DEPTH_USD"
   prompt DAILY_LOSS_LIMIT_PCT "Risk daily_loss_limit_pct" "$DAILY_LOSS_LIMIT_PCT"
   prompt MAX_DRAWDOWN_PCT "Risk max_drawdown_pct" "$MAX_DRAWDOWN_PCT"
   prompt_bool KILL_SWITCH_ENABLED "Enable kill switch?" "$KILL_SWITCH_ENABLED"
+  KILL_SWITCH_ENABLED="${KILL_SWITCH_ENABLED,,}"
+  if [[ "$KILL_SWITCH_ENABLED" != "true" && "$KILL_SWITCH_ENABLED" != "false" ]]; then
+    warn "XS_KILL_SWITCH_ENABLED must be true/false; defaulting to true"
+    KILL_SWITCH_ENABLED="true"
+  fi
+  if [[ "$KILL_SWITCH_ENABLED" == "true" ]]; then
+    KILL_SWITCH_ENABLED_PY="True"
+  else
+    KILL_SWITCH_ENABLED_PY="False"
+  fi
+  prompt_bool OPT_FAST "Run FAST optimization grid (recommended on install)?" "true"
 fi
 
 ############################
@@ -424,22 +464,15 @@ payload = {
   "exchange": {
     "api_key_env": "BYBIT_API_KEY",
     "api_secret_env": "BYBIT_API_SECRET",
-    "testnet": (${BYBIT_TESTNET,,} == "true"),
+    "testnet": ${BYBIT_TESTNET_PY},
     "category": "linear",
   },
   "universe": {
     "top_n_by_volume": int(${TOP_N_BY_VOLUME}),
   },
-  "signal": {
-    "lookback_days": int(${LOOKBACK_DAYS}),
-    "long_quantile": float(${LONG_Q}),
-    "short_quantile": float(${SHORT_Q}),
-  },
+  # signal/sizing fields will be optimized; we only seed minimal defaults
   "rebalance": {
     "time_utc": "${REBALANCE_TIME_UTC}",
-  },
-  "sizing": {
-    "target_gross_leverage": float(${TARGET_GROSS_LEVERAGE}),
   },
   "filters": {
     "max_spread_bps": float(${MAX_SPREAD_BPS}),
@@ -448,7 +481,7 @@ payload = {
   "risk": {
     "daily_loss_limit_pct": float(${DAILY_LOSS_LIMIT_PCT}),
     "max_drawdown_pct": float(${MAX_DRAWDOWN_PCT}),
-    "kill_switch_enabled": (${KILL_SWITCH_ENABLED,,} == "true"),
+    "kill_switch_enabled": ${KILL_SWITCH_ENABLED_PY},
   }
 }
 
@@ -503,14 +536,14 @@ exchange:
 universe:
   top_n_by_volume: ${TOP_N_BY_VOLUME}
 signal:
-  lookback_days: ${LOOKBACK_DAYS}
-  long_quantile: ${LONG_Q}
-  short_quantile: ${SHORT_Q}
+  lookback_days: ${SEED_LOOKBACK_DAYS}
+  long_quantile: ${SEED_LONG_Q}
+  short_quantile: ${SEED_SHORT_Q}
 rebalance:
   frequency: "daily"
   time_utc: "${REBALANCE_TIME_UTC}"
 sizing:
-  target_gross_leverage: ${TARGET_GROSS_LEVERAGE}
+  target_gross_leverage: ${SEED_TARGET_GROSS_LEVERAGE}
 filters:
   max_spread_bps: ${MAX_SPREAD_BPS}
   min_orderbook_depth_usd: ${MIN_OB_DEPTH_USD}
@@ -537,6 +570,31 @@ fi
 ############################
 chmod +x "$ROOT_DIR/scripts/run_backtest.sh" "$ROOT_DIR/scripts/run_live.sh" || true
 chmod +x "$ROOT_DIR/install.sh" || true
+
+############################
+# Optimization (instead of manual parameter input)
+############################
+log "Running parameter optimization (this will download/cached daily candles; first run can take a few minutes)..."
+if [[ "$MODE" == "venv" ]]; then
+  # shellcheck disable=SC1091
+  source "$PROJECT_DIR/.venv/bin/activate"
+  if [[ "${OPT_FAST}" == "true" ]]; then
+    bybit-xsreversal optimize --config "$CONFIG_PATH" --fast
+  else
+    bybit-xsreversal optimize --config "$CONFIG_PATH"
+  fi
+else
+  # Docker mode: run optimizer inside container using compose if available
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    if [[ "${OPT_FAST}" == "true" ]]; then
+      docker compose run --rm bot bash -lc "pip install -e . && bybit-xsreversal optimize --config config/config.yaml --fast"
+    else
+      docker compose run --rm bot bash -lc "pip install -e . && bybit-xsreversal optimize --config config/config.yaml"
+    fi
+  else
+    warn "Docker compose not available; skipping optimization in docker mode."
+  fi
+fi
 
 ############################
 # Optional systemd install
