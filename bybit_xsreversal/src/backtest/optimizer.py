@@ -152,6 +152,79 @@ def _level_to_budget(level: str) -> int:
     return 250  # standard
 
 
+def _level_to_stage2_topk(level: str) -> int:
+    level = (level or "").strip().lower()
+    if level == "quick":
+        return 25
+    if level == "deep":
+        return 150
+    return 75
+
+
+def _simulate_candidate_full(
+    *,
+    cfg: BotConfig,
+    candles: dict[str, pd.DataFrame],
+    market_df: pd.DataFrame | None,
+    calendar: pd.DatetimeIndex,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """
+    Full (slow) simulation consistent with the main backtester logic:
+    - uses compute_targets_from_daily_candles (shared with live)
+    - applies fees+slippage on turnover
+    """
+    fee_bps = cfg.backtest.maker_fee_bps if (cfg.execution.order_type == "limit" and cfg.execution.post_only) else cfg.backtest.taker_fee_bps
+    tc_bps = float(fee_bps) + float(cfg.backtest.slippage_bps)
+
+    equity = float(cfg.backtest.initial_equity)
+    prev_w: dict[str, float] = {}
+    eq_curve: list[tuple[datetime, float]] = []
+    dr: list[tuple[datetime, float]] = []
+    to: list[tuple[datetime, float]] = []
+
+    for i in range(0, len(calendar) - 1):
+        asof = calendar[i]
+        nxt = calendar[i + 1]
+
+        day_candles = {s: df.loc[:asof] for s, df in candles.items() if asof in df.index}
+        if len(day_candles) < 5:
+            continue
+
+        targets, _ = compute_targets_from_daily_candles(
+            candles=day_candles,
+            config=cfg,
+            equity_usd=equity,
+            asof=asof.to_pydatetime(),
+            market_proxy_candles=market_df.loc[:asof] if market_df is not None else None,
+        )
+        w = targets.weights
+        syms = set(prev_w) | set(w)
+        turnover = float(sum(abs(w.get(s, 0.0) - prev_w.get(s, 0.0)) for s in syms))
+        traded_notional = turnover * equity
+        tc_cost = traded_notional * (tc_bps / 10_000.0)
+
+        port_ret = 0.0
+        for s, ws in w.items():
+            df = candles.get(s)
+            if df is None or nxt not in df.index or asof not in df.index:
+                continue
+            px0 = float(df.loc[asof, "close"])
+            px1 = float(df.loc[nxt, "close"])
+            r = px1 / px0 - 1.0
+            port_ret += float(ws) * float(r)
+
+        equity = equity * (1.0 + port_ret) - tc_cost
+        eq_curve.append((nxt.to_pydatetime(), equity))
+        dr.append((nxt.to_pydatetime(), port_ret - (tc_cost / max(1e-12, equity))))
+        to.append((asof.to_pydatetime(), turnover))
+        prev_w = w
+
+    eq = pd.Series({d: v for d, v in eq_curve}).sort_index()
+    daily_ret = pd.Series({d: v for d, v in dr}).sort_index()
+    daily_turn = pd.Series({d: v for d, v in to}).sort_index()
+    return eq, daily_ret, daily_turn
+
+
 def _random_candidates(
     *,
     n: int,
@@ -369,6 +442,7 @@ def optimize_config(
     candidates: int | None = None,
     method: Literal["random", "grid"] = "random",
     seed: int = 42,
+    stage2_topk: int | None = None,
     show_progress: bool = True,
 ) -> dict[str, Any]:
     """
@@ -541,13 +615,16 @@ def optimize_config(
             if progress_ctx is not None:
                 progress_ctx.stop()
 
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "stage1_results.json").write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
+
         if best is None:
             out = Path(output_dir)
             out.mkdir(parents=True, exist_ok=True)
-            (out / "optimization_results.json").write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
             logger.error(
                 "Optimization found no feasible candidates. Leaving config unchanged. Results: {}",
-                (out / "optimization_results.json").resolve(),
+                (out / "stage1_results.json").resolve(),
             )
             return {
                 "status": "no_feasible_candidate",
@@ -559,18 +636,102 @@ def optimize_config(
 
         best_cand, best_row = best
 
-        # Helpful transparency: show top-by-sharpe and top-by-objective in logs.
+        # Stage 2: re-evaluate top-K candidates with the full backtester logic.
+        feasible = [r for r in rows if (not r.get("rejected")) and np.isfinite(float(r.get("sharpe", float("nan"))))]
+        feasible.sort(key=lambda r: float(r.get("sharpe", -1e9)), reverse=True)
+
+        k2 = int(stage2_topk) if stage2_topk is not None else _level_to_stage2_topk(level)
+        k2 = max(5, min(k2, len(feasible)))
+        stage2_candidates = [Candidate(**feasible[i]["candidate"]) for i in range(k2)]
+
+        stage2_rows: list[dict[str, Any]] = []
+        stage2_best: tuple[Candidate, dict[str, Any]] | None = None
+        stage2_best_key: tuple[float, float, float, float] | None = None
+
+        if show_progress:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[bold]stage2[/bold] full backtest"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+                TextColumn("best_sharpe={task.fields[best_sharpe]}"),
+                TextColumn("best_dd={task.fields[best_dd]}"),
+                TextColumn("best_cagr={task.fields[best_cagr]}"),
+            ) as p2:
+                t2 = p2.add_task("stage2", total=len(stage2_candidates), best_sharpe="n/a", best_dd="n/a", best_cagr="n/a")
+                for cand2 in stage2_candidates:
+                    trial = cfg.model_copy(deep=True)
+                    trial.signal.lookback_days = int(cand2.lookback_days)  # type: ignore[assignment]
+                    trial.signal.long_quantile = float(cand2.long_quantile)
+                    trial.signal.short_quantile = float(cand2.short_quantile)
+                    trial.sizing.target_gross_leverage = float(cand2.target_gross_leverage)
+                    trial.sizing.vol_lookback_days = int(cand2.vol_lookback_days)
+                    trial.rebalance.time_utc = str(cand2.rebalance_time_utc)
+
+                    eq2, dr2, to2 = _simulate_candidate_full(cfg=trial, candles=candles, market_df=market_df, calendar=cal)
+                    m2 = compute_metrics(eq2, dr2, to2)
+                    row2 = {
+                        "candidate": cand2.__dict__,
+                        "sharpe": m2.sharpe,
+                        "cagr": m2.cagr,
+                        "max_drawdown": m2.max_drawdown,
+                        "avg_daily_turnover": m2.avg_daily_turnover,
+                    }
+                    stage2_rows.append(row2)
+                    key2 = (-float(m2.sharpe), -float(m2.cagr), abs(float(m2.max_drawdown)), float(m2.avg_daily_turnover))
+                    if stage2_best_key is None or key2 < stage2_best_key:
+                        stage2_best_key = key2
+                        stage2_best = (cand2, row2)
+                        p2.update(
+                            t2,
+                            best_sharpe=fmt_or_na(float(row2.get("sharpe", float("nan"))), ".3f"),
+                            best_dd=fmt_or_na(float(row2.get("max_drawdown", float("nan"))), ".2%"),
+                            best_cagr=fmt_or_na(float(row2.get("cagr", float("nan"))), ".2%"),
+                        )
+                    p2.advance(t2, 1)
+        else:
+            for cand2 in stage2_candidates:
+                trial = cfg.model_copy(deep=True)
+                trial.signal.lookback_days = int(cand2.lookback_days)  # type: ignore[assignment]
+                trial.signal.long_quantile = float(cand2.long_quantile)
+                trial.signal.short_quantile = float(cand2.short_quantile)
+                trial.sizing.target_gross_leverage = float(cand2.target_gross_leverage)
+                trial.sizing.vol_lookback_days = int(cand2.vol_lookback_days)
+                trial.rebalance.time_utc = str(cand2.rebalance_time_utc)
+
+                eq2, dr2, to2 = _simulate_candidate_full(cfg=trial, candles=candles, market_df=market_df, calendar=cal)
+                m2 = compute_metrics(eq2, dr2, to2)
+                row2 = {
+                    "candidate": cand2.__dict__,
+                    "sharpe": m2.sharpe,
+                    "cagr": m2.cagr,
+                    "max_drawdown": m2.max_drawdown,
+                    "avg_daily_turnover": m2.avg_daily_turnover,
+                }
+                stage2_rows.append(row2)
+                key2 = (-float(m2.sharpe), -float(m2.cagr), abs(float(m2.max_drawdown)), float(m2.avg_daily_turnover))
+                if stage2_best_key is None or key2 < stage2_best_key:
+                    stage2_best_key = key2
+                    stage2_best = (cand2, row2)
+
+        (out / "stage2_results.json").write_text(json.dumps(stage2_rows, indent=2, sort_keys=True), encoding="utf-8")
+
+        if stage2_best is not None:
+            best_cand, best_row = stage2_best
+            logger.info("Stage2 selected best candidate based on full backtest metrics.")
+        else:
+            logger.warning("Stage2 had no results; falling back to stage1 selection.")
+
+        # Helpful transparency: show top-by-sharpe in logs (stage2 if available).
         try:
-            df = pd.DataFrame([r for r in rows if not r.get("rejected")])
+            df = pd.DataFrame(stage2_rows if stage2_rows else [r for r in rows if not r.get("rejected")])
             if not df.empty:
                 top_sh = df.sort_values("sharpe", ascending=False).head(5)[
                     ["sharpe", "cagr", "max_drawdown", "avg_daily_turnover", "candidate"]
                 ]
-                top_sc = df.sort_values("score", ascending=False).head(5)[
-                    ["score", "sharpe", "cagr", "max_drawdown", "avg_daily_turnover", "candidate"]
-                ]
                 logger.info("Top 5 by Sharpe:\n{}", top_sh.to_string(index=False))
-                logger.info("Top 5 by score:\n{}", top_sc.to_string(index=False))
         except Exception:
             pass
 
@@ -585,7 +746,7 @@ def optimize_config(
         if not np.isfinite(best_sharpe) or best_sharpe < min_sharpe:
             out = Path(output_dir)
             out.mkdir(parents=True, exist_ok=True)
-            (out / "optimization_results.json").write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
+            (out / "stage1_results.json").write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
             (out / "best.json").write_text(json.dumps(best_row, indent=2, sort_keys=True), encoding="utf-8")
             logger.warning(
                 "Optimizer best Sharpe {:.3f} < min {:.3f}; leaving config unchanged. Best: {}",
@@ -622,9 +783,6 @@ def optimize_config(
 
         Path(config_path).write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
 
-        out = Path(output_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        (out / "optimization_results.json").write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
         (out / "best.json").write_text(json.dumps(best_row, indent=2, sort_keys=True), encoding="utf-8")
 
         logger.info(
@@ -642,6 +800,7 @@ def optimize_config(
             "universe_size": len(symbols),
             "candidates": len(rows),
             "evaluated": len(candidates_list),
+            "stage2_topk": int(stage2_topk) if stage2_topk is not None else _level_to_stage2_topk(level),
         }
     finally:
         client.close()

@@ -85,6 +85,7 @@ def main() -> None:
     opt.add_argument("--candidates", type=int, default=None, help="Override number of candidates to evaluate")
     opt.add_argument("--method", choices=["random", "grid"], default="random", help="Candidate generation method")
     opt.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    opt.add_argument("--stage2-topk", type=int, default=None, help="How many top stage-1 candidates to re-evaluate with full backtest logic")
     opt.add_argument("--no-progress", action="store_true", help="Disable progress bar/ETA output")
 
     lv = sub.add_parser("live", help="Run live trader (scheduler)")
@@ -115,6 +116,7 @@ def main() -> None:
             candidates=args.candidates,
             method=str(args.method),
             seed=int(args.seed),
+            stage2_topk=args.stage2_topk,
             show_progress=not bool(args.no_progress),
         )
         logger.info("Config updated: {}", Path(args.config).resolve())
