@@ -611,9 +611,11 @@ def optimize_config(
         if len(cal) < 30:
             raise ValueError("Not enough aligned daily bars for optimization window.")
 
-        # Prepare data matrix once for fast candidate evaluation
-        # Use candidate-independent history requirement based on max LB
-        min_hist = int(max(80, 2 * max(cfg.sizing.vol_lookback_days, 30)))
+        # Prepare data matrix once for fast candidate evaluation.
+        # IMPORTANT: This history requirement must be aligned with stage2's shared strategy logic,
+        # which enforces cfg.universe.min_history_days. If stage1 uses a looser min history,
+        # it may select candidates that cannot trade at all in stage2 (empty universe -> no results).
+        min_hist = int(max(80, int(cfg.universe.min_history_days), 2 * max(cfg.sizing.vol_lookback_days, 30)))
         close = _prepare_close_matrix(candles, start=start, end=end, min_history_days=min_hist, max_symbols=60)
         opt_symbols = list(close.columns) if close is not None and not close.empty else list(candles.keys())
         # Keep stage2 universe consistent with stage1 (reduces sparse-history issues in stage2)
@@ -958,6 +960,29 @@ def optimize_config(
         else:
             logger.warning("Stage2 had no results; falling back to stage1 selection.")
             # best_cand and best_row are already set from Stage 1 above
+
+        # Debug: summarize stage2 outcomes (why did we get no results?)
+        try:
+            total2 = len(stage2_rows)
+            ok2 = [r for r in stage2_rows if not r.get("rejected") and np.isfinite(float(r.get("sharpe", float("nan"))))]
+            rej2 = [r for r in stage2_rows if r.get("rejected")]
+            if not ok2:
+                # Count by error string (top few)
+                err_counts: dict[str, int] = {}
+                for r in rej2:
+                    err = str(r.get("error") or "unknown")
+                    err_counts[err] = err_counts.get(err, 0) + 1
+                top_err = sorted(err_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+                logger.warning(
+                    "Stage2 produced 0 successful candidates (total={} rejected={}). Top reject reasons: {}",
+                    total2,
+                    len(rej2),
+                    top_err,
+                )
+            else:
+                logger.info("Stage2 produced {} successful candidates out of {}", len(ok2), total2)
+        except Exception:
+            pass
 
         # Helpful transparency: show top-by-sharpe in logs (stage2 if available).
         try:
