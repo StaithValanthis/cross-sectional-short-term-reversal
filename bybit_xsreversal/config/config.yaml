@@ -16,16 +16,16 @@ universe:
     max_rank: 9999
 signal:
   lookback_days: 3
-  long_quantile: 0.2
-  short_quantile: 0.2
+  long_quantile: 0.24
+  short_quantile: 0.24
   long_only: false
 rebalance:
   frequency: daily
   time_utc: 00:05
   candle_close_delay_seconds: 30
 sizing:
-  target_gross_leverage: 1.0
-  vol_lookback_days: 14
+  target_gross_leverage: 1.21
+  vol_lookback_days: 21
   max_leverage_per_symbol: 0.2
   max_notional_per_symbol: 25000.0
   min_notional_per_symbol: 15.0

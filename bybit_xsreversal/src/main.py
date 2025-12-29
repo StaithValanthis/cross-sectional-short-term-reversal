@@ -81,7 +81,10 @@ def main() -> None:
 
     opt = sub.add_parser("optimize", help="Optimize strategy parameters (small grid search) and write best back to config.yaml")
     opt.add_argument("--output-dir", default=None, help="Output directory (default outputs/optimize/<ts>)")
-    opt.add_argument("--fast", action="store_true", help="Run a smaller/faster grid")
+    opt.add_argument("--level", choices=["quick", "standard", "deep"], default="standard", help="Optimization depth preset")
+    opt.add_argument("--candidates", type=int, default=None, help="Override number of candidates to evaluate")
+    opt.add_argument("--method", choices=["random", "grid"], default="random", help="Candidate generation method")
+    opt.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     opt.add_argument("--no-progress", action="store_true", help="Disable progress bar/ETA output")
 
     lv = sub.add_parser("live", help="Run live trader (scheduler)")
@@ -105,7 +108,15 @@ def main() -> None:
 
     if args.cmd == "optimize":
         out_dir = Path(args.output_dir) if args.output_dir else _ts_dir(Path("outputs") / "optimize")
-        optimize_config(config_path=args.config, output_dir=out_dir, fast=bool(args.fast), show_progress=not bool(args.no_progress))
+        optimize_config(
+            config_path=args.config,
+            output_dir=out_dir,
+            level=str(args.level),
+            candidates=args.candidates,
+            method=str(args.method),
+            seed=int(args.seed),
+            show_progress=not bool(args.no_progress),
+        )
         logger.info("Config updated: {}", Path(args.config).resolve())
         return
 

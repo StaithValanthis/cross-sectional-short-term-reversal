@@ -360,13 +360,21 @@ else
   KILL_SWITCH_ENABLED_PY="False"
 fi
 
-OPT_FAST="${XS_OPT_FAST:-true}"
-OPT_FAST="${OPT_FAST,,}"
-if [[ "$OPT_FAST" != "true" && "$OPT_FAST" != "false" ]]; then
-  OPT_FAST="true"
+OPT_LEVEL="${XS_OPT_LEVEL:-quick}"
+OPT_LEVEL="${OPT_LEVEL,,}"
+if [[ "$OPT_LEVEL" != "quick" && "$OPT_LEVEL" != "standard" && "$OPT_LEVEL" != "deep" ]]; then
+  OPT_LEVEL="quick"
 fi
 if [[ $NON_INTERACTIVE -eq 0 ]]; then
-  prompt_bool OPT_FAST "Run FAST optimization grid (recommended on install)?" "$OPT_FAST"
+  echo "Optimization depth (how hard to search for parameters):"
+  echo "  - quick    (recommended on install, ~1-5 min)"
+  echo "  - standard (~5-20 min)"
+  echo "  - deep     (~20-60+ min)"
+  prompt OPT_LEVEL "Choose optimization depth (quick/standard/deep)" "$OPT_LEVEL"
+  OPT_LEVEL="${OPT_LEVEL,,}"
+  if [[ "$OPT_LEVEL" != "quick" && "$OPT_LEVEL" != "standard" && "$OPT_LEVEL" != "deep" ]]; then
+    OPT_LEVEL="quick"
+  fi
 fi
 
 ############################
@@ -576,19 +584,11 @@ if [[ "$MODE" == "venv" ]]; then
   export BYBIT_OPT_WINDOW_DAYS="${BYBIT_OPT_WINDOW_DAYS:-180}"
   # Reject negative Sharpe on install so we don't overwrite defaults with worse params.
   export BYBIT_OPT_MIN_SHARPE="${BYBIT_OPT_MIN_SHARPE:-0.0}"
-  if [[ "${OPT_FAST}" == "true" ]]; then
-    bybit-xsreversal --config "$CONFIG_PATH" optimize --fast
-  else
-    bybit-xsreversal --config "$CONFIG_PATH" optimize
-  fi
+  bybit-xsreversal --config "$CONFIG_PATH" optimize --level "$OPT_LEVEL"
 else
   # Docker mode: run optimizer inside container using compose if available
   if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-    if [[ "${OPT_FAST}" == "true" ]]; then
-      docker compose run --rm bot bash -lc "export BYBIT_OPT_WINDOW_DAYS=${BYBIT_OPT_WINDOW_DAYS:-180} BYBIT_OPT_MIN_SHARPE=${BYBIT_OPT_MIN_SHARPE:-0.0} && pip install -e . && bybit-xsreversal --config config/config.yaml optimize --fast"
-    else
-      docker compose run --rm bot bash -lc "export BYBIT_OPT_WINDOW_DAYS=${BYBIT_OPT_WINDOW_DAYS:-180} BYBIT_OPT_MIN_SHARPE=${BYBIT_OPT_MIN_SHARPE:-0.0} && pip install -e . && bybit-xsreversal --config config/config.yaml optimize"
-    fi
+    docker compose run --rm bot bash -lc "export BYBIT_OPT_WINDOW_DAYS=${BYBIT_OPT_WINDOW_DAYS:-180} BYBIT_OPT_MIN_SHARPE=${BYBIT_OPT_MIN_SHARPE:-0.0} && pip install -e . && bybit-xsreversal --config config/config.yaml optimize --level ${OPT_LEVEL}"
   else
     warn "Docker compose not available; skipping optimization in docker mode."
   fi

@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 import numpy as np
 import pandas as pd
@@ -35,6 +35,7 @@ class Candidate:
     short_quantile: float
     target_gross_leverage: float
     rebalance_time_utc: str
+    vol_lookback_days: int
 
 
 def _parse_date(d: str) -> datetime:
@@ -142,27 +143,232 @@ def _simulate(
     return eq, daily_ret, daily_turn
 
 
-def _candidates(*, fast: bool, default_time_utc: str) -> Iterable[Candidate]:
-    lookbacks = [1, 2, 3, 5] if not fast else [1, 2, 3]
-    qs = [0.1, 0.15, 0.2] if not fast else [0.1, 0.2]
-    levs = [0.5, 1.0, 1.5] if not fast else [1.0, 1.5]
-    times = [default_time_utc]  # keep fixed; scheduling is operational not alpha
+def _level_to_budget(level: str) -> int:
+    level = (level or "").strip().lower()
+    if level == "quick":
+        return 60
+    if level == "deep":
+        return 800
+    return 250  # standard
 
-    for lb, q, lev, t in itertools.product(lookbacks, qs, levs, times):
-        yield Candidate(
-            lookback_days=int(lb),
-            long_quantile=float(q),
-            short_quantile=float(q),
-            target_gross_leverage=float(lev),
-            rebalance_time_utc=str(t),
+
+def _random_candidates(
+    *,
+    n: int,
+    default_time_utc: str,
+    seed: int,
+) -> list[Candidate]:
+    rng = np.random.default_rng(seed)
+    lookbacks = np.array([1, 2, 3, 5], dtype=int)
+    vol_lbs = np.array([14, 21, 30], dtype=int)
+    # Typical quantiles for decile-ish reversal; allow some exploration
+    q_low, q_high = 0.05, 0.25
+    # Leverage exploration (gross)
+    lev_low, lev_high = 0.5, 1.75
+
+    out: list[Candidate] = []
+    for _ in range(n):
+        lb = int(rng.choice(lookbacks))
+        vlb = int(rng.choice(vol_lbs))
+        q = float(rng.uniform(q_low, q_high))
+        # discretize to 0.01 to keep config readable
+        q = round(q, 2)
+        lev = float(rng.uniform(lev_low, lev_high))
+        lev = round(lev, 2)
+        out.append(
+            Candidate(
+                lookback_days=lb,
+                long_quantile=q,
+                short_quantile=q,
+                target_gross_leverage=lev,
+                rebalance_time_utc=str(default_time_utc),
+                vol_lookback_days=vlb,
+            )
         )
+    # de-dup
+    uniq = {(c.lookback_days, c.long_quantile, c.target_gross_leverage, c.vol_lookback_days): c for c in out}
+    return list(uniq.values())
+
+
+def _grid_candidates(*, default_time_utc: str) -> list[Candidate]:
+    lookbacks = [1, 2, 3, 5]
+    qs = [0.05, 0.10, 0.15, 0.20]
+    levs = [0.5, 0.75, 1.0, 1.25, 1.5]
+    vol_lbs = [14, 30]
+    out: list[Candidate] = []
+    for lb, q, lev, vlb in itertools.product(lookbacks, qs, levs, vol_lbs):
+        out.append(
+            Candidate(
+                lookback_days=int(lb),
+                long_quantile=float(q),
+                short_quantile=float(q),
+                target_gross_leverage=float(lev),
+                rebalance_time_utc=str(default_time_utc),
+                vol_lookback_days=int(vlb),
+            )
+        )
+    return out
+
+
+def _prepare_close_matrix(
+    candles: dict[str, pd.DataFrame],
+    *,
+    start: datetime,
+    end: datetime,
+    min_history_days: int,
+    max_symbols: int = 60,
+) -> pd.DataFrame:
+    """
+    Build a close price matrix (date x symbol) using symbols with enough history,
+    preferring the longest-history symbols to improve optimization stability.
+    """
+    rows: list[tuple[str, pd.Series]] = []
+    for sym, df in candles.items():
+        if df is None or df.empty:
+            continue
+        sub = df.loc[(df.index >= start) & (df.index <= end), "close"].dropna().astype(float)
+        if len(sub) < min_history_days:
+            continue
+        rows.append((sym, sub))
+    # Prefer longest history
+    rows.sort(key=lambda x: len(x[1]), reverse=True)
+    rows = rows[:max_symbols]
+    if not rows:
+        return pd.DataFrame()
+    # Align on union of dates, then later we will drop days with too many NaNs.
+    close = pd.concat({sym: s for sym, s in rows}, axis=1).sort_index()
+    return close.loc[(close.index >= start) & (close.index <= end)]
+
+
+def _simulate_candidate_vectorized(
+    *,
+    close: pd.DataFrame,
+    lookback_days: int,
+    vol_lookback_days: int,
+    q: float,
+    gross_leverage: float,
+    maker_fee_bps: float,
+    taker_fee_bps: float,
+    slippage_bps: float,
+    use_maker: bool,
+    initial_equity: float,
+    max_dd_limit: float,
+    max_turnover: float,
+    min_symbols: int = 10,
+) -> dict[str, float] | None:
+    """
+    Fast daily rebalance simulation for candidate selection:
+    - cross-sectional rank on lookback return
+    - inverse-vol weights
+    - dollar-neutral LS (long losers, short winners)
+    - turnover/fees modeled in weight space
+    Returns metrics dict or None if not feasible.
+    """
+    if close.empty:
+        return None
+    px = close.copy()
+    # Require at least min_symbols available per day
+    valid_counts = px.notna().sum(axis=1)
+    px = px.loc[valid_counts >= min_symbols]
+    if len(px) < (vol_lookback_days + lookback_days + 20):
+        return None
+
+    # daily returns and lookback returns
+    r1 = px.pct_change()
+    r_lb = px / px.shift(lookback_days) - 1.0
+    vol = r1.rolling(vol_lookback_days, min_periods=vol_lookback_days).std(ddof=0)
+
+    # Weights matrix (T x N)
+    weights = pd.DataFrame(0.0, index=px.index, columns=px.columns)
+
+    q = float(q)
+    for t in range(len(px.index)):
+        dt = px.index[t]
+        ret_row = r_lb.loc[dt]
+        vol_row = vol.loc[dt]
+        # eligible symbols
+        mask = ret_row.notna() & vol_row.notna() & (vol_row > 0)
+        if mask.sum() < min_symbols:
+            continue
+        rets = ret_row[mask].astype(float)
+        vols = vol_row[mask].astype(float)
+
+        # thresholds
+        lo_thr = np.nanquantile(rets.values, q)
+        hi_thr = np.nanquantile(rets.values, 1.0 - q)
+        longs = rets[rets <= lo_thr].index
+        shorts = rets[rets >= hi_thr].index
+        if len(longs) == 0 or len(shorts) == 0:
+            continue
+
+        invv_l = (1.0 / vols.loc[longs]).replace([np.inf, -np.inf], np.nan).dropna()
+        invv_s = (1.0 / vols.loc[shorts]).replace([np.inf, -np.inf], np.nan).dropna()
+        if invv_l.empty or invv_s.empty:
+            continue
+
+        w_l = invv_l / invv_l.abs().sum()
+        w_s = invv_s / invv_s.abs().sum()
+        w_l = w_l * (gross_leverage / 2.0)
+        w_s = w_s * (gross_leverage / 2.0)
+        w = pd.Series(0.0, index=px.columns)
+        w.loc[w_l.index] = w_l.values
+        w.loc[w_s.index] = -w_s.values
+        weights.loc[dt] = w
+
+    weights = weights.dropna(how="all")
+    if weights.empty or len(weights) < 30:
+        return None
+
+    # Turnover / costs
+    dw = weights.diff().abs().sum(axis=1).fillna(0.0)
+    avg_turnover = float(dw.mean())
+    if avg_turnover > float(max_turnover):
+        return None
+
+    fee_bps = float(maker_fee_bps) if use_maker else float(taker_fee_bps)
+    tc_bps = fee_bps + float(slippage_bps)
+
+    # Portfolio daily return: sum(w_{t} * r1_{t+1})
+    aligned = r1.loc[weights.index].shift(-1)
+    port_ret = (weights * aligned).sum(axis=1).dropna()
+    if port_ret.empty:
+        return None
+
+    # apply transaction costs on traded notional in equity terms
+    tc = dw.loc[port_ret.index] * (tc_bps / 10_000.0)
+    net_ret = port_ret - tc
+
+    equity = initial_equity * (1.0 + net_ret).cumprod()
+    if float(equity.min()) <= 0.0:
+        return None
+
+    # drawdown
+    peak = equity.cummax()
+    dd = equity / peak - 1.0
+    max_dd = float(dd.min())
+    if abs(max_dd) > float(max_dd_limit):
+        return None
+
+    # sharpe
+    if net_ret.std(ddof=0) == 0:
+        sharpe = 0.0
+    else:
+        sharpe = float(np.sqrt(365) * net_ret.mean() / net_ret.std(ddof=0))
+
+    # CAGR on window length
+    years = max(1e-9, (len(equity) - 1) / 365.0)
+    cagr = float((float(equity.iloc[-1]) / float(equity.iloc[0])) ** (1.0 / years) - 1.0)
+    return {"sharpe": sharpe, "cagr": cagr, "max_drawdown": max_dd, "avg_daily_turnover": avg_turnover}
 
 
 def optimize_config(
     *,
     config_path: str | Path,
     output_dir: str | Path,
-    fast: bool,
+    level: str = "standard",
+    candidates: int | None = None,
+    method: Literal["random", "grid"] = "random",
+    seed: int = 42,
     show_progress: bool = True,
 ) -> dict[str, Any]:
     """
@@ -213,11 +419,25 @@ def optimize_config(
         if len(cal) < 30:
             raise ValueError("Not enough aligned daily bars for optimization window.")
 
+        # Prepare data matrix once for fast candidate evaluation
+        # Use candidate-independent history requirement based on max LB
+        min_hist = int(max(80, 2 * max(cfg.sizing.vol_lookback_days, 30)))
+        close = _prepare_close_matrix(candles, start=start, end=end, min_history_days=min_hist, max_symbols=60)
+
         best = None
-        best_score = -float("inf")
+        best_key: tuple[float, float, float, float] | None = None
         rows: list[dict[str, Any]] = []
 
-        candidates = list(_candidates(fast=fast, default_time_utc=cfg.rebalance.time_utc))
+        budget = int(candidates) if candidates is not None else _level_to_budget(level)
+        if method == "grid":
+            cand_list = _grid_candidates(default_time_utc=cfg.rebalance.time_utc)
+        else:
+            cand_list = _random_candidates(n=budget, default_time_utc=cfg.rebalance.time_utc, seed=seed)
+        # If grid, respect budget if provided
+        if candidates is not None:
+            cand_list = cand_list[: int(candidates)]
+        # If random produced fewer uniques than budget, that's OK.
+        candidates_list = cand_list
 
         # Progress bar + ETA
         progress_ctx = (
@@ -230,6 +450,7 @@ def optimize_config(
                 TimeRemainingColumn(),
                 TextColumn("best_sharpe={task.fields[best_sharpe]}"),
                 TextColumn("best_dd={task.fields[best_dd]}"),
+                TextColumn("best_cagr={task.fields[best_cagr]}"),
                 transient=False,
             )
             if show_progress
@@ -247,64 +468,71 @@ def optimize_config(
             progress_ctx.start()
             task_id = progress_ctx.add_task(
                 "optimize",
-                total=len(candidates),
+                total=len(candidates_list),
                 best_sharpe="n/a",
                 best_dd="n/a",
+                best_cagr="n/a",
             )
 
         try:
-            for cand in candidates:
-                trial = cfg.model_copy(deep=True)
-                trial.signal.lookback_days = int(cand.lookback_days)  # type: ignore[assignment]
-                trial.signal.long_quantile = float(cand.long_quantile)
-                trial.signal.short_quantile = float(cand.short_quantile)
-                trial.sizing.target_gross_leverage = float(cand.target_gross_leverage)
-                trial.rebalance.time_utc = str(cand.rebalance_time_utc)
-
-                eq, dr, to = _simulate(cfg=trial, candles=candles, market_df=market_df, calendar=cal)
-                m = compute_metrics(eq, dr, to)
+            for cand in candidates_list:
+                # Evaluate candidate quickly (vectorized)
+                use_maker = bool(cfg.execution.order_type == "limit" and cfg.execution.post_only)
+                m = _simulate_candidate_vectorized(
+                    close=close,
+                    lookback_days=int(cand.lookback_days),
+                    vol_lookback_days=int(cand.vol_lookback_days),
+                    q=float(cand.long_quantile),
+                    gross_leverage=float(cand.target_gross_leverage),
+                    maker_fee_bps=float(cfg.backtest.maker_fee_bps),
+                    taker_fee_bps=float(cfg.backtest.taker_fee_bps),
+                    slippage_bps=float(cfg.backtest.slippage_bps),
+                    use_maker=use_maker,
+                    initial_equity=float(cfg.backtest.initial_equity),
+                    max_dd_limit=float(cfg.risk.max_drawdown_pct) / 100.0,
+                    max_turnover=float(cfg.risk.max_turnover),
+                )
 
                 # Record candidate metrics even if rejected (for debugging)
                 row = {
                     "candidate": cand.__dict__,
-                    "sharpe": m.sharpe,
-                    "cagr": m.cagr,
-                    "max_drawdown": m.max_drawdown,
-                    "avg_daily_turnover": m.avg_daily_turnover,
+                    "sharpe": (float(m["sharpe"]) if m is not None else float("nan")),
+                    "cagr": (float(m["cagr"]) if m is not None else float("nan")),
+                    "max_drawdown": (float(m["max_drawdown"]) if m is not None else float("nan")),
+                    "avg_daily_turnover": (float(m["avg_daily_turnover"]) if m is not None else float("nan")),
                     "rejected": False,
                     "reject_reason": None,
                 }
 
-                # Hard reject pathological candidates (equity blowups, nonsensical DD)
-                if eq.empty or float(eq.min()) <= 0.0:
+                if m is None:
                     row["rejected"] = True
-                    row["reject_reason"] = "equity_non_positive_or_empty"
-                    rows.append(row)
-                    if progress_ctx is not None and task_id is not None:
-                        progress_ctx.advance(task_id, 1)
-                    continue
-                if float(m.max_drawdown) < -0.95:
-                    row["rejected"] = True
-                    row["reject_reason"] = "max_dd_too_large"
+                    row["reject_reason"] = "infeasible_or_insufficient_data"
                     rows.append(row)
                     if progress_ctx is not None and task_id is not None:
                         progress_ctx.advance(task_id, 1)
                     continue
 
-                # Objective: Sharpe, with penalty for big drawdown and high turnover
-                dd_pen = max(0.0, abs(m.max_drawdown) - (trial.risk.max_drawdown_pct / 100.0))
-                score = float(m.sharpe) - 2.0 * float(dd_pen) - 0.1 * float(m.avg_daily_turnover)
+                # Objective (lexicographic):
+                #   1) maximize Sharpe
+                #   2) maximize CAGR
+                #   3) minimize drawdown magnitude
+                #   4) minimize turnover
+                # We'll store as a key where smaller is better.
+                key = (-float(row["sharpe"]), -float(row["cagr"]), abs(float(row["max_drawdown"])), float(row["avg_daily_turnover"]))
+                # Also keep a scalar score for reporting/debugging
+                score = float(row["sharpe"]) + 0.25 * float(row["cagr"]) - 0.05 * float(row["avg_daily_turnover"])
                 row["score"] = score
                 rows.append(row)
 
-                if score > best_score and np.isfinite(score):
-                    best_score = score
+                if best_key is None or key < best_key:
+                    best_key = key
                     best = (cand, row)
                     if progress_ctx is not None and task_id is not None:
                         progress_ctx.update(
                             task_id,
                             best_sharpe=fmt_or_na(float(row.get("sharpe", float("nan"))), ".3f"),
                             best_dd=fmt_or_na(float(row.get("max_drawdown", float("nan"))), ".2%"),
+                            best_cagr=fmt_or_na(float(row.get("cagr", float("nan"))), ".2%"),
                         )
 
                 if progress_ctx is not None and task_id is not None:
@@ -330,6 +558,21 @@ def optimize_config(
             }
 
         best_cand, best_row = best
+
+        # Helpful transparency: show top-by-sharpe and top-by-objective in logs.
+        try:
+            df = pd.DataFrame([r for r in rows if not r.get("rejected")])
+            if not df.empty:
+                top_sh = df.sort_values("sharpe", ascending=False).head(5)[
+                    ["sharpe", "cagr", "max_drawdown", "avg_daily_turnover", "candidate"]
+                ]
+                top_sc = df.sort_values("score", ascending=False).head(5)[
+                    ["score", "sharpe", "cagr", "max_drawdown", "avg_daily_turnover", "candidate"]
+                ]
+                logger.info("Top 5 by Sharpe:\n{}", top_sh.to_string(index=False))
+                logger.info("Top 5 by score:\n{}", top_sc.to_string(index=False))
+        except Exception:
+            pass
 
         # Guardrail: don't write params that are statistically/financially "worse than nothing".
         # Default: reject negative Sharpe (BYBIT_OPT_MIN_SHARPE=0.0).
@@ -365,12 +608,15 @@ def optimize_config(
         raw.setdefault("signal", {})
         raw.setdefault("rebalance", {})
         raw.setdefault("sizing", {})
+        raw.setdefault("sizing", {})
 
         raw["signal"]["lookback_days"] = int(best_cand.lookback_days)
         raw["signal"]["long_quantile"] = float(best_cand.long_quantile)
         raw["signal"]["short_quantile"] = float(best_cand.short_quantile)
         raw["rebalance"]["time_utc"] = str(best_cand.rebalance_time_utc)
         raw["sizing"]["target_gross_leverage"] = float(best_cand.target_gross_leverage)
+        raw.setdefault("sizing", {})
+        raw["sizing"]["vol_lookback_days"] = int(best_cand.vol_lookback_days)
 
         import yaml
 
@@ -381,13 +627,21 @@ def optimize_config(
         (out / "optimization_results.json").write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
         (out / "best.json").write_text(json.dumps(best_row, indent=2, sort_keys=True), encoding="utf-8")
 
-        logger.info("Optimization complete. Best score={:.3f} sharpe={:.3f} maxDD={:.2%}", best_score, best_row["sharpe"], best_row["max_drawdown"])
+        logger.info(
+            "Optimization complete. Best sharpe={:.3f} cagr={:.2%} maxDD={:.2%} turnover={:.3f} params={}",
+            float(best_row.get("sharpe", 0.0)),
+            float(best_row.get("cagr", 0.0)),
+            float(best_row.get("max_drawdown", 0.0)),
+            float(best_row.get("avg_daily_turnover", 0.0)),
+            best_cand.__dict__,
+        )
         return {
             "best": best_row,
             "output_dir": str(out.resolve()),
             "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
             "universe_size": len(symbols),
             "candidates": len(rows),
+            "evaluated": len(candidates_list),
         }
     finally:
         client.close()
