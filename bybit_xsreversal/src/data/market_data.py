@@ -227,6 +227,28 @@ class MarketData:
                 break
             cursor_end = oldest_ts - 1
 
+        # Fallback: some instruments (new listings, edge cases) can return empty when a very old start_ms is provided.
+        # Try fetching the most recent candles (no start constraint) and then slice to our target window.
+        if not all_rows:
+            cursor_end = end_ms
+            for _ in range(20):
+                chunk = self.client.get_kline(
+                    category=self.config.exchange.category,
+                    symbol=symbol,
+                    interval="D",
+                    start_ms=None,
+                    end_ms=cursor_end,
+                    limit=1000,
+                )
+                if not chunk:
+                    break
+                all_rows.extend(chunk)
+                oldest_ts = int(chunk[-1][0])
+                # Stop if we've gone past the requested start
+                if oldest_ts <= start_ms:
+                    break
+                cursor_end = oldest_ts - 1
+
         if not all_rows:
             raise ValueError(f"No candles returned for {symbol}")
 

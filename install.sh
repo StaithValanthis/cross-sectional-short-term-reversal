@@ -564,6 +564,8 @@ log "Running parameter optimization (this will download/cached daily candles; fi
 if [[ "$MODE" == "venv" ]]; then
   # shellcheck disable=SC1091
   source "$PROJECT_DIR/.venv/bin/activate"
+  # Use a shorter rolling window on install to ensure enough symbols have history.
+  export BYBIT_OPT_WINDOW_DAYS="${BYBIT_OPT_WINDOW_DAYS:-180}"
   if [[ "${OPT_FAST}" == "true" ]]; then
     bybit-xsreversal --config "$CONFIG_PATH" optimize --fast
   else
@@ -573,9 +575,9 @@ else
   # Docker mode: run optimizer inside container using compose if available
   if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     if [[ "${OPT_FAST}" == "true" ]]; then
-      docker compose run --rm bot bash -lc "pip install -e . && bybit-xsreversal --config config/config.yaml optimize --fast"
+      docker compose run --rm bot bash -lc "export BYBIT_OPT_WINDOW_DAYS=${BYBIT_OPT_WINDOW_DAYS:-180} && pip install -e . && bybit-xsreversal --config config/config.yaml optimize --fast"
     else
-      docker compose run --rm bot bash -lc "pip install -e . && bybit-xsreversal --config config/config.yaml optimize"
+      docker compose run --rm bot bash -lc "export BYBIT_OPT_WINDOW_DAYS=${BYBIT_OPT_WINDOW_DAYS:-180} && pip install -e . && bybit-xsreversal --config config/config.yaml optimize"
     fi
   else
     warn "Docker compose not available; skipping optimization in docker mode."

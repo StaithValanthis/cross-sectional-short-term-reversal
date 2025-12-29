@@ -40,16 +40,17 @@ def _default_opt_window_days() -> int:
 
 
 def _ensure_backtest_range(cfg: BotConfig) -> tuple[datetime, datetime]:
+    # Optimizer should be robust on fresh installs; prefer a recent rolling window
+    # instead of relying on whatever backtest start/end happen to be set to.
+    # Allow override via env: BYBIT_OPT_WINDOW_DAYS (int).
+    win_env = os.getenv("BYBIT_OPT_WINDOW_DAYS", "").strip()
     try:
-        start = _parse_date(cfg.backtest.start_date)
-        end = _parse_date(cfg.backtest.end_date)
-        if end > start:
-            return start, end
+        win_days = int(win_env) if win_env else _default_opt_window_days()
     except Exception:
-        pass
-    # fallback to last 365 days ending yesterday UTC
+        win_days = _default_opt_window_days()
+
     end = datetime.now(tz=UTC).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
-    start = end - timedelta(days=_default_opt_window_days())
+    start = end - timedelta(days=win_days)
     return start, end
 
 
