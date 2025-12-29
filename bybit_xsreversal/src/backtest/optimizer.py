@@ -801,6 +801,7 @@ def optimize_config(
             ) as p2:
                 t2 = p2.add_task("stage2", total=len(stage2_candidates), best_sharpe="n/a", best_dd="n/a", best_cagr="n/a")
                 for cand2 in stage2_candidates:
+                    row2: dict[str, Any] | None = None
                     try:
                         trial = cfg.model_copy(deep=True)
                         trial.signal.lookback_days = int(cand2.lookback_days)  # type: ignore[assignment]
@@ -820,15 +821,14 @@ def optimize_config(
                         m2 = compute_metrics(eq2, dr2, to2)
                         if eq2.empty or dr2.empty or not _metrics_ok(m2):
                             raise ValueError("stage2_invalid_metrics")
+                        key2 = (-float(m2.sharpe), -float(m2.cagr), abs(float(m2.max_drawdown)), float(m2.avg_daily_turnover))
                         row2 = {
                             "candidate": cand2.__dict__,
-                            "sharpe": m2.sharpe,
-                            "cagr": m2.cagr,
-                            "max_drawdown": m2.max_drawdown,
-                            "avg_daily_turnover": m2.avg_daily_turnover,
+                            "sharpe": float(m2.sharpe),
+                            "cagr": float(m2.cagr),
+                            "max_drawdown": float(m2.max_drawdown),
+                            "avg_daily_turnover": float(m2.avg_daily_turnover),
                         }
-                        stage2_rows.append(row2)
-                        key2 = (-float(m2.sharpe), -float(m2.cagr), abs(float(m2.max_drawdown)), float(m2.avg_daily_turnover))
                         if stage2_best_key is None or key2 < stage2_best_key:
                             stage2_best_key = key2
                             stage2_best = (cand2, row2)
@@ -853,7 +853,6 @@ def optimize_config(
                             "max_drawdown": float("nan"),
                             "avg_daily_turnover": float("nan"),
                         }
-                        stage2_rows.append(row2)
                     except Exception as e:
                         logger.warning("Stage2 candidate {} failed with unexpected error: {}", cand2.__dict__, e)
                         row2 = {
@@ -865,11 +864,22 @@ def optimize_config(
                             "max_drawdown": float("nan"),
                             "avg_daily_turnover": float("nan"),
                         }
-                        stage2_rows.append(row2)
                     finally:
+                        if row2 is None:
+                            row2 = {
+                                "candidate": cand2.__dict__,
+                                "rejected": True,
+                                "error": "stage2_unknown_error",
+                                "sharpe": float("nan"),
+                                "cagr": float("nan"),
+                                "max_drawdown": float("nan"),
+                                "avg_daily_turnover": float("nan"),
+                            }
+                        stage2_rows.append(row2)
                         p2.advance(t2, 1)
         else:
             for cand2 in stage2_candidates:
+                row2: dict[str, Any] | None = None
                 try:
                     trial = cfg.model_copy(deep=True)
                     trial.signal.lookback_days = int(cand2.lookback_days)  # type: ignore[assignment]
@@ -889,15 +899,14 @@ def optimize_config(
                     m2 = compute_metrics(eq2, dr2, to2)
                     if eq2.empty or dr2.empty or not _metrics_ok(m2):
                         raise ValueError("stage2_invalid_metrics")
+                    key2 = (-float(m2.sharpe), -float(m2.cagr), abs(float(m2.max_drawdown)), float(m2.avg_daily_turnover))
                     row2 = {
                         "candidate": cand2.__dict__,
-                        "sharpe": m2.sharpe,
-                        "cagr": m2.cagr,
-                        "max_drawdown": m2.max_drawdown,
-                        "avg_daily_turnover": m2.avg_daily_turnover,
+                        "sharpe": float(m2.sharpe),
+                        "cagr": float(m2.cagr),
+                        "max_drawdown": float(m2.max_drawdown),
+                        "avg_daily_turnover": float(m2.avg_daily_turnover),
                     }
-                    stage2_rows.append(row2)
-                    key2 = (-float(m2.sharpe), -float(m2.cagr), abs(float(m2.max_drawdown)), float(m2.avg_daily_turnover))
                     if stage2_best_key is None or key2 < stage2_best_key:
                         stage2_best_key = key2
                         stage2_best = (cand2, row2)
@@ -916,7 +925,6 @@ def optimize_config(
                         "max_drawdown": float("nan"),
                         "avg_daily_turnover": float("nan"),
                     }
-                    stage2_rows.append(row2)
                 except Exception as e:
                     logger.warning("Stage2 candidate {} failed with unexpected error: {}", cand2.__dict__, e)
                     row2 = {
@@ -928,6 +936,17 @@ def optimize_config(
                         "max_drawdown": float("nan"),
                         "avg_daily_turnover": float("nan"),
                     }
+                finally:
+                    if row2 is None:
+                        row2 = {
+                            "candidate": cand2.__dict__,
+                            "rejected": True,
+                            "error": "stage2_unknown_error",
+                            "sharpe": float("nan"),
+                            "cagr": float("nan"),
+                            "max_drawdown": float("nan"),
+                            "avg_daily_turnover": float("nan"),
+                        }
                     stage2_rows.append(row2)
 
         (out / "stage2_results.json").write_text(json.dumps(stage2_rows, indent=2, sort_keys=True), encoding="utf-8")
