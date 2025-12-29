@@ -79,6 +79,32 @@ class BybitClient:
         ret_msg = str(data.get("retMsg", ""))
         raise BybitAPIError(f"Bybit error retCode={ret_code} retMsg={ret_msg}", ret_code=ret_code, ret_msg=ret_msg)
 
+    def _sleep_rate_limit(self, resp: httpx.Response) -> None:
+        """
+        Bybit often returns retCode=10006 for rate limiting and may include reset timestamp headers.
+        Prefer sleeping until reset rather than a fixed delay.
+        """
+        reset_hdr = None
+        for k in ("X-Bapi-Limit-Reset-Timestamp", "X-BAPI-LIMIT-RESET-TIMESTAMP", "x-bapi-limit-reset-timestamp"):
+            if k in resp.headers:
+                reset_hdr = resp.headers.get(k)
+                break
+        now_ms = int(time.time() * 1000)
+        sleep_s = 1.5
+        if reset_hdr:
+            try:
+                reset_val = int(float(str(reset_hdr)))
+                # Heuristic: if seconds epoch, convert to ms
+                if reset_val < 10_000_000_000:
+                    reset_val *= 1000
+                delta_ms = max(0, reset_val - now_ms)
+                # Add a small safety buffer
+                sleep_s = max(1.0, delta_ms / 1000.0 + 0.25)
+            except Exception:
+                sleep_s = 1.5
+        logger.warning("Bybit rate limit backoff: sleeping {:.2f}s", sleep_s)
+        time.sleep(sleep_s)
+
     @retry(
         retry=retry_if_exception_type((httpx.HTTPError, BybitAPIError)),
         wait=wait_exponential_jitter(initial=0.5, max=10.0),
@@ -102,6 +128,11 @@ class BybitClient:
             headers = self._headers(payload=payload)
             resp = self._http.post(path, content=payload.encode("utf-8"), params=params, headers=headers)
 
+        if resp.status_code == 429:
+            # HTTP-level rate limit
+            self._sleep_rate_limit(resp)
+            raise httpx.HTTPStatusError(f"Bybit 429 rate limit", request=resp.request, response=resp)
+
         if resp.status_code >= 500:
             raise httpx.HTTPStatusError(f"Bybit 5xx: {resp.status_code}", request=resp.request, response=resp)
 
@@ -111,8 +142,7 @@ class BybitClient:
         except BybitAPIError as e:
             # 10006: rate limit
             if e.ret_code == 10006:
-                logger.warning("Bybit rate limit hit (10006). Backing off then retrying...")
-                time.sleep(1.2)
+                self._sleep_rate_limit(resp)
             raise
         return data
 

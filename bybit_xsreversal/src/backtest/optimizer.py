@@ -610,17 +610,24 @@ def optimize_config(
             cal = _calendar_from_any(candles, start, end)
         if len(cal) < 30:
             raise ValueError("Not enough aligned daily bars for optimization window.")
+        # For stage2, use calendar based on the optimization symbol subset (more stable).
+        cal_stage2 = _calendar_from_any(candles_stage2, start, end)
+        if len(cal_stage2) >= 30:
+            cal = cal_stage2
 
         # Prepare data matrix once for fast candidate evaluation
         # Use candidate-independent history requirement based on max LB
         min_hist = int(max(80, 2 * max(cfg.sizing.vol_lookback_days, 30)))
         close = _prepare_close_matrix(candles, start=start, end=end, min_history_days=min_hist, max_symbols=60)
+        opt_symbols = list(close.columns) if close is not None and not close.empty else list(candles.keys())
+        # Keep stage2 universe consistent with stage1 (reduces sparse-history issues in stage2)
+        candles_stage2 = {s: candles[s] for s in opt_symbols if s in candles and candles[s] is not None and not candles[s].empty}
 
         # Funding daily rates cache for stage2 (and for optional funding filter)
         funding_daily: dict[str, pd.Series] = {}
         force_mainnet_funding = bool(cfg.funding.filter.use_mainnet_data_even_on_testnet and cfg.exchange.testnet)
         if cfg.funding.model_in_backtest or cfg.funding.filter.enabled:
-            for s in candles.keys():
+            for s in opt_symbols:
                 try:
                     funding_daily[s] = md.get_daily_funding_rate(s, fetch_start, fetch_end, force_mainnet=force_mainnet_funding)
                 except Exception:
@@ -808,7 +815,7 @@ def optimize_config(
                         trial.funding.filter.enabled = bool(cand2.funding_filter_enabled)
                         trial.funding.filter.max_abs_daily_funding_rate = float(cand2.funding_max_abs_daily_rate)
 
-                        eq2, dr2, to2 = _simulate_candidate_full(cfg=trial, candles=candles, market_df=market_df, calendar=cal, funding_daily=funding_daily)
+                        eq2, dr2, to2 = _simulate_candidate_full(cfg=trial, candles=candles_stage2, market_df=market_df, calendar=cal, funding_daily=funding_daily)
                         m2 = compute_metrics(eq2, dr2, to2)
                         if eq2.empty or dr2.empty or not _metrics_ok(m2):
                             raise ValueError("stage2_invalid_metrics")
@@ -877,7 +884,7 @@ def optimize_config(
                     trial.funding.filter.enabled = bool(cand2.funding_filter_enabled)
                     trial.funding.filter.max_abs_daily_funding_rate = float(cand2.funding_max_abs_daily_rate)
 
-                    eq2, dr2, to2 = _simulate_candidate_full(cfg=trial, candles=candles, market_df=market_df, calendar=cal, funding_daily=funding_daily)
+                    eq2, dr2, to2 = _simulate_candidate_full(cfg=trial, candles=candles_stage2, market_df=market_df, calendar=cal, funding_daily=funding_daily)
                     m2 = compute_metrics(eq2, dr2, to2)
                     if eq2.empty or dr2.empty or not _metrics_ok(m2):
                         raise ValueError("stage2_invalid_metrics")
