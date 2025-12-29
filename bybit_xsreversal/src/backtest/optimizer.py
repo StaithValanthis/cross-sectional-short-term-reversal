@@ -217,22 +217,24 @@ def _simulate_candidate_full(
                     if ser is not None and not ser.empty and day_key in ser.index:
                         fr_today[s] = float(ser.loc[day_key])
 
-            targets, _ = compute_targets_from_daily_candles(
-                candles=day_candles,
-                config=cfg,
-                equity_usd=equity,
-                asof=asof.to_pydatetime(),
-                market_proxy_candles=market_df.loc[:asof] if market_df is not None else None,
-                current_weights=prev_w,
-                funding_daily_rate=fr_today if fr_today else None,
-            )
-            w = targets.weights
-        except ValueError as e:
-            # Robustness: if this particular day has too few eligible symbols (e.g. sparse history),
-            # just hold current weights and continue rather than rejecting the entire candidate.
-            if "Universe too small" in str(e):
-                continue
-            raise
+            try:
+                targets, _ = compute_targets_from_daily_candles(
+                    candles=day_candles,
+                    config=cfg,
+                    equity_usd=equity,
+                    asof=asof.to_pydatetime(),
+                    market_proxy_candles=market_df.loc[:asof] if market_df is not None else None,
+                    current_weights=prev_w,
+                    funding_daily_rate=fr_today if fr_today else None,
+                )
+                w = targets.weights
+            except ValueError as e:
+                # Robustness: if this particular day has too few eligible symbols (e.g. sparse history),
+                # just hold current weights and continue rather than rejecting the entire candidate.
+                if "Universe too small" in str(e):
+                    w = dict(prev_w)
+                else:
+                    raise
         else:
             w = dict(prev_w)
         syms = set(prev_w) | set(w)
