@@ -1,0 +1,2 @@
+[console_scripts]
+bybit-xsreversal = src.main:main

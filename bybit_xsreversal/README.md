@@ -1,0 +1,74 @@
+## Bybit XS Reversal Bot (USDT Perps)
+
+Production-grade Python 3.11+ trading system for **cross-sectional short-term reversal** (“yesterday’s losers bounce”) on Bybit **USDT linear perpetuals**:
+
+- **Backtest**: daily rebalanced cross-sectional long/short (or long-only) portfolio with fees + slippage + turnover.
+- **Live**: daily scheduler that computes targets from the last *complete* UTC daily candle, then rebalances positions with maker-biased execution, risk checks, and full audit snapshots.
+
+### Safety / Disclaimer
+
+This is real trading software. Run **testnet first**, use small size, and understand Bybit perps mechanics (leverage, liquidation, funding, position mode). You are responsible for losses.
+
+---
+
+## Setup
+
+### 1) Install
+
+From `bybit_xsreversal/`:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
+pip install -U pip
+pip install -e .
+```
+
+### 2) Configure keys
+
+- Copy `bybit_xsreversal/.env.example` to `.env` and fill keys.
+- Edit `bybit_xsreversal/config/config.yaml`.
+
+### 3) Run backtest
+
+```bash
+bybit-xsreversal backtest --config config/config.yaml
+```
+
+Outputs are written to `bybit_xsreversal/outputs/backtest/<timestamp>/`.
+
+### 4) Run live (testnet first)
+
+Dry-run (prints intended orders only):
+
+```bash
+bybit-xsreversal live --config config/config.yaml --dry-run
+```
+
+Live trading:
+
+```bash
+bybit-xsreversal live --config config/config.yaml
+```
+
+Live snapshots are written to `bybit_xsreversal/outputs/live/<timestamp>/rebalance_snapshot.json`.
+
+---
+
+## Notes on Daily Candle Alignment (UTC)
+
+Bybit `interval=D` klines are aligned to **UTC day boundaries**. This bot trades at `rebalance.time_utc` (default `00:05`) and uses the **last complete daily candle** (yesterday’s close) to avoid look-ahead.
+
+---
+
+## Project Layout
+
+The implementation matches the requested layout under `bybit_xsreversal/`:
+
+- `src/data/bybit_client.py`: Bybit v5 REST client (auth, retries, rate-limit handling)
+- `src/data/market_data.py`: candles, tickers, orderbook spread/depth filters
+- `src/strategy/xs_reversal.py`: ranking + vol scaling + target weights
+- `src/backtest/backtester.py`: daily rebalance simulator
+- `src/live.py`: scheduler + rebalance runner
+
+

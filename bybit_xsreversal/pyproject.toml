@@ -1,0 +1,40 @@
+[project]
+name = "bybit-xsreversal"
+version = "0.1.0"
+description = "Bybit USDT-perps cross-sectional short-term reversal (losers bounce) bot: backtest + live trader."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "httpx>=0.27.0",
+  "tenacity>=8.2.3",
+  "pydantic>=2.7.0",
+  "pydantic-settings>=2.2.1",
+  "PyYAML>=6.0.1",
+  "python-dotenv>=1.0.1",
+  "pandas>=2.2.2",
+  "numpy>=1.26.4",
+  "loguru>=0.7.2",
+  "rich>=13.7.1",
+  "orjson>=3.10.7",
+]
+
+[project.scripts]
+bybit-xsreversal = "src.main:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+
+

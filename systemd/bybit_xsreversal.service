@@ -1,0 +1,24 @@
+[Unit]
+Description=Bybit XS Reversal Bot (daily rebalance)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/bybit_xsreversal/bybit_xsreversal
+EnvironmentFile=/opt/bybit_xsreversal/bybit_xsreversal/.env
+ExecStart=/opt/bybit_xsreversal/bybit_xsreversal/.venv/bin/bybit-xsreversal live --config config/config.yaml
+Restart=on-failure
+RestartSec=5
+
+# Hardening (optional)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/bybit_xsreversal/bybit_xsreversal/outputs /opt/bybit_xsreversal/bybit_xsreversal/data_cache
+
+[Install]
+WantedBy=multi-user.target
+
+

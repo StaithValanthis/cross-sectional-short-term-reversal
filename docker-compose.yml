@@ -1,0 +1,12 @@
+services:
+  bot:
+    image: python:3.11-slim
+    working_dir: /app
+    volumes:
+      - ./bybit_xsreversal:/app
+    env_file:
+      - ./bybit_xsreversal/.env
+    command: bash -lc "python -m pip install -U pip && pip install -e . && bybit-xsreversal --help"
+    restart: "no"
+
+
