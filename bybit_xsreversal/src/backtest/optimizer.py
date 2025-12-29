@@ -629,6 +629,49 @@ def optimize_config(
         if len(cal) < 30:
             raise ValueError("Not enough aligned daily bars for optimization window.")
 
+        # -----------------------
+        # Train/Test split (OOS)
+        # -----------------------
+        train_frac_env = os.getenv("BYBIT_OPT_TRAIN_FRAC", "").strip()
+        try:
+            train_frac = float(train_frac_env) if train_frac_env else 0.7
+        except Exception:
+            train_frac = 0.7
+        train_frac = float(min(0.9, max(0.5, train_frac)))
+
+        min_test_days_env = os.getenv("BYBIT_OPT_MIN_TEST_DAYS", "").strip()
+        try:
+            min_test_days = int(min_test_days_env) if min_test_days_env else 60
+        except Exception:
+            min_test_days = 60
+        min_test_days = max(30, min_test_days)
+
+        split_idx = int(np.floor(len(cal) * train_frac))
+        split_idx = max(2, min(split_idx, len(cal) - 2))
+        cal_train = cal[:split_idx]
+        cal_test = cal[split_idx:]
+        if len(cal_test) < min_test_days:
+            # If the window is too small to support a useful OOS slice, fall back to a single window.
+            logger.warning(
+                "Optimization window too small for test split (cal={} train={} test={} < min_test_days={}); disabling OOS split for this run.",
+                len(cal),
+                len(cal_train),
+                len(cal_test),
+                min_test_days,
+            )
+            cal_train = cal
+            cal_test = pd.DatetimeIndex([])
+        else:
+            logger.info(
+                "Optimizer train/test split: train_days={} ({} -> {}), test_days={} ({} -> {})",
+                len(cal_train),
+                cal_train[0].date().isoformat(),
+                cal_train[-1].date().isoformat(),
+                len(cal_test),
+                cal_test[0].date().isoformat(),
+                cal_test[-1].date().isoformat(),
+            )
+
         # Prepare data matrix once for fast candidate evaluation.
         # IMPORTANT: This history requirement must be aligned with stage2's shared strategy logic,
         # which enforces cfg.universe.min_history_days. If stage1 uses a looser min history,
@@ -643,6 +686,12 @@ def optimize_config(
         cal_stage2 = _calendar_from_any(candles_stage2, start, end)
         if len(cal_stage2) >= 30:
             cal = cal_stage2
+
+        # Stage1 should optimize on TRAIN only (to avoid leaking test data into selection)
+        if close is not None and not close.empty:
+            close_train = close.loc[(close.index >= cal_train[0]) & (close.index <= cal_train[-1])]
+        else:
+            close_train = close
 
         # Funding daily rates cache for stage2 (and for optional funding filter)
         funding_daily: dict[str, pd.Series] = {}
@@ -709,7 +758,7 @@ def optimize_config(
                 # Evaluate candidate quickly (vectorized)
                 use_maker = bool(cfg.execution.order_type == "limit" and cfg.execution.post_only)
                 m = _simulate_candidate_vectorized(
-                    close=close,
+                    close=close_train,
                     lookback_days=int(cand.lookback_days),
                     vol_lookback_days=int(cand.vol_lookback_days),
                     q=float(cand.long_quantile),
@@ -837,11 +886,17 @@ def optimize_config(
                         trial.funding.filter.enabled = bool(cand2.funding_filter_enabled)
                         trial.funding.filter.max_abs_daily_funding_rate = float(cand2.funding_max_abs_daily_rate)
 
-                        eq2, dr2, to2 = _simulate_candidate_full(cfg=trial, candles=candles_stage2, market_df=market_df, calendar=cal, funding_daily=funding_daily)
+                        eq2, dr2, to2 = _simulate_candidate_full(cfg=trial, candles=candles_stage2, market_df=market_df, calendar=cal_train, funding_daily=funding_daily)
                         m2 = compute_metrics(eq2, dr2, to2)
                         # Reject degenerate curves: if we barely traded / produced too few daily points,
                         # annualized metrics (especially CAGR) can become meaningless.
-                        if eq2.empty or dr2.empty or len(eq2) < 90 or len(dr2) < 90 or not _metrics_ok(m2):
+                        min_pts_env = os.getenv("BYBIT_OPT_MIN_POINTS", "").strip()
+                        try:
+                            min_pts = int(min_pts_env) if min_pts_env else 90
+                        except Exception:
+                            min_pts = 90
+                        min_pts = max(30, min_pts)
+                        if eq2.empty or dr2.empty or len(eq2) < min_pts or len(dr2) < min_pts or not _metrics_ok(m2):
                             raise ValueError("stage2_invalid_metrics")
                         key2 = (-float(m2.sharpe), -float(m2.cagr), abs(float(m2.max_drawdown)), float(m2.avg_daily_turnover))
                         row2 = {
@@ -917,9 +972,15 @@ def optimize_config(
                     trial.funding.filter.enabled = bool(cand2.funding_filter_enabled)
                     trial.funding.filter.max_abs_daily_funding_rate = float(cand2.funding_max_abs_daily_rate)
 
-                    eq2, dr2, to2 = _simulate_candidate_full(cfg=trial, candles=candles_stage2, market_df=market_df, calendar=cal, funding_daily=funding_daily)
+                    eq2, dr2, to2 = _simulate_candidate_full(cfg=trial, candles=candles_stage2, market_df=market_df, calendar=cal_train, funding_daily=funding_daily)
                     m2 = compute_metrics(eq2, dr2, to2)
-                    if eq2.empty or dr2.empty or len(eq2) < 90 or len(dr2) < 90 or not _metrics_ok(m2):
+                    min_pts_env = os.getenv("BYBIT_OPT_MIN_POINTS", "").strip()
+                    try:
+                        min_pts = int(min_pts_env) if min_pts_env else 90
+                    except Exception:
+                        min_pts = 90
+                    min_pts = max(30, min_pts)
+                    if eq2.empty or dr2.empty or len(eq2) < min_pts or len(dr2) < min_pts or not _metrics_ok(m2):
                         raise ValueError("stage2_invalid_metrics")
                     key2 = (-float(m2.sharpe), -float(m2.cagr), abs(float(m2.max_drawdown)), float(m2.avg_daily_turnover))
                     row2 = {
@@ -980,6 +1041,72 @@ def optimize_config(
         else:
             logger.warning("Stage2 had no results; falling back to stage1 selection.")
             # best_cand and best_row are already set from Stage 1 above
+
+        # Evaluate the selected params Out-Of-Sample (test window) for sanity.
+        oos_metrics: dict[str, Any] | None = None
+        if len(cal_test) >= 2:
+            try:
+                trial = cfg.model_copy(deep=True)
+                trial.signal.lookback_days = int(best_cand.lookback_days)  # type: ignore[assignment]
+                trial.signal.long_quantile = float(best_cand.long_quantile)
+                trial.signal.short_quantile = float(best_cand.short_quantile)
+                trial.sizing.target_gross_leverage = float(best_cand.target_gross_leverage)
+                trial.sizing.vol_lookback_days = int(best_cand.vol_lookback_days)
+                trial.rebalance.time_utc = str(best_cand.rebalance_time_utc)
+                trial.rebalance.interval_days = int(best_cand.interval_days)
+                trial.rebalance.rebalance_fraction = float(best_cand.rebalance_fraction)
+                trial.rebalance.min_weight_change_bps = float(best_cand.min_weight_change_bps)
+                trial.filters.regime_filter.action = str(best_cand.regime_action)  # type: ignore[assignment]
+                trial.funding.filter.enabled = bool(best_cand.funding_filter_enabled)
+                trial.funding.filter.max_abs_daily_funding_rate = float(best_cand.funding_max_abs_daily_rate)
+
+                eq_oos, dr_oos, to_oos = _simulate_candidate_full(
+                    cfg=trial,
+                    candles=candles_stage2,
+                    market_df=market_df,
+                    calendar=cal_test,
+                    funding_daily=funding_daily,
+                )
+                m_oos = compute_metrics(eq_oos, dr_oos, to_oos)
+                oos_metrics = {
+                    "sharpe": float(m_oos.sharpe),
+                    "cagr": float(m_oos.cagr),
+                    "max_drawdown": float(m_oos.max_drawdown),
+                    "avg_daily_turnover": float(m_oos.avg_daily_turnover),
+                    "test_days": int(len(eq_oos)),
+                    "test_start": cal_test[0].date().isoformat(),
+                    "test_end": cal_test[-1].date().isoformat(),
+                }
+                (out / "oos_best.json").write_text(
+                    json.dumps(
+                        {
+                            "split": {
+                                "train_days": int(len(cal_train)),
+                                "train_start": cal_train[0].date().isoformat(),
+                                "train_end": cal_train[-1].date().isoformat(),
+                                "test_days": int(len(cal_test)),
+                                "test_start": cal_test[0].date().isoformat(),
+                                "test_end": cal_test[-1].date().isoformat(),
+                            },
+                            "best_candidate": best_cand.__dict__,
+                            "train": best_row,
+                            "test": oos_metrics,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    ),
+                    encoding="utf-8",
+                )
+                logger.info(
+                    "OOS (test) metrics for selected params: Sharpe={:.3f} CAGR={:.2%} MaxDD={:.2%} Turnover={:.3f} Days={}",
+                    float(m_oos.sharpe),
+                    float(m_oos.cagr),
+                    float(m_oos.max_drawdown),
+                    float(m_oos.avg_daily_turnover),
+                    int(len(eq_oos)),
+                )
+            except Exception as e:
+                logger.warning("OOS evaluation failed; continuing without OOS metrics: {}", e)
 
         # Debug: summarize stage2 outcomes (why did we get no results?)
         try:
@@ -1087,6 +1214,7 @@ def optimize_config(
         )
         return {
             "best": best_row,
+            "oos": oos_metrics,
             "output_dir": str(out.resolve()),
             "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
             "universe_size": len(symbols),
