@@ -150,6 +150,27 @@ class BybitClient:
         data = self._request("GET", "/v5/market/instruments-info", params, None)
         return list((data.get("result") or {}).get("list") or [])
 
+    def get_funding_history(
+        self,
+        *,
+        category: str,
+        symbol: str,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """
+        Funding history endpoint (USDT linear perps).
+        Bybit v5: /v5/market/funding/history
+        """
+        params: dict[str, Any] = {"category": category, "symbol": symbol, "limit": limit}
+        if start_ms is not None:
+            params["startTime"] = int(start_ms)
+        if end_ms is not None:
+            params["endTime"] = int(end_ms)
+        data = self._request("GET", "/v5/market/funding/history", params, None)
+        return list((data.get("result") or {}).get("list") or [])
+
     # -------- Account/positions/orders (auth required) --------
     def get_wallet_balance(self, *, account_type: str = "UNIFIED") -> dict[str, Any]:
         if self._auth is None:

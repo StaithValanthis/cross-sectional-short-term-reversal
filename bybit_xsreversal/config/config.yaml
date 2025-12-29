@@ -9,6 +9,7 @@ universe:
   include_symbols: []
   min_24h_quote_volume: 0.0
   min_open_interest: 0.0
+  min_history_days: 120
   liquidity_bucket:
     enabled: false
     exclude_top_k: 0
@@ -23,6 +24,9 @@ rebalance:
   frequency: daily
   time_utc: 00:05
   candle_close_delay_seconds: 30
+  interval_days: 1
+  rebalance_fraction: 1.0
+  min_weight_change_bps: 5.0
 sizing:
   target_gross_leverage: 1.21
   vol_lookback_days: 21
@@ -43,6 +47,12 @@ filters:
     ema_slow: 50
     action: scale_down
     scale_factor: 0.35
+funding:
+  model_in_backtest: true
+  filter:
+    enabled: false
+    max_abs_daily_funding_rate: 0.003
+    use_mainnet_data_even_on_testnet: true
 execution:
   order_type: limit
   maker_bias: true

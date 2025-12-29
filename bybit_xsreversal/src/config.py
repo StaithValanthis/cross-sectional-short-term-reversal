@@ -27,6 +27,7 @@ class UniverseConfig(BaseModel):
     include_symbols: list[str] = Field(default_factory=list)
     min_24h_quote_volume: float = 0.0
     min_open_interest: float = 0.0
+    min_history_days: int = 120
     liquidity_bucket: LiquidityBucketConfig = Field(default_factory=LiquidityBucketConfig)
 
 
@@ -41,6 +42,9 @@ class RebalanceConfig(BaseModel):
     frequency: Literal["daily"] = "daily"
     time_utc: str = "00:05"  # HH:MM
     candle_close_delay_seconds: int = 30
+    interval_days: int = 1
+    rebalance_fraction: float = 1.0  # 1.0 = full rebalance, 0.5 = half-way toward target
+    min_weight_change_bps: float = 5.0  # skip trades below this weight delta (bps of equity)
 
 
 class SizingConfig(BaseModel):
@@ -59,7 +63,7 @@ class RegimeFilterConfig(BaseModel):
     symbol_adx_threshold: float = 30.0
     ema_fast: int = 20
     ema_slow: int = 50
-    action: Literal["skip", "scale_down"] = "scale_down"
+    action: Literal["skip", "scale_down", "switch_to_momentum"] = "scale_down"
     scale_factor: float = 0.35
 
 
@@ -68,6 +72,17 @@ class FiltersConfig(BaseModel):
     min_orderbook_depth_usd: float = 5_000.0
     depth_band_bps: float = 15.0
     regime_filter: RegimeFilterConfig = Field(default_factory=RegimeFilterConfig)
+
+
+class FundingFilterConfig(BaseModel):
+    enabled: bool = False
+    max_abs_daily_funding_rate: float = 0.003  # 30 bps/day approx (sum of 8h rates)
+    use_mainnet_data_even_on_testnet: bool = True
+
+
+class FundingConfig(BaseModel):
+    model_in_backtest: bool = True
+    filter: FundingFilterConfig = Field(default_factory=FundingFilterConfig)
 
 
 class ExecutionConfig(BaseModel):
@@ -112,6 +127,7 @@ class BotConfig(BaseModel):
     rebalance: RebalanceConfig = Field(default_factory=RebalanceConfig)
     sizing: SizingConfig = Field(default_factory=SizingConfig)
     filters: FiltersConfig = Field(default_factory=FiltersConfig)
+    funding: FundingConfig = Field(default_factory=FundingConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     backtest: BacktestConfig

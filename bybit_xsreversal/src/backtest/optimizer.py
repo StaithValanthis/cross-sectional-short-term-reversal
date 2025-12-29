@@ -36,6 +36,12 @@ class Candidate:
     target_gross_leverage: float
     rebalance_time_utc: str
     vol_lookback_days: int
+    interval_days: int
+    rebalance_fraction: float
+    min_weight_change_bps: float
+    regime_action: str
+    funding_filter_enabled: bool
+    funding_max_abs_daily_rate: float
 
 
 def _parse_date(d: str) -> datetime:
@@ -167,6 +173,7 @@ def _simulate_candidate_full(
     candles: dict[str, pd.DataFrame],
     market_df: pd.DataFrame | None,
     calendar: pd.DatetimeIndex,
+    funding_daily: dict[str, pd.Series] | None,
 ) -> tuple[pd.Series, pd.Series, pd.Series]:
     """
     Full (slow) simulation consistent with the main backtester logic:
@@ -181,23 +188,37 @@ def _simulate_candidate_full(
     eq_curve: list[tuple[datetime, float]] = []
     dr: list[tuple[datetime, float]] = []
     to: list[tuple[datetime, float]] = []
+    interval_days = max(1, int(cfg.rebalance.interval_days))
 
     for i in range(0, len(calendar) - 1):
         asof = calendar[i]
         nxt = calendar[i + 1]
 
-        day_candles = {s: df.loc[:asof] for s, df in candles.items() if asof in df.index}
-        if len(day_candles) < 5:
-            continue
+        if i % interval_days == 0:
+            day_candles = {s: df.loc[:asof] for s, df in candles.items() if asof in df.index}
+            if len(day_candles) < 5:
+                continue
 
-        targets, _ = compute_targets_from_daily_candles(
-            candles=day_candles,
-            config=cfg,
-            equity_usd=equity,
-            asof=asof.to_pydatetime(),
-            market_proxy_candles=market_df.loc[:asof] if market_df is not None else None,
-        )
-        w = targets.weights
+            fr_today: dict[str, float] = {}
+            if cfg.funding.filter.enabled and funding_daily:
+                day_key = asof.floor("D")
+                for s in day_candles.keys():
+                    ser = funding_daily.get(s)
+                    if ser is not None and not ser.empty and day_key in ser.index:
+                        fr_today[s] = float(ser.loc[day_key])
+
+            targets, _ = compute_targets_from_daily_candles(
+                candles=day_candles,
+                config=cfg,
+                equity_usd=equity,
+                asof=asof.to_pydatetime(),
+                market_proxy_candles=market_df.loc[:asof] if market_df is not None else None,
+                current_weights=prev_w,
+                funding_daily_rate=fr_today if fr_today else None,
+            )
+            w = targets.weights
+        else:
+            w = dict(prev_w)
         syms = set(prev_w) | set(w)
         turnover = float(sum(abs(w.get(s, 0.0) - prev_w.get(s, 0.0)) for s in syms))
         traded_notional = turnover * equity
@@ -213,9 +234,20 @@ def _simulate_candidate_full(
             r = px1 / px0 - 1.0
             port_ret += float(ws) * float(r)
 
-        equity = equity * (1.0 + port_ret) - tc_cost
+        funding_pnl = 0.0
+        if cfg.funding.model_in_backtest and funding_daily:
+            day_key = nxt.floor("D")
+            for s, ws in w.items():
+                ser = funding_daily.get(s)
+                if ser is None or ser.empty or day_key not in ser.index:
+                    continue
+                fr = float(ser.loc[day_key])
+                notional = float(ws) * float(equity)
+                funding_pnl += -notional * fr
+
+        equity = equity * (1.0 + port_ret) - tc_cost + funding_pnl
         eq_curve.append((nxt.to_pydatetime(), equity))
-        dr.append((nxt.to_pydatetime(), port_ret - (tc_cost / max(1e-12, equity))))
+        dr.append((nxt.to_pydatetime(), port_ret + (funding_pnl / max(1e-12, equity)) - (tc_cost / max(1e-12, equity))))
         to.append((asof.to_pydatetime(), turnover))
         prev_w = w
 
@@ -239,6 +271,13 @@ def _random_candidates(
     # Leverage exploration (gross)
     lev_low, lev_high = 0.5, 1.75
 
+    interval_choices = np.array([1, 2, 3], dtype=int)
+    frac_low, frac_high = 0.25, 1.0
+    thresh_choices = np.array([0.0, 2.0, 5.0, 10.0, 20.0], dtype=float)  # bps
+    regime_actions = ["scale_down", "switch_to_momentum"]
+    funding_enabled_choices = [False, True]
+    funding_max_choices = np.array([0.001, 0.002, 0.003, 0.005], dtype=float)
+
     out: list[Candidate] = []
     for _ in range(n):
         lb = int(rng.choice(lookbacks))
@@ -248,6 +287,13 @@ def _random_candidates(
         q = round(q, 2)
         lev = float(rng.uniform(lev_low, lev_high))
         lev = round(lev, 2)
+        interval = int(rng.choice(interval_choices))
+        frac = float(rng.uniform(frac_low, frac_high))
+        frac = round(frac, 2)
+        thresh = float(rng.choice(thresh_choices))
+        regime_action = str(rng.choice(regime_actions))
+        fund_en = bool(rng.choice(funding_enabled_choices))
+        fund_max = float(rng.choice(funding_max_choices))
         out.append(
             Candidate(
                 lookback_days=lb,
@@ -256,10 +302,30 @@ def _random_candidates(
                 target_gross_leverage=lev,
                 rebalance_time_utc=str(default_time_utc),
                 vol_lookback_days=vlb,
+                interval_days=interval,
+                rebalance_fraction=frac,
+                min_weight_change_bps=thresh,
+                regime_action=regime_action,
+                funding_filter_enabled=fund_en,
+                funding_max_abs_daily_rate=fund_max,
             )
         )
     # de-dup
-    uniq = {(c.lookback_days, c.long_quantile, c.target_gross_leverage, c.vol_lookback_days): c for c in out}
+    uniq = {
+        (
+            c.lookback_days,
+            c.long_quantile,
+            c.target_gross_leverage,
+            c.vol_lookback_days,
+            c.interval_days,
+            c.rebalance_fraction,
+            c.min_weight_change_bps,
+            c.regime_action,
+            c.funding_filter_enabled,
+            c.funding_max_abs_daily_rate,
+        ): c
+        for c in out
+    }
     return list(uniq.values())
 
 
@@ -268,8 +334,16 @@ def _grid_candidates(*, default_time_utc: str) -> list[Candidate]:
     qs = [0.05, 0.10, 0.15, 0.20]
     levs = [0.5, 0.75, 1.0, 1.25, 1.5]
     vol_lbs = [14, 30]
+    intervals = [1, 2]
+    fracs = [0.5, 1.0]
+    thresh_bps = [0.0, 5.0, 10.0]
+    regime_actions = ["scale_down", "switch_to_momentum"]
+    funding_enabled = [False, True]
+    funding_max = [0.002, 0.003]
     out: list[Candidate] = []
-    for lb, q, lev, vlb in itertools.product(lookbacks, qs, levs, vol_lbs):
+    for lb, q, lev, vlb, interval, frac, thr, ra, fe, fm in itertools.product(
+        lookbacks, qs, levs, vol_lbs, intervals, fracs, thresh_bps, regime_actions, funding_enabled, funding_max
+    ):
         out.append(
             Candidate(
                 lookback_days=int(lb),
@@ -278,6 +352,12 @@ def _grid_candidates(*, default_time_utc: str) -> list[Candidate]:
                 target_gross_leverage=float(lev),
                 rebalance_time_utc=str(default_time_utc),
                 vol_lookback_days=int(vlb),
+                interval_days=int(interval),
+                rebalance_fraction=float(frac),
+                min_weight_change_bps=float(thr),
+                regime_action=str(ra),
+                funding_filter_enabled=bool(fe),
+                funding_max_abs_daily_rate=float(fm),
             )
         )
     return out
@@ -320,6 +400,9 @@ def _simulate_candidate_vectorized(
     vol_lookback_days: int,
     q: float,
     gross_leverage: float,
+    interval_days: int,
+    rebalance_fraction: float,
+    min_weight_change_bps: float,
     maker_fee_bps: float,
     taker_fee_bps: float,
     slippage_bps: float,
@@ -351,12 +434,20 @@ def _simulate_candidate_vectorized(
     r_lb = px / px.shift(lookback_days) - 1.0
     vol = r1.rolling(vol_lookback_days, min_periods=vol_lookback_days).std(ddof=0)
 
+    interval_days = max(1, int(interval_days))
+    rebalance_fraction = max(0.0, min(1.0, float(rebalance_fraction)))
+    min_w_delta = float(min_weight_change_bps) / 10_000.0
+
     # Weights matrix (T x N)
     weights = pd.DataFrame(0.0, index=px.index, columns=px.columns)
 
     q = float(q)
+    prev_w = pd.Series(0.0, index=px.columns)
     for t in range(len(px.index)):
         dt = px.index[t]
+        if t % interval_days != 0:
+            weights.loc[dt] = prev_w.values
+            continue
         ret_row = r_lb.loc[dt]
         vol_row = vol.loc[dt]
         # eligible symbols
@@ -386,7 +477,17 @@ def _simulate_candidate_vectorized(
         w = pd.Series(0.0, index=px.columns)
         w.loc[w_l.index] = w_l.values
         w.loc[w_s.index] = -w_s.values
-        weights.loc[dt] = w
+        # Turnover control approximation: partial rebalance + threshold
+        w_new = prev_w + rebalance_fraction * (w - prev_w)
+        if min_w_delta > 0:
+            keep = (w_new - prev_w).abs() < min_w_delta
+            w_new[keep] = prev_w[keep]
+        # Scale down if gross exceeds cap
+        gross = float(w_new.abs().sum())
+        if gross > gross_leverage and gross > 0:
+            w_new = w_new * (gross_leverage / gross)
+        weights.loc[dt] = w_new.values
+        prev_w = w_new
 
     weights = weights.dropna(how="all")
     if weights.empty or len(weights) < 30:
@@ -498,6 +599,16 @@ def optimize_config(
         min_hist = int(max(80, 2 * max(cfg.sizing.vol_lookback_days, 30)))
         close = _prepare_close_matrix(candles, start=start, end=end, min_history_days=min_hist, max_symbols=60)
 
+        # Funding daily rates cache for stage2 (and for optional funding filter)
+        funding_daily: dict[str, pd.Series] = {}
+        force_mainnet_funding = bool(cfg.funding.filter.use_mainnet_data_even_on_testnet and cfg.exchange.testnet)
+        if cfg.funding.model_in_backtest or cfg.funding.filter.enabled:
+            for s in candles.keys():
+                try:
+                    funding_daily[s] = md.get_daily_funding_rate(s, fetch_start, fetch_end, force_mainnet=force_mainnet_funding)
+                except Exception:
+                    continue
+
         best = None
         best_key: tuple[float, float, float, float] | None = None
         rows: list[dict[str, Any]] = []
@@ -558,6 +669,9 @@ def optimize_config(
                     vol_lookback_days=int(cand.vol_lookback_days),
                     q=float(cand.long_quantile),
                     gross_leverage=float(cand.target_gross_leverage),
+                    interval_days=int(cand.interval_days),
+                    rebalance_fraction=float(cand.rebalance_fraction),
+                    min_weight_change_bps=float(cand.min_weight_change_bps),
                     maker_fee_bps=float(cfg.backtest.maker_fee_bps),
                     taker_fee_bps=float(cfg.backtest.taker_fee_bps),
                     slippage_bps=float(cfg.backtest.slippage_bps),
@@ -669,8 +783,14 @@ def optimize_config(
                     trial.sizing.target_gross_leverage = float(cand2.target_gross_leverage)
                     trial.sizing.vol_lookback_days = int(cand2.vol_lookback_days)
                     trial.rebalance.time_utc = str(cand2.rebalance_time_utc)
+                    trial.rebalance.interval_days = int(cand2.interval_days)
+                    trial.rebalance.rebalance_fraction = float(cand2.rebalance_fraction)
+                    trial.rebalance.min_weight_change_bps = float(cand2.min_weight_change_bps)
+                    trial.filters.regime_filter.action = str(cand2.regime_action)  # type: ignore[assignment]
+                    trial.funding.filter.enabled = bool(cand2.funding_filter_enabled)
+                    trial.funding.filter.max_abs_daily_funding_rate = float(cand2.funding_max_abs_daily_rate)
 
-                    eq2, dr2, to2 = _simulate_candidate_full(cfg=trial, candles=candles, market_df=market_df, calendar=cal)
+                    eq2, dr2, to2 = _simulate_candidate_full(cfg=trial, candles=candles, market_df=market_df, calendar=cal, funding_daily=funding_daily)
                     m2 = compute_metrics(eq2, dr2, to2)
                     row2 = {
                         "candidate": cand2.__dict__,
@@ -700,8 +820,14 @@ def optimize_config(
                 trial.sizing.target_gross_leverage = float(cand2.target_gross_leverage)
                 trial.sizing.vol_lookback_days = int(cand2.vol_lookback_days)
                 trial.rebalance.time_utc = str(cand2.rebalance_time_utc)
+                trial.rebalance.interval_days = int(cand2.interval_days)
+                trial.rebalance.rebalance_fraction = float(cand2.rebalance_fraction)
+                trial.rebalance.min_weight_change_bps = float(cand2.min_weight_change_bps)
+                trial.filters.regime_filter.action = str(cand2.regime_action)  # type: ignore[assignment]
+                trial.funding.filter.enabled = bool(cand2.funding_filter_enabled)
+                trial.funding.filter.max_abs_daily_funding_rate = float(cand2.funding_max_abs_daily_rate)
 
-                eq2, dr2, to2 = _simulate_candidate_full(cfg=trial, candles=candles, market_df=market_df, calendar=cal)
+                eq2, dr2, to2 = _simulate_candidate_full(cfg=trial, candles=candles, market_df=market_df, calendar=cal, funding_daily=funding_daily)
                 m2 = compute_metrics(eq2, dr2, to2)
                 row2 = {
                     "candidate": cand2.__dict__,
@@ -775,9 +901,17 @@ def optimize_config(
         raw["signal"]["long_quantile"] = float(best_cand.long_quantile)
         raw["signal"]["short_quantile"] = float(best_cand.short_quantile)
         raw["rebalance"]["time_utc"] = str(best_cand.rebalance_time_utc)
+        raw["rebalance"]["interval_days"] = int(best_cand.interval_days)
+        raw["rebalance"]["rebalance_fraction"] = float(best_cand.rebalance_fraction)
+        raw["rebalance"]["min_weight_change_bps"] = float(best_cand.min_weight_change_bps)
         raw["sizing"]["target_gross_leverage"] = float(best_cand.target_gross_leverage)
         raw.setdefault("sizing", {})
         raw["sizing"]["vol_lookback_days"] = int(best_cand.vol_lookback_days)
+        raw.setdefault("filters", {}).setdefault("regime_filter", {})
+        raw["filters"]["regime_filter"]["action"] = str(best_cand.regime_action)
+        raw.setdefault("funding", {}).setdefault("filter", {})
+        raw["funding"]["filter"]["enabled"] = bool(best_cand.funding_filter_enabled)
+        raw["funding"]["filter"]["max_abs_daily_funding_rate"] = float(best_cand.funding_max_abs_daily_rate)
 
         import yaml
 

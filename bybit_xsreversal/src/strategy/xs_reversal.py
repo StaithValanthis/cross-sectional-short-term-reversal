@@ -42,6 +42,8 @@ def compute_targets_from_daily_candles(
     equity_usd: float,
     asof: datetime | None = None,
     market_proxy_candles: pd.DataFrame | None = None,
+    current_weights: dict[str, float] | None = None,
+    funding_daily_rate: dict[str, float] | None = None,
 ) -> tuple[PortfolioTargets, RebalanceSnapshot]:
     """
     Shared core used by backtest and live:
@@ -60,6 +62,7 @@ def compute_targets_from_daily_candles(
 
     lookback = int(config.signal.lookback_days)
     vol_lb = int(config.sizing.vol_lookback_days)
+    min_hist = int(max(config.universe.min_history_days, 30))
 
     returns: dict[str, float] = {}
     vol: dict[str, float] = {}
@@ -71,7 +74,7 @@ def compute_targets_from_daily_candles(
             exclusions[sym] = "missing_asof_candle"
             continue
         sub = df.loc[:asof].copy()
-        if len(sub) < max(lookback + 1, vol_lb + 2, 30):
+        if len(sub) < max(lookback + 1, vol_lb + 2, min_hist):
             exclusions[sym] = "insufficient_history"
             continue
         close = sub["close"].astype(float)
@@ -87,7 +90,20 @@ def compute_targets_from_daily_candles(
     if len(universe) < 5:
         raise ValueError(f"Universe too small after data checks: {len(universe)}")
 
-    # Cross-sectional rank by lookback return
+    # Optional funding filter (daily aggregate funding rate)
+    if config.funding.filter.enabled and funding_daily_rate is not None:
+        max_abs = float(config.funding.filter.max_abs_daily_funding_rate)
+        for sym in list(universe):
+            fr = funding_daily_rate.get(sym)
+            if fr is None:
+                continue
+            if abs(float(fr)) > max_abs:
+                exclusions[sym] = "funding_filter"
+                returns.pop(sym, None)
+                vol.pop(sym, None)
+        universe = sorted(returns.keys())
+
+    # Cross-sectional rank by lookback return (reversal by default)
     ranked = sorted(universe, key=lambda s: returns[s])
     n = len(ranked)
 
@@ -98,6 +114,27 @@ def compute_targets_from_daily_candles(
 
     selected_longs = ranked[:k_long]
     selected_shorts = ranked[-k_short:] if not config.signal.long_only else []
+
+    # Regime-aware signal direction: in strong market trend we can switch to momentum.
+    signal_mode: str = "reversal"
+    rf = config.filters.regime_filter
+    market_df = market_proxy_candles if (rf.enabled and rf.use_market_regime) else None
+    if rf.enabled and market_df is not None:
+        mdec = regime_gate(
+            symbol_df=market_df,
+            market_df=None,
+            symbol_adx_threshold=rf.market_adx_threshold,
+            market_adx_threshold=rf.market_adx_threshold,
+            ema_fast=rf.ema_fast,
+            ema_slow=rf.ema_slow,
+            action=rf.action,
+            scale_factor=rf.scale_factor,
+        )
+        if mdec.action == "switch_to_momentum":
+            signal_mode = "momentum"
+            # Flip selection: long winners, short losers
+            selected_longs = ranked[-k_long:]
+            selected_shorts = ranked[:k_short] if not config.signal.long_only else []
 
     # Inverse vol scores (equal risk)
     long_scores = {s: 1.0 / vol[s] for s in selected_longs}
@@ -111,12 +148,10 @@ def compute_targets_from_daily_candles(
         long_only=bool(config.signal.long_only),
     )
 
-    # Optional regime gating: scale all weights down (or skip) if strong market trend
+    # Optional regime gating: scale all weights down (or skip) in strong trends
     final_weights = dict(raw_weights)
     regime_meta: dict[str, Any] = {}
-    rf = config.filters.regime_filter
     if rf.enabled:
-        market_df = market_proxy_candles if rf.use_market_regime else None
         # Market regime decision (single) can scale the whole book.
         if market_df is not None:
             mdec = regime_gate(
@@ -155,6 +190,29 @@ def compute_targets_from_daily_candles(
     # Drop tiny weights induced by scaling
     final_weights = {k: float(v) for k, v in final_weights.items() if abs(float(v)) > 1e-8}
 
+    # Turnover controls: partial rebalance + thresholding (shared with live/backtest)
+    if current_weights is not None:
+        frac = float(config.rebalance.rebalance_fraction)
+        frac = max(0.0, min(1.0, frac))
+        thresh = float(config.rebalance.min_weight_change_bps) / 10_000.0
+        union = set(current_weights) | set(final_weights)
+        blended: dict[str, float] = {}
+        for s in union:
+            cur = float(current_weights.get(s, 0.0))
+            tgt = float(final_weights.get(s, 0.0))
+            new = cur + frac * (tgt - cur)
+            if abs(new - cur) < thresh:
+                new = cur
+            if abs(new) > 1e-10:
+                blended[s] = new
+        # Safety: don't exceed target gross; scale down only (never scale up)
+        gross = sum(abs(v) for v in blended.values())
+        cap = float(config.sizing.target_gross_leverage)
+        if gross > cap and gross > 0:
+            scale = cap / gross
+            blended = {k: v * scale for k, v in blended.items()}
+        final_weights = blended
+
     notionals = weights_to_notionals(
         final_weights,
         equity_usd=float(equity_usd),
@@ -172,6 +230,7 @@ def compute_targets_from_daily_candles(
         "k_long": k_long,
         "k_short": 0 if config.signal.long_only else k_short,
         "exclusions": exclusions,
+        "signal_mode": signal_mode,
         "regime": regime_meta,
     }
 

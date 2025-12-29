@@ -53,6 +53,7 @@ def run_live(cfg: BotConfig, *, dry_run: bool) -> None:
     client = BybitClient(auth=auth, testnet=cfg.exchange.testnet)
     md = MarketData(client=client, config=cfg, cache_dir=cfg.backtest.cache_dir)
     risk = RiskManager(cfg=cfg.risk, state_dir=Path("outputs") / "state")
+    state_path = Path("outputs") / "state" / "rebalance_state.json"
 
     try:
         while True:
@@ -69,6 +70,20 @@ def run_live(cfg: BotConfig, *, dry_run: bool) -> None:
             close_ts = last_complete_daily_close(rb_now, cfg.rebalance.candle_close_delay_seconds)
             asof_bar = close_ts - timedelta(days=1)
             logger.info("Rebalance now={} using last complete daily bar start={}", rb_now.isoformat(), asof_bar.isoformat())
+
+            # Rebalance interval control (stateful)
+            interval_days = max(1, int(cfg.rebalance.interval_days))
+            if interval_days > 1 and state_path.exists():
+                try:
+                    st = orjson.loads(state_path.read_bytes())
+                    last = st.get("last_rebalance_day")
+                    if last:
+                        last_dt = datetime.fromisoformat(last).replace(tzinfo=UTC)
+                        if (asof_bar.date() - last_dt.date()).days < interval_days:
+                            logger.info("Skipping rebalance due to interval_days={} (last={})", interval_days, last_dt.date().isoformat())
+                            continue
+                except Exception as e:
+                    logger.warning("Failed to parse rebalance_state.json: {}", e)
 
             # Universe + microstructure filtering
             symbols = [normalize_symbol(s) for s in md.get_liquidity_ranked_symbols()]
@@ -87,12 +102,49 @@ def run_live(cfg: BotConfig, *, dry_run: bool) -> None:
                 logger.warning("Universe too small after spread/depth filters: {}", len(passed))
                 continue
 
+            # Funding filter (optional)
+            funding_meta: dict[str, Any] = {}
+            if cfg.funding.filter.enabled:
+                force_mainnet = bool(cfg.funding.filter.use_mainnet_data_even_on_testnet and cfg.exchange.testnet)
+                max_abs = float(cfg.funding.filter.max_abs_daily_funding_rate)
+                kept: list[str] = []
+                for s in passed:
+                    try:
+                        fr = md.get_latest_daily_funding_rate(s, force_mainnet=force_mainnet)
+                        funding_meta[s] = {"daily_funding_rate": fr}
+                        if fr is None or abs(float(fr)) <= max_abs:
+                            kept.append(s)
+                    except Exception as e:
+                        funding_meta[s] = {"error": str(e)}
+                passed = kept
+
+            if len(passed) < 5:
+                logger.warning("Universe too small after funding filter: {}", len(passed))
+                continue
+
             # Equity + risk check
             equity = fetch_equity_usdt(client=client)
             ok, risk_info = risk.check(equity)
             if not ok:
                 logger.error("Risk kill-switch active; skipping trades: {}", risk_info)
                 continue
+
+            # Current weights from positions (for turnover controls)
+            current_weights: dict[str, float] = {}
+            try:
+                positions = client.get_positions(category=cfg.exchange.category, settle_coin="USDT")
+                for p in positions:
+                    sym = normalize_symbol(str(p.get("symbol", "")))
+                    side = str(p.get("side", ""))
+                    size = float(p.get("size") or 0.0)
+                    mark = float(p.get("markPrice") or p.get("avgPrice") or 0.0)
+                    if mark <= 0 or size == 0:
+                        continue
+                    signed = size if side == "Buy" else -size
+                    notional = signed * mark
+                    current_weights[sym] = float(notional) / float(equity) if equity > 0 else 0.0
+            except Exception as e:
+                logger.warning("Failed to compute current weights from positions: {}", e)
 
             # Fetch candles needed for indicators/signal
             buffer_days = int(max(cfg.sizing.vol_lookback_days + 10, cfg.signal.lookback_days + 5, cfg.filters.regime_filter.ema_slow + 20, 40))
@@ -122,6 +174,7 @@ def run_live(cfg: BotConfig, *, dry_run: bool) -> None:
                 equity_usd=equity,
                 asof=asof_bar,
                 market_proxy_candles=market_df,
+                current_weights=current_weights,
             )
 
             _print_targets(console, targets.notionals_usd)
@@ -134,6 +187,7 @@ def run_live(cfg: BotConfig, *, dry_run: bool) -> None:
                 "targets": targets.notionals_usd,
                 "snapshot": snapshot.__dict__,
                 "microstructure": micro_meta,
+                "funding": funding_meta,
                 "risk": risk_info,
                 "config": cfg.model_dump(),
             }
@@ -143,6 +197,13 @@ def run_live(cfg: BotConfig, *, dry_run: bool) -> None:
             res = run_rebalance(cfg=cfg, client=client, md=md, target_notionals=targets.notionals_usd, dry_run=dry_run)
             (out_dir / "execution_result.json").write_bytes(orjson.dumps(res, option=orjson.OPT_INDENT_2))
             logger.info("Rebalance done. Result saved to {}", (out_dir / "execution_result.json").resolve())
+
+            # Update rebalance state
+            try:
+                state_path.parent.mkdir(parents=True, exist_ok=True)
+                state_path.write_bytes(orjson.dumps({"last_rebalance_day": asof_bar.date().isoformat()}, option=orjson.OPT_INDENT_2))
+            except Exception as e:
+                logger.warning("Failed to write rebalance_state.json: {}", e)
     finally:
         client.close()
 

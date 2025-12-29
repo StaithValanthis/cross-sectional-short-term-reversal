@@ -62,6 +62,17 @@ def run_backtest(cfg: BotConfig, md: MarketData, outputs_dir: str | Path) -> Bac
         except Exception as e:
             logger.warning("Skipping {}: candle fetch failed: {}", s, e)
 
+    # Funding daily rates (optional)
+    funding_daily: dict[str, pd.Series] = {}
+    force_mainnet_funding = bool(cfg.funding.filter.use_mainnet_data_even_on_testnet and cfg.exchange.testnet)
+    if cfg.funding.model_in_backtest:
+        logger.info("Fetching funding history (cached) for backtest window (may take a while on first run)...")
+        for s in symbols:
+            try:
+                funding_daily[s] = md.get_daily_funding_rate(s, fetch_start, fetch_end, force_mainnet=force_mainnet_funding)
+            except Exception as e:
+                logger.warning("Funding unavailable for {}: {}", s, e)
+
     # Optional market proxy candles (BTC) for regime gating
     market_df = None
     proxy = cfg.filters.regime_filter.market_proxy_symbol
@@ -88,6 +99,7 @@ def run_backtest(cfg: BotConfig, md: MarketData, outputs_dir: str | Path) -> Bac
 
     equity = float(cfg.backtest.initial_equity)
     prev_weights: dict[str, float] = {}
+    interval_days = max(1, int(cfg.rebalance.interval_days))
 
     equity_curve: list[tuple[datetime, float]] = []
     rets: list[tuple[datetime, float]] = []
@@ -97,20 +109,34 @@ def run_backtest(cfg: BotConfig, md: MarketData, outputs_dir: str | Path) -> Bac
         asof = calendar[i]
         nxt = calendar[i + 1]
 
-        # Build per-symbol slices up to asof
-        day_candles = {s: df.loc[:asof] for s, df in candles.items() if not df.empty and asof in df.index}
-        if len(day_candles) < 5:
-            continue
+        # Rebalance only every interval_days; hold weights otherwise.
+        if i % interval_days == 0:
+            day_candles = {s: df.loc[:asof] for s, df in candles.items() if not df.empty and asof in df.index}
+            if len(day_candles) < 5:
+                continue
 
-        targets, _snap = compute_targets_from_daily_candles(
-            candles=day_candles,
-            config=cfg,
-            equity_usd=equity,
-            asof=asof.to_pydatetime(),
-            market_proxy_candles=market_df.loc[:asof] if market_df is not None else None,
-        )
+            # Funding filter input for this day (optional)
+            fr_today: dict[str, float] = {}
+            if cfg.funding.filter.enabled and funding_daily:
+                day_key = asof.floor("D")
+                for s in day_candles.keys():
+                    ser = funding_daily.get(s)
+                    if ser is not None and not ser.empty and day_key in ser.index:
+                        fr_today[s] = float(ser.loc[day_key])
 
-        w = targets.weights
+            targets, _snap = compute_targets_from_daily_candles(
+                candles=day_candles,
+                config=cfg,
+                equity_usd=equity,
+                asof=asof.to_pydatetime(),
+                market_proxy_candles=market_df.loc[:asof] if market_df is not None else None,
+                current_weights=prev_weights,
+                funding_daily_rate=fr_today if fr_today else None,
+            )
+            w = targets.weights
+        else:
+            w = dict(prev_weights)
+
         # Turnover in weight space
         syms = set(prev_weights) | set(w)
         turnover = float(sum(abs(w.get(s, 0.0) - prev_weights.get(s, 0.0)) for s in syms))
@@ -130,9 +156,21 @@ def run_backtest(cfg: BotConfig, md: MarketData, outputs_dir: str | Path) -> Bac
             r = px1 / px0 - 1.0
             port_ret += float(ws) * float(r)
 
-        equity = equity * (1.0 + port_ret) - tc_cost
+        # Funding PnL approximation (daily aggregate funding rate applied to start-of-period notional)
+        funding_pnl = 0.0
+        if cfg.funding.model_in_backtest and funding_daily:
+            day_key = nxt.floor("D")
+            for s, ws in w.items():
+                ser = funding_daily.get(s)
+                if ser is None or ser.empty or day_key not in ser.index:
+                    continue
+                fr = float(ser.loc[day_key])
+                notional = float(ws) * float(equity)
+                funding_pnl += -notional * fr
+
+        equity = equity * (1.0 + port_ret) - tc_cost + funding_pnl
         equity_curve.append((nxt.to_pydatetime(), equity))
-        rets.append((nxt.to_pydatetime(), port_ret - (tc_cost / max(1e-12, equity))))
+        rets.append((nxt.to_pydatetime(), port_ret + (funding_pnl / max(1e-12, equity)) - (tc_cost / max(1e-12, equity))))
 
         prev_weights = w
 
@@ -147,6 +185,9 @@ def run_backtest(cfg: BotConfig, md: MarketData, outputs_dir: str | Path) -> Bac
         "slippage_bps": slip_bps,
         "turnover_cost_bps": tc_bps,
         "buffer_days": buffer,
+        "interval_days": interval_days,
+        "funding_modeled": bool(cfg.funding.model_in_backtest),
+        "funding_force_mainnet": bool(force_mainnet_funding),
     }
 
     out_dir = Path(outputs_dir)

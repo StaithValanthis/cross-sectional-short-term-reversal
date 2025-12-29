@@ -90,6 +90,9 @@ def regime_gate(
     if strong_symbol or strong_market:
         if action == "skip":
             return RegimeDecision(action="skip", scale=0.0, meta=meta)
+        if action == "switch_to_momentum":
+            # Strategy-level action: caller may flip signal direction in strong-trend regimes.
+            return RegimeDecision(action="switch_to_momentum", scale=1.0, meta=meta)
         return RegimeDecision(action="scale_down", scale=float(scale_factor), meta=meta)
 
     return RegimeDecision(action="pass", scale=1.0, meta=meta)

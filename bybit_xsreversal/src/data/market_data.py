@@ -11,7 +11,7 @@ from loguru import logger
 
 from src.config import BotConfig
 from src.data.bybit_client import BybitClient
-from src.data.caching import load_cached_candles, save_cached_candles, write_json
+from src.data.caching import load_cached_candles, save_cached_candles, write_json, load_cached_funding, save_cached_funding
 
 
 def normalize_symbol(sym: str) -> str:
@@ -279,5 +279,123 @@ class MarketData:
         out = {"ts_utc": datetime.now(tz=UTC).isoformat(), "symbols": symbols, "meta": meta}
         write_json(self.cache_dir / "universe_snapshot.json", out)
         logger.info("Saved universe snapshot: {}", self.cache_dir / "universe_snapshot.json")
+
+    # -------- Funding rates (perps) --------
+    def get_funding_history(
+        self,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+        *,
+        use_cache: bool = True,
+        cache_write: bool = True,
+        force_mainnet: bool | None = None,
+    ) -> pd.DataFrame:
+        """
+        Returns funding events indexed by UTC timestamp with column funding_rate.
+        """
+        symbol = normalize_symbol(symbol)
+        start = start.astimezone(UTC)
+        end = end.astimezone(UTC)
+
+        cached = load_cached_funding(self.cache_dir, symbol) if use_cache else None
+        if cached is not None and not cached.empty:
+            have_start = cached.index.min()
+            have_end = cached.index.max()
+            if have_start <= start and have_end >= end:
+                return cached.loc[start:end].copy()
+
+        df = self._fetch_funding_remote(symbol=symbol, start=start, end=end, force_mainnet=force_mainnet)
+        if cached is not None and not cached.empty:
+            df = pd.concat([cached, df]).sort_index()
+            df = df[~df.index.duplicated(keep="last")]
+        if cache_write:
+            save_cached_funding(self.cache_dir, symbol, df)
+        return df.loc[start:end].copy()
+
+    def get_daily_funding_rate(
+        self,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+        *,
+        force_mainnet: bool | None = None,
+    ) -> pd.Series:
+        """
+        Aggregate funding events into a daily total funding rate per UTC day (sum of 8h rates).
+        Returned index is UTC day start.
+        """
+        df = self.get_funding_history(symbol, start, end, force_mainnet=force_mainnet)
+        if df.empty:
+            return pd.Series(dtype=float)
+        s = df["funding_rate"].astype(float)
+        day = s.index.floor("D")
+        daily = s.groupby(day).sum().sort_index()
+        return daily
+
+    def get_latest_daily_funding_rate(self, symbol: str, *, lookback_days: int = 3, force_mainnet: bool | None = None) -> float | None:
+        now = datetime.now(tz=UTC)
+        start = now - timedelta(days=max(5, lookback_days * 3))
+        end = now + timedelta(days=1)
+        daily = self.get_daily_funding_rate(symbol, start, end, force_mainnet=force_mainnet)
+        if daily.empty:
+            return None
+        return float(daily.iloc[-1])
+
+    def _fetch_funding_remote(self, *, symbol: str, start: datetime, end: datetime, force_mainnet: bool | None) -> pd.DataFrame:
+        start_ms = int(start.timestamp() * 1000)
+        end_ms = int(end.timestamp() * 1000)
+
+        # Optionally override data source environment.
+        client = self.client
+        if force_mainnet is True and "api-testnet" in getattr(self.client, "_base_url", ""):
+            # Create a temporary mainnet client without auth
+            from src.data.bybit_client import BybitClient as _C
+
+            client = _C(auth=None, testnet=False)
+        elif force_mainnet is False and "api.bybit.com" in getattr(self.client, "_base_url", ""):
+            from src.data.bybit_client import BybitClient as _C
+
+            client = _C(auth=None, testnet=True)
+
+        rows: list[dict[str, Any]] = []
+        cursor_end = end_ms
+        for _ in range(40):
+            chunk = client.get_funding_history(category=self.config.exchange.category, symbol=symbol, start_ms=start_ms, end_ms=cursor_end, limit=200)
+            if not chunk:
+                break
+            rows.extend(chunk)
+            # Funding list is typically newest-first
+            oldest = chunk[-1]
+            try:
+                oldest_ts = int(oldest.get("fundingRateTimestamp") or oldest.get("fundingRateTime") or 0)
+            except Exception:
+                oldest_ts = 0
+            if oldest_ts <= start_ms or oldest_ts == 0:
+                break
+            cursor_end = oldest_ts - 1
+
+        if client is not self.client:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+        if not rows:
+            return pd.DataFrame(columns=["funding_rate"]).astype({"funding_rate": float})
+
+        out_rows = []
+        for r in rows:
+            ts_ms = r.get("fundingRateTimestamp") or r.get("fundingRateTime") or r.get("fundingRateTimestamp")
+            fr = r.get("fundingRate")
+            try:
+                ts = datetime.fromtimestamp(int(ts_ms) / 1000, tz=UTC)
+                out_rows.append({"ts": ts, "funding_rate": float(fr)})
+            except Exception:
+                continue
+        df = pd.DataFrame(out_rows).drop_duplicates(subset=["ts"]).sort_values("ts")
+        if df.empty:
+            return pd.DataFrame(columns=["funding_rate"]).astype({"funding_rate": float})
+        return df.set_index("ts").sort_index()
 
 
