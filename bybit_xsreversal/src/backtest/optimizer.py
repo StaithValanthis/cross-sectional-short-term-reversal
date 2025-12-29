@@ -257,6 +257,23 @@ def _simulate_candidate_full(
     return eq, daily_ret, daily_turn
 
 
+def _metrics_ok(m: Any) -> bool:
+    """
+    Guard for stage2: treat NaN/inf metrics as invalid so stage2 can skip the candidate.
+    """
+    try:
+        import numpy as _np
+
+        return bool(
+            _np.isfinite(float(m.sharpe))
+            and _np.isfinite(float(m.cagr))
+            and _np.isfinite(float(m.max_drawdown))
+            and _np.isfinite(float(m.avg_daily_turnover))
+        )
+    except Exception:
+        return False
+
+
 def _random_candidates(
     *,
     n: int,
@@ -793,6 +810,8 @@ def optimize_config(
 
                         eq2, dr2, to2 = _simulate_candidate_full(cfg=trial, candles=candles, market_df=market_df, calendar=cal, funding_daily=funding_daily)
                         m2 = compute_metrics(eq2, dr2, to2)
+                        if eq2.empty or dr2.empty or not _metrics_ok(m2):
+                            raise ValueError("stage2_invalid_metrics")
                         row2 = {
                             "candidate": cand2.__dict__,
                             "sharpe": m2.sharpe,
@@ -860,6 +879,8 @@ def optimize_config(
 
                     eq2, dr2, to2 = _simulate_candidate_full(cfg=trial, candles=candles, market_df=market_df, calendar=cal, funding_daily=funding_daily)
                     m2 = compute_metrics(eq2, dr2, to2)
+                    if eq2.empty or dr2.empty or not _metrics_ok(m2):
+                        raise ValueError("stage2_invalid_metrics")
                     row2 = {
                         "candidate": cand2.__dict__,
                         "sharpe": m2.sharpe,
@@ -915,6 +936,10 @@ def optimize_config(
         try:
             df = pd.DataFrame(stage2_rows if stage2_rows else [r for r in rows if not r.get("rejected")])
             if not df.empty:
+                if "rejected" in df.columns:
+                    df = df[df["rejected"] != True]  # noqa: E712
+                # Drop rows with NaN/inf sharpe
+                df = df[pd.to_numeric(df["sharpe"], errors="coerce").notna()]
                 top_sh = df.sort_values("sharpe", ascending=False).head(5)[
                     ["sharpe", "cagr", "max_drawdown", "avg_daily_turnover", "candidate"]
                 ]
