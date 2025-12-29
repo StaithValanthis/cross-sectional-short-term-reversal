@@ -812,11 +812,15 @@ def optimize_config(
                                 best_cagr=fmt_or_na(float(row2.get("cagr", float("nan"))), ".2%"),
                             )
                     except (ValueError, KeyError, IndexError) as e:
-                        logger.debug("Stage2 candidate {} rejected: {}", cand2.__dict__, e)
+                        err_msg = str(e)
+                        if "Universe too small" in err_msg:
+                            logger.debug("Stage2 candidate {} rejected: empty universe (likely funding/min_history filter too strict)", cand2.__dict__)
+                        else:
+                            logger.debug("Stage2 candidate {} rejected: {}", cand2.__dict__, err_msg)
                         row2 = {
                             "candidate": cand2.__dict__,
                             "rejected": True,
-                            "error": str(e),
+                            "error": err_msg,
                             "sharpe": float("nan"),
                             "cagr": float("nan"),
                             "max_drawdown": float("nan"),
@@ -869,11 +873,15 @@ def optimize_config(
                         stage2_best_key = key2
                         stage2_best = (cand2, row2)
                 except (ValueError, KeyError, IndexError) as e:
-                    logger.debug("Stage2 candidate {} rejected: {}", cand2.__dict__, e)
+                    err_msg = str(e)
+                    if "Universe too small" in err_msg:
+                        logger.debug("Stage2 candidate {} rejected: empty universe (likely funding/min_history filter too strict)", cand2.__dict__)
+                    else:
+                        logger.debug("Stage2 candidate {} rejected: {}", cand2.__dict__, err_msg)
                     row2 = {
                         "candidate": cand2.__dict__,
                         "rejected": True,
-                        "error": str(e),
+                        "error": err_msg,
                         "sharpe": float("nan"),
                         "cagr": float("nan"),
                         "max_drawdown": float("nan"),

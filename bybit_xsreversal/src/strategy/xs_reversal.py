@@ -91,17 +91,33 @@ def compute_targets_from_daily_candles(
         raise ValueError(f"Universe too small after data checks: {len(universe)}")
 
     # Optional funding filter (daily aggregate funding rate)
+    # Only apply if it won't leave us with too few symbols (< 5)
     if config.funding.filter.enabled and funding_daily_rate is not None:
         max_abs = float(config.funding.filter.max_abs_daily_funding_rate)
-        for sym in list(universe):
+        symbols_with_funding = [s for s in universe if funding_daily_rate.get(s) is not None]
+        symbols_without_funding = [s for s in universe if funding_daily_rate.get(s) is None]
+        
+        # Apply filter only if we'll have enough symbols left
+        filtered_out: list[str] = []
+        for sym in symbols_with_funding:
             fr = funding_daily_rate.get(sym)
-            if fr is None:
-                continue
-            if abs(float(fr)) > max_abs:
+            if fr is not None and abs(float(fr)) > max_abs:
+                filtered_out.append(sym)
+        
+        remaining_count = len(symbols_without_funding) + len(symbols_with_funding) - len(filtered_out)
+        if remaining_count >= 5:
+            # Safe to apply filter
+            for sym in filtered_out:
                 exclusions[sym] = "funding_filter"
                 returns.pop(sym, None)
                 vol.pop(sym, None)
-        universe = sorted(returns.keys())
+            universe = sorted(returns.keys())
+        else:
+            # Filter too strict; skip it to preserve universe size
+            logger.debug(
+                "Funding filter would leave {} symbols (< 5); skipping filter to preserve universe",
+                remaining_count
+            )
 
     # Cross-sectional rank by lookback return (reversal by default)
     ranked = sorted(universe, key=lambda s: returns[s])
