@@ -116,10 +116,13 @@ class BybitClient:
         body = body or {}
 
         if method == "GET":
-            query = urlencode(sorted([(k, str(v)) for k, v in params.items() if v is not None]))
-            payload = query
-            headers = self._headers(payload=payload)
-            resp = self._http.get(path, params=params, headers=headers)
+            # IMPORTANT: Bybit signature validation is sensitive to the exact query-string.
+            # Sign the *same ordered param sequence* that we send over the wire.
+            # (Sorting can cause "Error sign" if httpx encodes params in insertion order.)
+            pairs = [(k, str(v)) for k, v in params.items() if v is not None]
+            query = urlencode(pairs)
+            headers = self._headers(payload=query)
+            resp = self._http.get(path, params=pairs, headers=headers)
         else:
             # Bybit signs the raw JSON string (no whitespace). httpx will json-dump similarly, but we control it.
             import json

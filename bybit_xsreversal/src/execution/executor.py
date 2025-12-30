@@ -128,9 +128,13 @@ class Executor:
 
         deadline = time.time() + float(self.cfg.execution.max_order_age_seconds)
         while time.time() < deadline:
-            open_orders = self.client.get_open_orders(category=self.cfg.exchange.category, symbol=order.symbol)
-            if not any(str(o.get("orderId")) == oid for o in open_orders):
-                return  # filled or closed
+            try:
+                open_orders = self.client.get_open_orders(category=self.cfg.exchange.category, symbol=order.symbol)
+                if not any(str(o.get("orderId")) == oid for o in open_orders):
+                    return  # filled or closed
+            except Exception as e:
+                # Don't crash the whole rebalance if an order status poll fails (rate limits, temporary API issues).
+                logger.warning("Open-order poll failed for {} (orderId={}): {}", order.symbol, oid, e)
             time.sleep(0.5)
 
         # Cancel and fallback

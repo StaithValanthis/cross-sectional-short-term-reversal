@@ -128,6 +128,14 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
 
             # Equity + risk check
             equity = fetch_equity_usdt(client=client)
+            logger.info(
+                "Equity: {:.4f} USDT (min_notional_per_symbol={} USDT)",
+                float(equity),
+                float(cfg.sizing.min_notional_per_symbol),
+            )
+            if float(equity) <= 0.0:
+                logger.error("Equity is <= 0 USDT; cannot size trades. Skipping rebalance.")
+                return
             ok, risk_info = risk.check(equity)
             if not ok:
                 logger.error("Risk kill-switch active; skipping trades: {}", risk_info)
