@@ -35,6 +35,9 @@ def _ts_dir(base: Path) -> Path:
 
 
 def _print_targets(console: Console, notionals: dict[str, float]) -> None:
+    if not notionals:
+        console.print("[bold yellow]No target notionals to trade (empty target book).[/bold yellow]")
+        return
     t = Table(title="Target notionals (USDT)", show_lines=False)
     t.add_column("Symbol")
     t.add_column("Notional", justify="right")
@@ -43,7 +46,7 @@ def _print_targets(console: Console, notionals: dict[str, float]) -> None:
     console.print(t)
 
 
-def run_live(cfg: BotConfig, *, dry_run: bool) -> None:
+def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bool = False) -> None:
     console = Console()
 
     auth = BybitAuth(
@@ -56,24 +59,18 @@ def run_live(cfg: BotConfig, *, dry_run: bool) -> None:
     state_path = Path("outputs") / "state" / "rebalance_state.json"
 
     try:
-        while True:
-            now = now_utc()
-            nxt = next_run_time(now, cfg.rebalance.time_utc, grace_seconds=int(cfg.rebalance.startup_grace_seconds))
-            sleep_s = max(1.0, (nxt - now).total_seconds())
-            logger.info("Next rebalance scheduled at {} (sleep {:.1f}s)", nxt.isoformat(), sleep_s)
-            time.sleep(sleep_s)
-
+        def _rebalance_once() -> None:
             # small delay to ensure daily candle is finalized
             time.sleep(max(0, int(cfg.rebalance.candle_close_delay_seconds)))
 
-            rb_now = now_utc()
+            rb_now = now_utc()  # use current wall time after delay
             close_ts = last_complete_daily_close(rb_now, cfg.rebalance.candle_close_delay_seconds)
             asof_bar = close_ts - timedelta(days=1)
             logger.info("Rebalance now={} using last complete daily bar start={}", rb_now.isoformat(), asof_bar.isoformat())
 
             # Rebalance interval control (stateful)
             interval_days = max(1, int(cfg.rebalance.interval_days))
-            if interval_days > 1 and state_path.exists():
+            if not force and interval_days > 1 and state_path.exists():
                 try:
                     st = orjson.loads(state_path.read_bytes())
                     last = st.get("last_rebalance_day")
@@ -81,7 +78,7 @@ def run_live(cfg: BotConfig, *, dry_run: bool) -> None:
                         last_dt = datetime.fromisoformat(last).replace(tzinfo=UTC)
                         if (asof_bar.date() - last_dt.date()).days < interval_days:
                             logger.info("Skipping rebalance due to interval_days={} (last={})", interval_days, last_dt.date().isoformat())
-                            continue
+                            return
                 except Exception as e:
                     logger.warning("Failed to parse rebalance_state.json: {}", e)
 
@@ -100,7 +97,14 @@ def run_live(cfg: BotConfig, *, dry_run: bool) -> None:
 
             if len(passed) < 5:
                 logger.warning("Universe too small after spread/depth filters: {}", len(passed))
-                continue
+                return
+
+            logger.info(
+                "Universe: {} symbols (top_n_by_volume={}), passed microstructure filters: {}",
+                len(symbols),
+                int(cfg.universe.top_n_by_volume),
+                len(passed),
+            )
 
             # Funding filter (optional)
             funding_meta: dict[str, Any] = {}
@@ -120,14 +124,14 @@ def run_live(cfg: BotConfig, *, dry_run: bool) -> None:
 
             if len(passed) < 5:
                 logger.warning("Universe too small after funding filter: {}", len(passed))
-                continue
+                return
 
             # Equity + risk check
             equity = fetch_equity_usdt(client=client)
             ok, risk_info = risk.check(equity)
             if not ok:
                 logger.error("Risk kill-switch active; skipping trades: {}", risk_info)
-                continue
+                return
 
             # Current weights from positions (for turnover controls)
             current_weights: dict[str, float] = {}
@@ -160,6 +164,13 @@ def run_live(cfg: BotConfig, *, dry_run: bool) -> None:
                 except Exception as e:
                     logger.warning("Skipping {}: candle load failed: {}", s, e)
 
+            logger.info(
+                "Candles loaded: {} / {} symbols have required asof_bar={}",
+                len(candles),
+                len(passed),
+                asof_bar.date().isoformat(),
+            )
+
             market_df = None
             if cfg.filters.regime_filter.enabled and cfg.filters.regime_filter.use_market_regime:
                 proxy = cfg.filters.regime_filter.market_proxy_symbol
@@ -175,6 +186,17 @@ def run_live(cfg: BotConfig, *, dry_run: bool) -> None:
                 asof=asof_bar,
                 market_proxy_candles=market_df,
                 current_weights=current_weights,
+            )
+
+            # High-signal rebalance summary for journald visibility.
+            gross_w = float(sum(abs(w) for w in targets.weights.values()))
+            logger.info(
+                "Targets: {} symbols (longs={}, shorts={}), gross_weight={:.3f}, signal_mode={}",
+                len(targets.notionals_usd),
+                len(snapshot.selected_longs),
+                len(snapshot.selected_shorts),
+                gross_w,
+                str(snapshot.filters.get("signal_mode")),
             )
 
             _print_targets(console, targets.notionals_usd)
@@ -194,6 +216,15 @@ def run_live(cfg: BotConfig, *, dry_run: bool) -> None:
             snap_path.write_bytes(orjson.dumps(snap_payload, option=orjson.OPT_INDENT_2))
             logger.info("Saved rebalance snapshot: {}", snap_path.resolve())
 
+            # Safety: if the strategy produced an empty target book, do NOT interpret that as
+            # "flatten everything". This usually means filters/thresholds removed all targets.
+            if not targets.notionals_usd:
+                logger.warning(
+                    "No target notionals produced (empty target book). Skipping execution. See snapshot: {}",
+                    snap_path.resolve(),
+                )
+                return
+
             res = run_rebalance(cfg=cfg, client=client, md=md, target_notionals=targets.notionals_usd, dry_run=dry_run)
             (out_dir / "execution_result.json").write_bytes(orjson.dumps(res, option=orjson.OPT_INDENT_2))
             logger.info("Rebalance done. Result saved to {}", (out_dir / "execution_result.json").resolve())
@@ -204,6 +235,19 @@ def run_live(cfg: BotConfig, *, dry_run: bool) -> None:
                 state_path.write_bytes(orjson.dumps({"last_rebalance_day": asof_bar.date().isoformat()}, option=orjson.OPT_INDENT_2))
             except Exception as e:
                 logger.warning("Failed to write rebalance_state.json: {}", e)
+
+        if run_once:
+            logger.info("run_once enabled: executing a single rebalance immediately.")
+            _rebalance_once()
+            return
+
+        while True:
+            now = now_utc()
+            nxt = next_run_time(now, cfg.rebalance.time_utc, grace_seconds=int(cfg.rebalance.startup_grace_seconds))
+            sleep_s = max(1.0, (nxt - now).total_seconds())
+            logger.info("Next rebalance scheduled at {} (sleep {:.1f}s)", nxt.isoformat(), sleep_s)
+            time.sleep(sleep_s)
+            _rebalance_once()
     finally:
         client.close()
 

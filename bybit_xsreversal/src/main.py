@@ -90,6 +90,8 @@ def main() -> None:
 
     lv = sub.add_parser("live", help="Run live trader (scheduler)")
     lv.add_argument("--dry-run", action="store_true", help="Print intended orders without placing them")
+    lv.add_argument("--run-once", action="store_true", help="Run a single rebalance immediately and exit")
+    lv.add_argument("--force", action="store_true", help="Ignore interval_days state and force a rebalance (still respects risk checks)")
 
     argv = _normalize_argv(sys.argv[1:])
     args = p.parse_args(argv)
@@ -123,7 +125,7 @@ def main() -> None:
         return
 
     if args.cmd == "live":
-        run_live(cfg, dry_run=bool(args.dry_run))
+        run_live(cfg, dry_run=bool(args.dry_run), run_once=bool(args.run_once), force=bool(args.force))
         return
 
     raise SystemExit(2)

@@ -164,14 +164,26 @@ def run_rebalance(
     orders = plan_rebalance_orders(cfg=cfg, md=md, current_positions=positions, target_notionals=target_notionals)
 
     if not orders:
-        logger.info("No rebalance orders required.")
-        return {"orders": [], "positions": {k: v.__dict__ for k, v in positions.items()}}
+        logger.info(
+            "No rebalance orders required (targets={}, current_positions={}).",
+            len(target_notionals),
+            len(positions),
+        )
+        return {
+            "orders": [],
+            "positions": {k: v.__dict__ for k, v in positions.items()},
+            "summary": {"target_symbols": len(target_notionals), "current_symbols": len(positions), "planned_orders": 0},
+        }
 
     logger.info("Planned {} orders", len(orders))
     for o in orders:
         ex.place_with_fallback(o)
 
-    return {"orders": [o.__dict__ for o in orders], "positions": {k: v.__dict__ for k, v in positions.items()}}
+    return {
+        "orders": [o.__dict__ for o in orders],
+        "positions": {k: v.__dict__ for k, v in positions.items()},
+        "summary": {"target_symbols": len(target_notionals), "current_symbols": len(positions), "planned_orders": len(orders)},
+    }
 
 
 def fetch_equity_usdt(*, client: BybitClient) -> float:
