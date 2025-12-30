@@ -150,19 +150,39 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
             except Exception as e:
                 logger.warning("Failed to compute current weights from positions: {}", e)
 
-            # Fetch candles needed for indicators/signal
-            buffer_days = int(max(cfg.sizing.vol_lookback_days + 10, cfg.signal.lookback_days + 5, cfg.filters.regime_filter.ema_slow + 20, 40))
+            # Fetch candles needed for indicators/signal.
+            # Must cover min_history_days; otherwise all symbols can be filtered out as "insufficient_history".
+            buffer_days = int(
+                max(
+                    cfg.universe.min_history_days + 10,
+                    cfg.sizing.vol_lookback_days + 10,
+                    cfg.signal.lookback_days + 5,
+                    cfg.filters.regime_filter.ema_slow + 20,
+                    40,
+                )
+            )
             start = asof_bar - timedelta(days=buffer_days)
             end = asof_bar + timedelta(days=1)
+            logger.info(
+                "Candle window: start={} end={} (buffer_days={}, min_history_days={})",
+                start.date().isoformat(),
+                end.date().isoformat(),
+                buffer_days,
+                int(cfg.universe.min_history_days),
+            )
 
             candles: dict[str, Any] = {}
+            candle_skip: dict[str, int] = {"load_error": 0, "missing_asof_bar": 0}
             for s in passed:
                 try:
                     df = md.get_daily_candles(s, start, end, use_cache=True, cache_write=True)
                     if asof_bar in df.index:
                         candles[s] = df
+                    else:
+                        candle_skip["missing_asof_bar"] += 1
                 except Exception as e:
                     logger.warning("Skipping {}: candle load failed: {}", s, e)
+                    candle_skip["load_error"] += 1
 
             logger.info(
                 "Candles loaded: {} / {} symbols have required asof_bar={}",
@@ -170,6 +190,12 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                 len(passed),
                 asof_bar.date().isoformat(),
             )
+            if candle_skip["missing_asof_bar"] or candle_skip["load_error"]:
+                logger.info(
+                    "Candle skips: missing_asof_bar={}, load_error={}",
+                    int(candle_skip["missing_asof_bar"]),
+                    int(candle_skip["load_error"]),
+                )
 
             market_df = None
             if cfg.filters.regime_filter.enabled and cfg.filters.regime_filter.use_market_regime:
@@ -179,14 +205,22 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                 except Exception as e:
                     logger.warning("Market proxy candles unavailable: {}", e)
 
-            targets, snapshot = compute_targets_from_daily_candles(
-                candles=candles,
-                config=cfg,
-                equity_usd=equity,
-                asof=asof_bar,
-                market_proxy_candles=market_df,
-                current_weights=current_weights,
-            )
+            try:
+                targets, snapshot = compute_targets_from_daily_candles(
+                    candles=candles,
+                    config=cfg,
+                    equity_usd=equity,
+                    asof=asof_bar,
+                    market_proxy_candles=market_df,
+                    current_weights=current_weights,
+                )
+            except ValueError as e:
+                # Common: universe too small (new listings, missing candles, insufficient history)
+                logger.warning("Skipping rebalance: {}", str(e))
+                return
+            except Exception as e:
+                logger.exception("Unexpected error during target computation; skipping rebalance: {}", e)
+                return
 
             # High-signal rebalance summary for journald visibility.
             gross_w = float(sum(abs(w) for w in targets.weights.values()))
