@@ -42,6 +42,7 @@ class RebalanceConfig(BaseModel):
     frequency: Literal["daily"] = "daily"
     time_utc: str = "00:05"  # HH:MM
     candle_close_delay_seconds: int = 30
+    startup_grace_seconds: int = 300  # if process starts slightly late, still run "today"
     interval_days: int = 1
     rebalance_fraction: float = 1.0  # 1.0 = full rebalance, 0.5 = half-way toward target
     min_weight_change_bps: float = 5.0  # skip trades below this weight delta (bps of equity)

@@ -24,6 +24,7 @@ rebalance:
   frequency: daily
   time_utc: 00:05
   candle_close_delay_seconds: 30
+  startup_grace_seconds: 300
   interval_days: 1
   rebalance_fraction: 1.0
   min_weight_change_bps: 5.0

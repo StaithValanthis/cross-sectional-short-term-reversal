@@ -41,14 +41,28 @@ def last_complete_daily_close(now: datetime, close_delay_seconds: int) -> dateti
     return midnight
 
 
-def next_run_time(now: datetime, run_hhmm_utc: str) -> datetime:
+def next_run_time(now: datetime, run_hhmm_utc: str, *, grace_seconds: int = 0) -> datetime:
+    """
+    Returns the next scheduled run time for an HH:MM UTC schedule.
+
+    If the process starts slightly *after* today's scheduled time, a small grace window
+    avoids skipping a full day (useful when driven by systemd timers with jitter).
+
+    If now is within [candidate, candidate + grace], we return now (so callers can run immediately).
+    """
     t = parse_hhmm(run_hhmm_utc)
     now = now.astimezone(UTC)
     today = utc_day_start(now)
     candidate = datetime.combine(today.date(), t, tzinfo=UTC)
-    if candidate <= now:
-        candidate += timedelta(days=1)
-    return candidate
+
+    if now <= candidate:
+        return candidate
+
+    grace = timedelta(seconds=max(0, int(grace_seconds)))
+    if grace > timedelta(0) and now <= candidate + grace:
+        return now
+
+    return candidate + timedelta(days=1)
 
 
 @dataclass(frozen=True)

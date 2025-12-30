@@ -58,7 +58,7 @@ def run_live(cfg: BotConfig, *, dry_run: bool) -> None:
     try:
         while True:
             now = now_utc()
-            nxt = next_run_time(now, cfg.rebalance.time_utc)
+            nxt = next_run_time(now, cfg.rebalance.time_utc, grace_seconds=int(cfg.rebalance.startup_grace_seconds))
             sleep_s = max(1.0, (nxt - now).total_seconds())
             logger.info("Next rebalance scheduled at {} (sleep {:.1f}s)", nxt.isoformat(), sleep_s)
             time.sleep(sleep_s)
