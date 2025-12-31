@@ -1061,13 +1061,23 @@ def optimize_config(
                 trial.funding.filter.enabled = bool(best_cand.funding_filter_enabled)
                 trial.funding.filter.max_abs_daily_funding_rate = float(best_cand.funding_max_abs_daily_rate)
 
-                eq_oos, dr_oos, to_oos = _simulate_candidate_full(
+                # IMPORTANT: evaluate OOS in a *stateful* way by running a single contiguous simulation
+                # across train+test, then slicing metrics to the test window. This avoids resetting
+                # weights/equity at the test boundary (which can distort OOS significantly).
+                cal_full = cal_train.append(cal_test)
+                eq_full, dr_full, to_full = _simulate_candidate_full(
                     cfg=trial,
                     candles=candles_stage2,
                     market_df=market_df,
-                    calendar=cal_test,
+                    calendar=cal_full,
                     funding_daily=funding_daily,
                 )
+
+                test_start_dt = cal_test[0].to_pydatetime()
+                eq_oos = eq_full.loc[eq_full.index >= test_start_dt]
+                dr_oos = dr_full.loc[dr_full.index >= test_start_dt]
+                to_oos = to_full.loc[to_full.index >= test_start_dt]
+
                 m_oos = compute_metrics(eq_oos, dr_oos, to_oos)
                 oos_metrics = {
                     "sharpe": float(m_oos.sharpe),
