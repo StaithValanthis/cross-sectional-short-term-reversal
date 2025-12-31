@@ -46,6 +46,7 @@ class RebalanceConfig(BaseModel):
     interval_days: int = 1
     rebalance_fraction: float = 1.0  # 1.0 = full rebalance, 0.5 = half-way toward target
     min_weight_change_bps: float = 5.0  # skip trades below this weight delta (bps of equity)
+    flatten_on_empty_targets: bool = False  # if true, close all positions when target book is empty
 
 
 class SizingConfig(BaseModel):

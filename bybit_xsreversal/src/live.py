@@ -17,7 +17,7 @@ from src.data.market_data import MarketData, normalize_symbol
 from src.execution.rebalance import fetch_equity_usdt, run_rebalance
 from src.execution.risk import RiskManager
 from src.strategy.xs_reversal import compute_targets_from_daily_candles
-from src.utils.time import last_complete_daily_close, next_run_time, now_utc
+from src.utils.time import last_complete_daily_close, next_run_time, now_utc, parse_hhmm, utc_day_start
 
 
 def _need_env(name: str) -> str:
@@ -49,6 +49,18 @@ def _print_targets(console: Console, notionals: dict[str, float]) -> None:
 def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bool = False) -> None:
     console = Console()
 
+    # Optional env override for testnet (installer writes this, and many operators expect it to control the environment).
+    # Config still remains the source of truth if env var is absent.
+    env_testnet = os.getenv("BYBIT_TESTNET", "").strip().lower()
+    if env_testnet in ("1", "true", "yes", "y"):
+        if cfg.exchange.testnet is not True:
+            logger.warning("Overriding config exchange.testnet={} with env BYBIT_TESTNET=true", cfg.exchange.testnet)
+        cfg.exchange.testnet = True
+    elif env_testnet in ("0", "false", "no", "n"):
+        if cfg.exchange.testnet is not False:
+            logger.warning("Overriding config exchange.testnet={} with env BYBIT_TESTNET=false", cfg.exchange.testnet)
+        cfg.exchange.testnet = False
+
     auth = BybitAuth(
         api_key=_need_env(cfg.exchange.api_key_env),
         api_secret=_need_env(cfg.exchange.api_secret_env),
@@ -59,6 +71,15 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
     state_path = Path("outputs") / "state" / "rebalance_state.json"
 
     try:
+        logger.info(
+            "Live trader starting: testnet={} base_url={} category={} dry_run={} rebalance_time_utc={}",
+            bool(cfg.exchange.testnet),
+            getattr(client, "_base_url", "unknown"),
+            str(cfg.exchange.category),
+            bool(dry_run),
+            str(cfg.rebalance.time_utc),
+        )
+
         def _rebalance_once() -> None:
             # small delay to ensure daily candle is finalized
             time.sleep(max(0, int(cfg.rebalance.candle_close_delay_seconds)))
@@ -259,12 +280,21 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
             logger.info("Saved rebalance snapshot: {}", snap_path.resolve())
 
             # Safety: if the strategy produced an empty target book, do NOT interpret that as
-            # "flatten everything". This usually means filters/thresholds removed all targets.
+            # "flatten everything" by default. This usually means filters/thresholds removed all targets.
             if not targets.notionals_usd:
-                logger.warning(
-                    "No target notionals produced (empty target book). Skipping execution. See snapshot: {}",
-                    snap_path.resolve(),
-                )
+                if bool(getattr(cfg.rebalance, "flatten_on_empty_targets", False)):
+                    logger.warning(
+                        "Empty target book and flatten_on_empty_targets=true: flattening all positions. See snapshot: {}",
+                        snap_path.resolve(),
+                    )
+                    res = run_rebalance(cfg=cfg, client=client, md=md, target_notionals={}, dry_run=dry_run)
+                    (out_dir / "execution_result.json").write_bytes(orjson.dumps(res, option=orjson.OPT_INDENT_2))
+                    logger.info("Flatten done. Result saved to {}", (out_dir / "execution_result.json").resolve())
+                else:
+                    logger.warning(
+                        "No target notionals produced (empty target book). Skipping execution. See snapshot: {}",
+                        snap_path.resolve(),
+                    )
                 return
 
             res = run_rebalance(cfg=cfg, client=client, md=md, target_notionals=targets.notionals_usd, dry_run=dry_run)
@@ -282,6 +312,36 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
             logger.info("run_once enabled: executing a single rebalance immediately.")
             _rebalance_once()
             return
+
+        # Catch-up behavior:
+        # If the process starts AFTER today's scheduled time (or grace window) and we haven't rebalanced for the
+        # current asof_bar yet, run once immediately instead of silently skipping a whole day.
+        try:
+            now0 = now_utc()
+            t = parse_hhmm(cfg.rebalance.time_utc)
+            today = utc_day_start(now0)
+            scheduled_today = datetime.combine(today.date(), t, tzinfo=UTC)
+            if now0 >= scheduled_today:
+                close_ts0 = last_complete_daily_close(now0, int(cfg.rebalance.candle_close_delay_seconds))
+                asof0 = close_ts0 - timedelta(days=1)
+                last_done = None
+                if state_path.exists():
+                    try:
+                        st = orjson.loads(state_path.read_bytes())
+                        last_done = st.get("last_rebalance_day")
+                    except Exception:
+                        last_done = None
+                if last_done != asof0.date().isoformat():
+                    logger.warning(
+                        "Missed scheduled rebalance time earlier today (scheduled_today={} now={}). "
+                        "Catching up immediately for asof_bar={}.",
+                        scheduled_today.isoformat(),
+                        now0.isoformat(),
+                        asof0.date().isoformat(),
+                    )
+                    _rebalance_once()
+        except Exception as e:
+            logger.warning("Startup catch-up check failed (continuing with normal scheduler): {}", e)
 
         while True:
             now = now_utc()

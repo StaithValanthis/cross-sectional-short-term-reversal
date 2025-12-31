@@ -11,6 +11,10 @@ Type=simple
 #   /etc/systemd/system/bybit_xsreversal.service
 # with the correct WorkingDirectory/EnvironmentFile/ExecStart for your install path.
 #
+# This bot is designed to be a long-running scheduler (it sleeps until the next rebalance time).
+# If the service is stopped or the host reboots, the rebalance will not happen unless the service
+# is running again. Consider using Restart=always for maximum resilience.
+#
 # If you install manually, set these to your actual PROJECT_DIR:
 # WorkingDirectory=/home/ubuntu/cross-sectional-short-term-reversal/bybit_xsreversal
 # EnvironmentFile=/home/ubuntu/cross-sectional-short-term-reversal/bybit_xsreversal/.env
@@ -18,7 +22,7 @@ Type=simple
 WorkingDirectory=/opt/bybit_xsreversal/bybit_xsreversal
 EnvironmentFile=/opt/bybit_xsreversal/bybit_xsreversal/.env
 ExecStart=/opt/bybit_xsreversal/bybit_xsreversal/.venv/bin/bybit-xsreversal --config /opt/bybit_xsreversal/bybit_xsreversal/config/config.yaml live
-Restart=on-failure
+Restart=always
 RestartSec=5
 
 # Hardening (optional)

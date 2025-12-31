@@ -53,6 +53,18 @@ bybit-xsreversal live --config config/config.yaml
 
 Live snapshots are written to `bybit_xsreversal/outputs/live/<timestamp>/rebalance_snapshot.json`.
 
+Operational notes:
+- The live process is a **scheduler** that must keep running until the rebalance time. If the process/service is stopped, the rebalance will not happen.
+- If the bot starts *after* the scheduled time and it hasn’t rebalanced yet for that day, it will **catch up immediately** on startup (and log that it’s doing so).
+- Useful flags:
+  - `--run-once`: run a single rebalance immediately and exit
+  - `--force`: ignore `interval_days` state and force a rebalance (still respects risk checks)
+- Make sure you’re looking at the correct Bybit environment:
+  - `exchange.testnet` in `config.yaml` controls whether orders go to testnet vs mainnet
+  - `BYBIT_TESTNET=true|false` (if set) overrides the config at runtime and is logged on startup
+- If you want the bot to **flatten all existing positions** when the strategy produces an empty target book, set:
+  - `rebalance.flatten_on_empty_targets: true`
+
 ---
 
 ## Notes on Daily Candle Alignment (UTC)
