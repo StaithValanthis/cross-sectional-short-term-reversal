@@ -53,6 +53,27 @@ bybit-xsreversal live --config config/config.yaml
 
 Live snapshots are written to `bybit_xsreversal/outputs/live/<timestamp>/rebalance_snapshot.json`.
 
+### Run optimizer manually
+
+The optimizer runs in two stages:
+- **Stage 1**: fast screen over many candidates (vectorized)
+- **Stage 2**: re-evaluates top candidates with the **full backtest logic** (same core signal code as live)
+
+Run a deep optimization without modifying your config:
+
+```bash
+bybit-xsreversal optimize --config config/config.yaml --level deep --method random --seed 42 --no-write
+```
+
+Useful environment overrides:
+- `BYBIT_OPT_WINDOW_DAYS`: rolling history window for optimization (default 365)
+- `BYBIT_OPT_TRAIN_FRAC`: train fraction for OOS split (default 0.7)
+- `BYBIT_OPT_MIN_TEST_DAYS`: minimum test days (default 60)
+- `BYBIT_OPT_MIN_SHARPE`: minimum Sharpe to accept as “good enough” to write back (default 0.0)
+- `BYBIT_OPT_TESTNET`: use testnet market data for optimization (default false; mainnet recommended)
+
+Results are written to `outputs/optimize/<timestamp>/` including `best.json` and (if enabled) OOS metrics.
+
 Operational notes:
 - The live process is a **scheduler** that must keep running until the rebalance time. If the process/service is stopped, the rebalance will not happen.
 - If the bot starts *after* the scheduled time and it hasn’t rebalanced yet for that day, it will **catch up immediately** on startup (and log that it’s doing so).

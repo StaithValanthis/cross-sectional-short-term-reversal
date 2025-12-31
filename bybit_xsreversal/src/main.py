@@ -86,6 +86,7 @@ def main() -> None:
     opt.add_argument("--method", choices=["random", "grid"], default="random", help="Candidate generation method")
     opt.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     opt.add_argument("--stage2-topk", type=int, default=None, help="How many top stage-1 candidates to re-evaluate with full backtest logic")
+    opt.add_argument("--no-write", action="store_true", help="Do not write best params back into config.yaml (still writes outputs/*/best.json)")
     opt.add_argument("--no-progress", action="store_true", help="Disable progress bar/ETA output")
 
     lv = sub.add_parser("live", help="Run live trader (scheduler)")
@@ -111,7 +112,7 @@ def main() -> None:
 
     if args.cmd == "optimize":
         out_dir = Path(args.output_dir) if args.output_dir else _ts_dir(Path("outputs") / "optimize")
-        optimize_config(
+        res = optimize_config(
             config_path=args.config,
             output_dir=out_dir,
             level=str(args.level),
@@ -120,8 +121,12 @@ def main() -> None:
             seed=int(args.seed),
             stage2_topk=args.stage2_topk,
             show_progress=not bool(args.no_progress),
+            write_config=not bool(args.no_write),
         )
-        logger.info("Config updated: {}", Path(args.config).resolve())
+        if not bool(args.no_write) and str(res.get("status") or "") != "rejected_by_threshold":
+            logger.info("Config updated: {}", Path(args.config).resolve())
+        else:
+            logger.info("Optimization complete (config not modified). Outputs at {}", str(res.get("output_dir") or out_dir.resolve()))
         return
 
     if args.cmd == "live":

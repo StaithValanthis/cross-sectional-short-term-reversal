@@ -580,9 +580,10 @@ def optimize_config(
     seed: int = 42,
     stage2_topk: int | None = None,
     show_progress: bool = True,
+    write_config: bool = True,
 ) -> dict[str, Any]:
     """
-    Optimize a small parameter grid and write best params back to config.yaml.
+    Optimize a small parameter grid and (optionally) write best params back to config.yaml.
     Returns summary dict.
     """
     cfg = load_config(config_path)
@@ -1175,32 +1176,33 @@ def optimize_config(
                 "candidates": len(rows),
             }
 
-        # Patch config.yaml (deep merge)
-        raw = load_yaml_config(config_path)
-        raw.setdefault("signal", {})
-        raw.setdefault("rebalance", {})
-        raw.setdefault("sizing", {})
-        raw.setdefault("sizing", {})
+        if write_config:
+            # Patch config.yaml (deep merge)
+            raw = load_yaml_config(config_path)
+            raw.setdefault("signal", {})
+            raw.setdefault("rebalance", {})
+            raw.setdefault("sizing", {})
 
-        raw["signal"]["lookback_days"] = int(best_cand.lookback_days)
-        raw["signal"]["long_quantile"] = float(best_cand.long_quantile)
-        raw["signal"]["short_quantile"] = float(best_cand.short_quantile)
-        raw["rebalance"]["time_utc"] = str(best_cand.rebalance_time_utc)
-        raw["rebalance"]["interval_days"] = int(best_cand.interval_days)
-        raw["rebalance"]["rebalance_fraction"] = float(best_cand.rebalance_fraction)
-        raw["rebalance"]["min_weight_change_bps"] = float(best_cand.min_weight_change_bps)
-        raw["sizing"]["target_gross_leverage"] = float(best_cand.target_gross_leverage)
-        raw.setdefault("sizing", {})
-        raw["sizing"]["vol_lookback_days"] = int(best_cand.vol_lookback_days)
-        raw.setdefault("filters", {}).setdefault("regime_filter", {})
-        raw["filters"]["regime_filter"]["action"] = str(best_cand.regime_action)
-        raw.setdefault("funding", {}).setdefault("filter", {})
-        raw["funding"]["filter"]["enabled"] = bool(best_cand.funding_filter_enabled)
-        raw["funding"]["filter"]["max_abs_daily_funding_rate"] = float(best_cand.funding_max_abs_daily_rate)
+            raw["signal"]["lookback_days"] = int(best_cand.lookback_days)
+            raw["signal"]["long_quantile"] = float(best_cand.long_quantile)
+            raw["signal"]["short_quantile"] = float(best_cand.short_quantile)
+            raw["rebalance"]["time_utc"] = str(best_cand.rebalance_time_utc)
+            raw["rebalance"]["interval_days"] = int(best_cand.interval_days)
+            raw["rebalance"]["rebalance_fraction"] = float(best_cand.rebalance_fraction)
+            raw["rebalance"]["min_weight_change_bps"] = float(best_cand.min_weight_change_bps)
+            raw["sizing"]["target_gross_leverage"] = float(best_cand.target_gross_leverage)
+            raw["sizing"]["vol_lookback_days"] = int(best_cand.vol_lookback_days)
+            raw.setdefault("filters", {}).setdefault("regime_filter", {})
+            raw["filters"]["regime_filter"]["action"] = str(best_cand.regime_action)
+            raw.setdefault("funding", {}).setdefault("filter", {})
+            raw["funding"]["filter"]["enabled"] = bool(best_cand.funding_filter_enabled)
+            raw["funding"]["filter"]["max_abs_daily_funding_rate"] = float(best_cand.funding_max_abs_daily_rate)
 
-        import yaml
+            import yaml
 
-        Path(config_path).write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+            Path(config_path).write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+        else:
+            logger.warning("write_config=false: NOT writing params back to {} (see best.json in output dir).", Path(config_path).resolve())
 
         (out / "best.json").write_text(json.dumps(best_row, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -1221,6 +1223,7 @@ def optimize_config(
             "candidates": len(rows),
             "evaluated": len(candidates_list),
             "stage2_topk": int(stage2_topk) if stage2_topk is not None else _level_to_stage2_topk(level),
+            "write_config": bool(write_config),
         }
     finally:
         client.close()
