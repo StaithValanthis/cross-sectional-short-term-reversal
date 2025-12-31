@@ -465,7 +465,9 @@ def _simulate_candidate_vectorized(
         return None
 
     # daily returns and lookback returns
-    r1 = px.pct_change()
+    # pandas FutureWarning: default fill_method='pad' is deprecated.
+    # We do NOT want implicit forward-filling across missing symbol histories.
+    r1 = px.pct_change(fill_method=None)
     r_lb = px / px.shift(lookback_days) - 1.0
     vol = r1.rolling(vol_lookback_days, min_periods=vol_lookback_days).std(ddof=0)
 
