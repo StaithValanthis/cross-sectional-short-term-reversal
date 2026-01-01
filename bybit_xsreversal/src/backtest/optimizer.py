@@ -918,6 +918,19 @@ def optimize_config(
         feasible = [r for r in rows if (not r.get("rejected")) and np.isfinite(float(r.get("sharpe", float("nan"))))]
         feasible.sort(key=lambda r: float(r.get("sharpe", -1e9)), reverse=True)
 
+        if not feasible:
+            logger.warning("Stage1 found {} feasible candidates, but all were rejected. Skipping Stage2.", len(rows))
+            out = Path(output_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            return {
+                "status": "no_feasible_candidate",
+                "output_dir": str(out.resolve()),
+                "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
+                "universe_size": len(symbols),
+                "candidates": len(rows),
+                "feasible": 0,
+            }
+
         k2 = int(stage2_topk) if stage2_topk is not None else _level_to_stage2_topk(level)
         k2 = max(5, min(k2, len(feasible)))
         stage2_candidates = [Candidate(**feasible[i]["candidate"]) for i in range(k2)]
