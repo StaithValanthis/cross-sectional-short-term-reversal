@@ -9,7 +9,7 @@ from urllib.parse import urlencode
 
 import httpx
 from loguru import logger
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential_jitter
 
 
 class BybitAPIError(RuntimeError):
@@ -106,7 +106,10 @@ class BybitClient:
         time.sleep(sleep_s)
 
     @retry(
-        retry=retry_if_exception_type((httpx.HTTPError, BybitAPIError)),
+        retry=retry_if_exception(
+            lambda e: isinstance(e, httpx.HTTPError)
+            or (isinstance(e, BybitAPIError) and int(e.ret_code or -1) in (10006,))
+        ),
         wait=wait_exponential_jitter(initial=0.5, max=10.0),
         stop=stop_after_attempt(6),
         reraise=True,
@@ -234,7 +237,14 @@ class BybitClient:
         if self._auth is None:
             raise ValueError("Auth required for cancel_order.")
         body = {"category": category, "symbol": symbol, "orderId": order_id}
-        self._request("POST", "/v5/order/cancel", None, body)
+        try:
+            self._request("POST", "/v5/order/cancel", None, body)
+        except BybitAPIError as e:
+            # Non-fatal: order is already filled/canceled, or too late to cancel.
+            # Don't retry / don't fail the whole rebalance.
+            if int(e.ret_code or -1) == 110001:
+                return
+            raise
 
     def get_open_orders(
         self,
