@@ -83,6 +83,8 @@ class Executor:
         if step > 0:
             k = (q / step).to_integral_value(rounding=ROUND_DOWN)
             q = (k * step).quantize(step)
+        if q <= 0:
+            return ""
         # Enforce bounds
         min_q = Decimal(str(meta.min_qty))
         if q < min_q:
@@ -101,7 +103,14 @@ class Executor:
         meta = self.md.get_instrument_meta(order.symbol)
         qty_str = self._format_qty_str(order.qty, meta)
         if not qty_str:
-            logger.info("Skipping {} {}: qty below min step", order.symbol, order.side)
+            logger.info(
+                "Skipping {} {}: qty below min step (raw_qty={} qtyStep={} minQty={})",
+                order.symbol,
+                order.side,
+                float(order.qty),
+                float(meta.qty_step),
+                float(meta.min_qty),
+            )
             return None
 
         if self.dry_run:
@@ -137,11 +146,13 @@ class Executor:
         try:
             res = self.client.create_order(category=self.cfg.exchange.category, order=payload)
             logger.info(
-                "Order placed: {} {} qty={} type={} id={}",
+                "Order placed: {} {} qty={} type={} reduceOnly={} reason={} id={}",
                 order.symbol,
                 order.side,
                 qty_str,
                 order.order_type,
+                bool(order.reduce_only),
+                order.reason,
                 res.get("orderId"),
             )
             return res

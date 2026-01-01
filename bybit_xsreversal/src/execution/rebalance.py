@@ -240,6 +240,29 @@ def run_rebalance(
     - plan orders
     - place with maker->market fallback
     """
+    # Hygiene: cancel any previous open orders from this bot before planning a new rebalance.
+    # Otherwise repeated rebalances can accumulate duplicate pending orders and distort position reconciliation.
+    canceled: list[dict[str, Any]] = []
+    try:
+        open_orders = client.get_open_orders(category=cfg.exchange.category, symbol=None)
+        for o in open_orders:
+            try:
+                link = str(o.get("orderLinkId") or "")
+                if not link.startswith("xsrev-"):
+                    continue
+                sym = normalize_symbol(str(o.get("symbol") or ""))
+                oid = str(o.get("orderId") or "")
+                if not sym or not oid:
+                    continue
+                client.cancel_order(category=cfg.exchange.category, symbol=sym, order_id=oid)
+                canceled.append({"symbol": sym, "orderId": oid, "orderLinkId": link})
+            except Exception as e:
+                logger.warning("Failed to cancel stale open order: {}", e)
+        if canceled:
+            logger.info("Canceled {} stale open orders from previous rebalances.", len(canceled))
+    except Exception as e:
+        logger.warning("Open-order cleanup failed (continuing): {}", e)
+
     raw_pos = client.get_positions(category=cfg.exchange.category, settle_coin="USDT")
     parsed = _parse_positions(raw_pos)
     positions = parsed.positions
@@ -254,6 +277,7 @@ def run_rebalance(
             "orders": [],
             "positions": {k: v.__dict__ for k, v in positions.items()},
             "hedge_mode_symbols": parsed.hedge_mode_symbols,
+            "canceled_open_orders": canceled,
             "summary": {
                 "error": "hedge_mode_not_supported",
                 "target_symbols": len(target_notionals),
@@ -278,6 +302,7 @@ def run_rebalance(
             "orders": [],
             "positions": {k: v.__dict__ for k, v in positions.items()},
             "reconcile_top": reconcile_top,
+            "canceled_open_orders": canceled,
             "summary": {"target_symbols": len(target_notionals), "current_symbols": len(positions), "planned_orders": 0},
         }
 
@@ -289,6 +314,7 @@ def run_rebalance(
         "orders": [o.__dict__ for o in orders],
         "positions": {k: v.__dict__ for k, v in positions.items()},
         "reconcile_top": reconcile_top,
+        "canceled_open_orders": canceled,
         "summary": {"target_symbols": len(target_notionals), "current_symbols": len(positions), "planned_orders": len(orders)},
     }
 
