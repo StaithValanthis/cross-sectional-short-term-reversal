@@ -446,23 +446,24 @@ def _simulate_candidate_vectorized(
     max_dd_limit: float,
     max_turnover: float,
     min_symbols: int = 10,
-) -> dict[str, float] | None:
+) -> dict[str, Any] | None:
     """
     Fast daily rebalance simulation for candidate selection:
     - cross-sectional rank on lookback return
     - inverse-vol weights
     - dollar-neutral LS (long losers, short winners)
     - turnover/fees modeled in weight space
-    Returns metrics dict or None if not feasible.
+    Returns metrics dict (with sharpe, cagr, max_drawdown, avg_daily_turnover) on success,
+    or dict with reject_reason (and optional diagnostic fields) on failure, or None for legacy compatibility.
     """
     if close.empty:
-        return None
+        return {"reject_reason": "empty_close_data"}
     px = close.copy()
     # Require at least min_symbols available per day
     valid_counts = px.notna().sum(axis=1)
     px = px.loc[valid_counts >= min_symbols]
     if len(px) < (vol_lookback_days + lookback_days + 20):
-        return None
+        return {"reject_reason": "insufficient_history"}
 
     # daily returns and lookback returns
     # pandas FutureWarning: default fill_method='pad' is deprecated.
@@ -528,13 +529,13 @@ def _simulate_candidate_vectorized(
 
     weights = weights.dropna(how="all")
     if weights.empty or len(weights) < 30:
-        return None
+        return {"reject_reason": "insufficient_trading_days"}
 
     # Turnover / costs
     dw = weights.diff().abs().sum(axis=1).fillna(0.0)
     avg_turnover = float(dw.mean())
     if avg_turnover > float(max_turnover):
-        return None
+        return {"reject_reason": "max_turnover_exceeded", "avg_turnover": avg_turnover, "max_turnover": float(max_turnover)}
 
     fee_bps = float(maker_fee_bps) if use_maker else float(taker_fee_bps)
     tc_bps = fee_bps + float(slippage_bps)
@@ -543,7 +544,7 @@ def _simulate_candidate_vectorized(
     aligned = r1.loc[weights.index].shift(-1)
     port_ret = (weights * aligned).sum(axis=1).dropna()
     if port_ret.empty:
-        return None
+        return {"reject_reason": "no_portfolio_returns"}
 
     # apply transaction costs on traded notional in equity terms
     tc = dw.loc[port_ret.index] * (tc_bps / 10_000.0)
@@ -551,14 +552,14 @@ def _simulate_candidate_vectorized(
 
     equity = initial_equity * (1.0 + net_ret).cumprod()
     if float(equity.min()) <= 0.0:
-        return None
+        return {"reject_reason": "equity_below_zero"}
 
     # drawdown
     peak = equity.cummax()
     dd = equity / peak - 1.0
     max_dd = float(dd.min())
     if abs(max_dd) > float(max_dd_limit):
-        return None
+        return {"reject_reason": "max_drawdown_exceeded", "max_dd": max_dd, "max_dd_limit": float(max_dd_limit)}
 
     # sharpe
     if net_ret.std(ddof=0) == 0:
@@ -696,6 +697,28 @@ def optimize_config(
         else:
             close_train = close
 
+        # Stage1 feasibility gates (used only for the fast screening model).
+        # These can be overridden via env vars to avoid rejecting every candidate due to overly strict constraints.
+        # - BYBIT_OPT_STAGE1_MAX_DD_PCT: e.g. "50" means allow up to 50% drawdown in stage1 screen
+        # - BYBIT_OPT_STAGE1_MAX_TURNOVER: e.g. "10" means allow avg daily turnover up to 10 (weight-space)
+        dd_env = os.getenv("BYBIT_OPT_STAGE1_MAX_DD_PCT", "").strip()
+        to_env = os.getenv("BYBIT_OPT_STAGE1_MAX_TURNOVER", "").strip()
+        try:
+            stage1_max_dd = float(dd_env) / 100.0 if dd_env else float(cfg.risk.max_drawdown_pct) / 100.0
+        except Exception:
+            stage1_max_dd = float(cfg.risk.max_drawdown_pct) / 100.0
+        try:
+            stage1_max_turnover = float(to_env) if to_env else float(cfg.risk.max_turnover)
+        except Exception:
+            stage1_max_turnover = float(cfg.risk.max_turnover)
+        logger.info(
+            "Stage1 feasibility gates: max_dd_limit={:.2%} max_turnover={:.3f} (env overrides: BYBIT_OPT_STAGE1_MAX_DD_PCT={}, BYBIT_OPT_STAGE1_MAX_TURNOVER={})",
+            float(stage1_max_dd),
+            float(stage1_max_turnover),
+            dd_env or "n/a",
+            to_env or "n/a",
+        )
+
         # Funding daily rates cache for stage2 (and for optional funding filter)
         funding_daily: dict[str, pd.Series] = {}
         force_mainnet_funding = bool(cfg.funding.filter.use_mainnet_data_even_on_testnet and cfg.exchange.testnet)
@@ -774,28 +797,42 @@ def optimize_config(
                     slippage_bps=float(cfg.backtest.slippage_bps),
                     use_maker=use_maker,
                     initial_equity=float(cfg.backtest.initial_equity),
-                    max_dd_limit=float(cfg.risk.max_drawdown_pct) / 100.0,
-                    max_turnover=float(cfg.risk.max_turnover),
+                    max_dd_limit=float(stage1_max_dd),
+                    max_turnover=float(stage1_max_turnover),
                 )
 
                 # Record candidate metrics even if rejected (for debugging)
-                row = {
-                    "candidate": cand.__dict__,
-                    "sharpe": (float(m["sharpe"]) if m is not None else float("nan")),
-                    "cagr": (float(m["cagr"]) if m is not None else float("nan")),
-                    "max_drawdown": (float(m["max_drawdown"]) if m is not None else float("nan")),
-                    "avg_daily_turnover": (float(m["avg_daily_turnover"]) if m is not None else float("nan")),
-                    "rejected": False,
-                    "reject_reason": None,
-                }
-
-                if m is None:
-                    row["rejected"] = True
-                    row["reject_reason"] = "infeasible_or_insufficient_data"
+                if m is None or "reject_reason" in m:
+                    reject_reason = m.get("reject_reason", "unknown") if m is not None else "unknown"
+                    row = {
+                        "candidate": cand.__dict__,
+                        "sharpe": float("nan"),
+                        "cagr": float("nan"),
+                        "max_drawdown": float(m.get("max_dd", float("nan"))) if m is not None and "max_dd" in m else float("nan"),
+                        "avg_daily_turnover": float(m.get("avg_turnover", float("nan"))) if m is not None and "avg_turnover" in m else float("nan"),
+                        "rejected": True,
+                        "reject_reason": reject_reason,
+                    }
+                    # Store limit values for diagnostic logging
+                    if m is not None:
+                        if "max_dd_limit" in m:
+                            row["max_dd_limit"] = float(m["max_dd_limit"])
+                        if "max_turnover" in m:
+                            row["max_turnover"] = float(m["max_turnover"])
                     rows.append(row)
                     if progress_ctx is not None and task_id is not None:
                         progress_ctx.advance(task_id, 1)
                     continue
+
+                row = {
+                    "candidate": cand.__dict__,
+                    "sharpe": float(m["sharpe"]),
+                    "cagr": float(m["cagr"]),
+                    "max_drawdown": float(m["max_drawdown"]),
+                    "avg_daily_turnover": float(m["avg_daily_turnover"]),
+                    "rejected": False,
+                    "reject_reason": None,
+                }
 
                 # Objective (lexicographic):
                 #   1) maximize Sharpe
@@ -833,6 +870,36 @@ def optimize_config(
         if best is None:
             out = Path(output_dir)
             out.mkdir(parents=True, exist_ok=True)
+            # Helpful diagnostics
+            if close_train is None or getattr(close_train, "empty", False):
+                logger.error("Stage1 close_train matrix is empty; cannot evaluate candidates (check data window/min_history).")
+            try:
+                rej = [r.get("reject_reason") for r in rows if r.get("rejected")]
+                counts: dict[str, int] = {}
+                for x in rej:
+                    k = str(x or "unknown")
+                    counts[k] = counts.get(k, 0) + 1
+                top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+                logger.error("Stage1 rejection reasons (top 5): {}", top)
+                # Show sample values for common rejection reasons
+                dd_rejects = [r for r in rows if r.get("reject_reason") == "max_drawdown_exceeded"]
+                to_rejects = [r for r in rows if r.get("reject_reason") == "max_turnover_exceeded"]
+                if dd_rejects:
+                    sample_dd = dd_rejects[0]
+                    logger.warning(
+                        "Sample max_drawdown rejection: dd={:.2%} limit={:.2%} (relax with BYBIT_OPT_STAGE1_MAX_DD_PCT)",
+                        sample_dd.get("max_dd", float("nan")),
+                        sample_dd.get("max_dd_limit", float("nan")),
+                    )
+                if to_rejects:
+                    sample_to = to_rejects[0]
+                    logger.warning(
+                        "Sample max_turnover rejection: turnover={:.3f} limit={:.3f} (relax with BYBIT_OPT_STAGE1_MAX_TURNOVER)",
+                        sample_to.get("avg_turnover", float("nan")),
+                        sample_to.get("max_turnover", float("nan")),
+                    )
+            except Exception as e:
+                logger.debug("Failed to generate rejection diagnostics: {}", e)
             logger.error(
                 "Optimization found no feasible candidates. Leaving config unchanged. Results: {}",
                 (out / "stage1_results.json").resolve(),
