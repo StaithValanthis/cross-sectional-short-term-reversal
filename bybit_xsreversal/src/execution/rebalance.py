@@ -229,26 +229,21 @@ def run_rebalance(
     - plan orders
     - place with maker->market fallback
     """
-    # Hygiene: cancel any previous open orders from this bot before planning a new rebalance.
-    # Otherwise repeated rebalances can accumulate duplicate pending orders and distort position reconciliation.
+    # Hygiene: manage existing open limit orders from this bot.
+    # We do NOT want duplicate pending orders hanging around across rebalances.
     canceled: list[dict[str, Any]] = []
+    xsrev_open_by_symbol: dict[str, list[dict[str, Any]]] = {}
     try:
         open_orders = client.get_open_orders(category=cfg.exchange.category, symbol=None, settle_coin="USDT")
         for o in open_orders:
-            try:
-                link = str(o.get("orderLinkId") or "")
-                if not link.startswith("xsrev-"):
-                    continue
-                sym = normalize_symbol(str(o.get("symbol") or ""))
-                oid = str(o.get("orderId") or "")
-                if not sym or not oid:
-                    continue
-                client.cancel_order(category=cfg.exchange.category, symbol=sym, order_id=oid)
-                canceled.append({"symbol": sym, "orderId": oid, "orderLinkId": link})
-            except Exception as e:
-                logger.warning("Failed to cancel stale open order: {}", e)
-        if canceled:
-            logger.info("Canceled {} stale open orders from previous rebalances.", len(canceled))
+            link = str(o.get("orderLinkId") or "")
+            if not link.startswith("xsrev-"):
+                continue
+            sym = normalize_symbol(str(o.get("symbol") or ""))
+            oid = str(o.get("orderId") or "")
+            if not sym or not oid:
+                continue
+            xsrev_open_by_symbol.setdefault(sym, []).append(o)
     except Exception as e:
         logger.warning("Open-order cleanup failed (continuing): {}", e)
 
@@ -280,6 +275,21 @@ def run_rebalance(
     reconcile_top = _summarize_reconcile(positions=positions, target_notionals=target_notionals, md=md, limit=12)
     if reconcile_top:
         logger.info("Reconcile (top diffs): {}", reconcile_top)
+
+    # Cancel all open bot orders before placing new ones.
+    # This keeps the rebalance idempotent: repeated manual rebalances won't accumulate duplicates.
+    for sym, lst in xsrev_open_by_symbol.items():
+        for o in lst:
+            try:
+                oid = str(o.get("orderId") or "")
+                link = str(o.get("orderLinkId") or "")
+                if oid:
+                    client.cancel_order(category=cfg.exchange.category, symbol=sym, order_id=oid)
+                    canceled.append({"symbol": sym, "orderId": oid, "orderLinkId": link})
+            except Exception as e:
+                logger.warning("Failed to cancel stale open order: {}", e)
+    if canceled:
+        logger.info("Canceled {} stale open orders from previous rebalances.", len(canceled))
 
     if not orders:
         logger.info(
