@@ -246,16 +246,32 @@ class BybitClient:
                 return
             raise
 
-    def cancel_all_orders(self, *, category: str, settle_coin: str | None = "USDT") -> dict[str, Any]:
+    def cancel_all_orders(
+        self,
+        *,
+        category: str,
+        symbol: str | None = None,
+        settle_coin: str | None = "USDT",
+        base_coin: str | None = None,
+        order_filter: str | None = None,
+    ) -> dict[str, Any]:
         """
-        Cancel all open orders for the account (optionally scoped by settleCoin).
+        Cancel orders for the account. Bybit v5 supports scoping by symbol / settleCoin / baseCoin and
+        (optionally) orderFilter to cancel normal orders vs conditional/stop orders.
+
         This is the most reliable way to ensure a clean slate before rebalancing on a dedicated sub-account.
         """
         if self._auth is None:
             raise ValueError("Auth required for cancel_all_orders.")
         body: dict[str, Any] = {"category": category}
+        if symbol:
+            body["symbol"] = symbol
         if settle_coin:
             body["settleCoin"] = settle_coin
+        if base_coin:
+            body["baseCoin"] = base_coin
+        if order_filter:
+            body["orderFilter"] = order_filter
         data = self._request("POST", "/v5/order/cancel-all", None, body)
         return dict(data.get("result") or {})
 

@@ -10,6 +10,7 @@ from src.config import BotConfig
 from src.data.bybit_client import BybitClient
 from src.data.market_data import MarketData, normalize_symbol
 from src.execution.executor import Executor, PlannedOrder
+import time
 
 
 @dataclass(frozen=True)
@@ -284,29 +285,39 @@ def run_rebalance(
                     except Exception as e:
                         logger.warning("Failed to cancel open order for {}: {}", sym, e)
         elif mode == "all":
-            # Cancel ALL open orders in the dedicated account (scoped to USDT settle).
-            # Use Bybit's cancel-all endpoint first (more reliable than per-order cancels).
-            try:
-                client.cancel_all_orders(category=cfg.exchange.category, settle_coin="USDT")
-            except Exception as e:
-                logger.warning("Cancel-all endpoint failed (falling back to per-order cancels): {}", e)
-                open_orders = client.get_open_orders(category=cfg.exchange.category, symbol=None, settle_coin="USDT")
+            # Cancel *all* open orders for each symbol in play (including conditional/stop orders),
+            # then verify and hard-cancel by orderId as a last resort.
+            for sym in sorted(symbols_in_play):
+                # 1) cancel normal orders
+                try:
+                    client.cancel_all_orders(category=cfg.exchange.category, symbol=sym, order_filter="Order")
+                except Exception as e:
+                    logger.warning("Cancel-all(Order) failed for {}: {}", sym, e)
+                # 2) cancel conditional/stop orders (if any)
+                try:
+                    client.cancel_all_orders(category=cfg.exchange.category, symbol=sym, order_filter="StopOrder")
+                except Exception:
+                    # Not all accounts/categories support this filter consistently; ignore.
+                    pass
+
+                # Give the exchange a brief moment to reflect cancellations
+                time.sleep(0.15)
+
+                # 3) verify and hard-cancel anything still open
+                try:
+                    open_orders = client.get_open_orders(category=cfg.exchange.category, symbol=sym)
+                except Exception as e:
+                    logger.warning("Open-order list failed for {} after cancel-all: {}", sym, e)
+                    continue
                 for o in open_orders:
                     try:
-                        sym = normalize_symbol(str(o.get("symbol") or ""))
                         oid = str(o.get("orderId") or "")
-                        if not sym or not oid:
-                            continue
                         link = str(o.get("orderLinkId") or "")
-                        client.cancel_order(category=cfg.exchange.category, symbol=sym, order_id=oid)
-                        canceled.append({"symbol": sym, "orderId": oid, "orderLinkId": link})
-                    except Exception as e2:
-                        logger.warning("Failed to cancel open order: {}", e2)
-            else:
-                # Verify how many remain (sometimes exchange reports eventual consistency).
-                remaining = client.get_open_orders(category=cfg.exchange.category, symbol=None, settle_coin="USDT")
-                if remaining:
-                    logger.warning("Cancel-all completed but {} open orders still remain (will continue anyway).", len(remaining))
+                        if oid:
+                            client.cancel_order(category=cfg.exchange.category, symbol=sym, order_id=oid)
+                            canceled.append({"symbol": sym, "orderId": oid, "orderLinkId": link})
+                    except Exception as e:
+                        logger.warning("Failed to cancel open order for {}: {}", sym, e)
         else:
             # none
             pass
