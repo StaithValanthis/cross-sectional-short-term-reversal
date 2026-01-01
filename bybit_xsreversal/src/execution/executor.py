@@ -129,17 +129,17 @@ class Executor:
                     px_mid = float(stats.mid)
                 except Exception:
                     px_mid = 0.0
-                # Minimum qty as string (ceil to step, just in case)
+
                 min_qty_str = self._ceil_qty_str(float(meta.min_qty), meta)
                 min_notional = float(meta.min_qty) * float(px_mid) if px_mid > 0 else None
-                # Per-symbol notional cap (if equity is known)
+
                 cap = None
                 if self.equity_usdt is not None:
                     cap = min(
                         float(self.cfg.sizing.max_notional_per_symbol),
                         float(self.cfg.sizing.max_leverage_per_symbol) * float(self.equity_usdt),
                     )
-                # Allow bump if we can validate against cap; otherwise keep default skip.
+
                 if min_qty_str and min_notional is not None and cap is not None and min_notional <= cap:
                     logger.warning(
                         "Bumping {} {} qty up to minQty={} (~{:.2f} USDT) because bump_to_min_qty=true (cap~{:.2f} USDT).",
@@ -163,15 +163,17 @@ class Executor:
                             float(cap),
                         )
                         return None
-            logger.info(
-                "Skipping {} {}: qty below min step (raw_qty={} qtyStep={} minQty={})",
-                order.symbol,
-                order.side,
-                float(order.qty),
-                float(meta.qty_step),
-                float(meta.min_qty),
-            )
-            return None
+
+            if not qty_str:
+                logger.info(
+                    "Skipping {} {}: qty below min step (raw_qty={} qtyStep={} minQty={})",
+                    order.symbol,
+                    order.side,
+                    float(order.qty),
+                    float(meta.qty_step),
+                    float(meta.min_qty),
+                )
+                return None
 
         # If we have a qty, ensure the order also satisfies minimum order VALUE (minNotional).
         if bool(getattr(self.cfg.execution, "bump_to_min_qty", False)):
