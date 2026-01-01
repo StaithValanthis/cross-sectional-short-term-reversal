@@ -229,25 +229,69 @@ def run_rebalance(
     - plan orders
     - place with maker->market fallback
     """
-    # Hygiene: manage existing open limit orders from this bot.
-    # We do NOT want duplicate pending orders hanging around across rebalances.
+    # Hygiene: manage existing open orders to avoid duplicate pending orders across rebalances.
+    # Modes:
+    # - none: don't cancel open orders
+    # - bot_only: cancel only orders placed by this bot (orderLinkId starts with xsrev-)
+    # - symbols: cancel ALL open orders for symbols in play (current positions or targets)
     canceled: list[dict[str, Any]] = []
-    xsrev_open_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    mode = str(getattr(cfg.execution, "cancel_open_orders", "bot_only"))
+
+    raw_pos0 = client.get_positions(category=cfg.exchange.category, settle_coin="USDT")
+    parsed0 = _parse_positions(raw_pos0)
+    positions0 = parsed0.positions
+    symbols_in_play = {normalize_symbol(s) for s in (set(positions0) | set(target_notionals))}
+
     try:
-        open_orders = client.get_open_orders(category=cfg.exchange.category, symbol=None, settle_coin="USDT")
-        for o in open_orders:
-            link = str(o.get("orderLinkId") or "")
-            if not link.startswith("xsrev-"):
-                continue
-            sym = normalize_symbol(str(o.get("symbol") or ""))
-            oid = str(o.get("orderId") or "")
-            if not sym or not oid:
-                continue
-            xsrev_open_by_symbol.setdefault(sym, []).append(o)
+        if mode == "bot_only":
+            xsrev_open_by_symbol: dict[str, list[dict[str, Any]]] = {}
+            open_orders = client.get_open_orders(category=cfg.exchange.category, symbol=None, settle_coin="USDT")
+            for o in open_orders:
+                link = str(o.get("orderLinkId") or "")
+                if not link.startswith("xsrev-"):
+                    continue
+                sym = normalize_symbol(str(o.get("symbol") or ""))
+                oid = str(o.get("orderId") or "")
+                if not sym or not oid:
+                    continue
+                xsrev_open_by_symbol.setdefault(sym, []).append(o)
+            for sym, lst in xsrev_open_by_symbol.items():
+                for o in lst:
+                    try:
+                        oid = str(o.get("orderId") or "")
+                        link = str(o.get("orderLinkId") or "")
+                        if oid:
+                            client.cancel_order(category=cfg.exchange.category, symbol=sym, order_id=oid)
+                            canceled.append({"symbol": sym, "orderId": oid, "orderLinkId": link})
+                    except Exception as e:
+                        logger.warning("Failed to cancel stale open order: {}", e)
+        elif mode == "symbols":
+            # Cancel ALL open orders for symbols we manage.
+            for sym in sorted(symbols_in_play):
+                try:
+                    open_orders = client.get_open_orders(category=cfg.exchange.category, symbol=sym)
+                except Exception as e:
+                    logger.warning("Open-order list failed for {}: {}", sym, e)
+                    continue
+                for o in open_orders:
+                    try:
+                        oid = str(o.get("orderId") or "")
+                        link = str(o.get("orderLinkId") or "")
+                        if oid:
+                            client.cancel_order(category=cfg.exchange.category, symbol=sym, order_id=oid)
+                            canceled.append({"symbol": sym, "orderId": oid, "orderLinkId": link})
+                    except Exception as e:
+                        logger.warning("Failed to cancel open order for {}: {}", sym, e)
+        else:
+            # none
+            pass
     except Exception as e:
         logger.warning("Open-order cleanup failed (continuing): {}", e)
 
-    raw_pos = client.get_positions(category=cfg.exchange.category, settle_coin="USDT")
+    if canceled:
+        logger.info("Canceled {} open orders (mode={}).", len(canceled), mode)
+
+    raw_pos = raw_pos0
     parsed = _parse_positions(raw_pos)
     positions = parsed.positions
 

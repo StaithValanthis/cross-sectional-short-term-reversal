@@ -94,6 +94,7 @@ class ExecutionConfig(BaseModel):
     max_order_age_seconds: int = 20
     price_offset_bps: float = 2.0
     ioc_fallback: bool = True
+    cancel_open_orders: Literal["none", "bot_only", "symbols"] = "bot_only"
 
 
 class VolSpikeConfig(BaseModel):
