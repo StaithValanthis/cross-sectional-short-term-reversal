@@ -126,11 +126,21 @@ class Executor:
             if (
                 bool(getattr(self.cfg.execution, "bump_to_min_qty", False))
                 and float(meta.min_qty) > 0
-                # Do not bump reduce-only "partial trim" orders. Bumping to minQty can over-close (flatten)
-                # and then require re-opening next rebalance, creating churn.
-                and not bool(order.reduce_only)
             ):
                 bump_mode = str(getattr(self.cfg.execution, "bump_mode", "respect_cap"))
+                # By default we avoid bumping reduce-only partial trims (can over-close/flatten and create churn).
+                # If you really want "always trade min size", set bump_mode=force_exchange_min.
+                if bool(order.reduce_only) and bump_mode != "force_exchange_min":
+                    logger.info(
+                        "Skipping {} {}: qty below min step (raw_qty={} qtyStep={} minQty={}); reduceOnly trim not bumped in mode={}.",
+                        order.symbol,
+                        order.side,
+                        float(order.qty),
+                        float(meta.qty_step),
+                        float(meta.min_qty),
+                        bump_mode,
+                    )
+                    return None
                 try:
                     stats = self.md.get_orderbook_stats(order.symbol)
                     px_mid = float(stats.mid)
@@ -190,8 +200,12 @@ class Executor:
                 return None
 
         # If we have a qty, ensure the order also satisfies minimum order VALUE (minNotional).
-        if bool(getattr(self.cfg.execution, "bump_to_min_qty", False)) and not bool(order.reduce_only):
+        if bool(getattr(self.cfg.execution, "bump_to_min_qty", False)):
             bump_mode = str(getattr(self.cfg.execution, "bump_mode", "respect_cap"))
+            if bool(order.reduce_only) and bump_mode != "force_exchange_min":
+                # Same rationale as above: avoid bumping reduce-only trims unless explicitly forced.
+                pass
+            else:
             try:
                 px_for_notional = float(order.limit_price) if order.limit_price is not None else self._limit_price(order.symbol, order.side)
             except Exception:
@@ -247,6 +261,7 @@ class Executor:
                                 float(cap),
                             )
                             return None
+            # end: reduce-only bump guard
 
         if self.dry_run:
             logger.info("[DRY RUN] {} {} qty={} reduceOnly={} type={} px={} reason={}",
