@@ -124,6 +124,7 @@ class Executor:
             # Optional: bump tiny orders up to minQty when possible.
             # This is only safe-ish when we can ensure it doesn't exceed per-symbol notional caps.
             if bool(getattr(self.cfg.execution, "bump_to_min_qty", False)) and float(meta.min_qty) > 0:
+                bump_mode = str(getattr(self.cfg.execution, "bump_mode", "respect_cap"))
                 try:
                     stats = self.md.get_orderbook_stats(order.symbol)
                     px_mid = float(stats.mid)
@@ -140,14 +141,21 @@ class Executor:
                         float(self.cfg.sizing.max_leverage_per_symbol) * float(self.equity_usdt),
                     )
 
-                if min_qty_str and min_notional is not None and cap is not None and min_notional <= cap:
+                allow_bump = False
+                if bump_mode == "force_exchange_min":
+                    allow_bump = bool(min_qty_str) and (min_notional is not None)
+                else:
+                    allow_bump = bool(min_qty_str) and (min_notional is not None) and (cap is not None) and (min_notional <= cap)
+
+                if allow_bump and min_qty_str and min_notional is not None:
                     logger.warning(
-                        "Bumping {} {} qty up to minQty={} (~{:.2f} USDT) because bump_to_min_qty=true (cap~{:.2f} USDT).",
+                        "Bumping {} {} qty up to minQty={} (~{:.2f} USDT) because bump_to_min_qty=true (mode={} cap~{} USDT).",
                         order.symbol,
                         order.side,
                         min_qty_str,
                         float(min_notional),
-                        float(cap),
+                        bump_mode,
+                        "n/a" if cap is None else f"{cap:.2f}",
                     )
                     qty_str = min_qty_str
                 else:
@@ -177,6 +185,7 @@ class Executor:
 
         # If we have a qty, ensure the order also satisfies minimum order VALUE (minNotional).
         if bool(getattr(self.cfg.execution, "bump_to_min_qty", False)):
+            bump_mode = str(getattr(self.cfg.execution, "bump_mode", "respect_cap"))
             try:
                 px_for_notional = float(order.limit_price) if order.limit_price is not None else self._limit_price(order.symbol, order.side)
             except Exception:
@@ -203,15 +212,22 @@ class Executor:
                                 float(self.cfg.sizing.max_leverage_per_symbol) * float(self.equity_usdt),
                             )
                         bumped_notional = float(bumped_qty_str) * px_for_notional if bumped_qty_str else None
-                        if bumped_qty_str and bumped_notional is not None and cap is not None and bumped_notional <= cap:
+                        allow_bump_val = False
+                        if bump_mode == "force_exchange_min":
+                            allow_bump_val = bool(bumped_qty_str) and (bumped_notional is not None)
+                        else:
+                            allow_bump_val = bool(bumped_qty_str) and (bumped_notional is not None) and (cap is not None) and (bumped_notional <= cap)
+
+                        if allow_bump_val and bumped_qty_str and bumped_notional is not None:
                             logger.warning(
-                                "Bumping {} {} qty up to {} to satisfy min order value {:.2f} USDT (was {:.2f}; cap~{:.2f}).",
+                                "Bumping {} {} qty up to {} to satisfy min order value {:.2f} USDT (was {:.2f}; mode={} cap~{}).",
                                 order.symbol,
                                 order.side,
                                 bumped_qty_str,
                                 float(min_val_f),
                                 float(cur_notional),
-                                float(cap),
+                                bump_mode,
+                                "n/a" if cap is None else f"{cap:.2f}",
                             )
                             qty_str = bumped_qty_str
                         elif bumped_notional is not None and cap is not None:

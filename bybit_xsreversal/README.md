@@ -83,6 +83,13 @@ If you are running a dedicated sub-account and want the bot to **bump tiny order
 within your `max_leverage_per_symbol` cap), set:
 
 - `execution.bump_to_min_qty: true`
+- `execution.bump_mode: respect_cap`
+
+If you want it to **always** use the exchange minimums (minQty / min order value) even when that exceeds your
+per-symbol cap (use with care, especially on small accounts), set:
+
+- `execution.bump_to_min_qty: true`
+- `execution.bump_mode: force_exchange_min`
 
 Operational notes:
 - The live process is a **scheduler** that must keep running until the rebalance time. If the process/service is stopped, the rebalance will not happen.
