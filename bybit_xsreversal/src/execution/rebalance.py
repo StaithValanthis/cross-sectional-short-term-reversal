@@ -350,7 +350,12 @@ def run_rebalance(
             },
         }
 
-    ex = Executor(client=client, md=md, cfg=cfg, dry_run=dry_run)
+    # Provide equity to the executor so it can apply "bump_to_min_qty" safely within per-symbol caps.
+    try:
+        equity_exec = fetch_equity_usdt(client=client)
+    except Exception:
+        equity_exec = None
+    ex = Executor(client=client, md=md, cfg=cfg, dry_run=dry_run, equity_usdt=equity_exec)
     orders = plan_rebalance_orders(cfg=cfg, md=md, current_positions=positions, target_notionals=target_notionals)
     reconcile_top = _summarize_reconcile(positions=positions, target_notionals=target_notionals, md=md, limit=12)
     if reconcile_top:

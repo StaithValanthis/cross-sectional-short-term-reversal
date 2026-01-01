@@ -74,6 +74,16 @@ Useful environment overrides:
 
 Results are written to `outputs/optimize/<timestamp>/` including `best.json` and (if enabled) OOS metrics.
 
+### Minimum order size behavior (exchange constraints)
+
+Some perps have exchange minimums (e.g. `ETHUSDT` min qty) that can exceed your intended notional when equity is small.
+By default, the bot **skips** orders that would be truncated to zero.
+
+If you are running a dedicated sub-account and want the bot to **bump tiny orders up to minQty** (only when it stays
+within your `max_leverage_per_symbol` cap), set:
+
+- `execution.bump_to_min_qty: true`
+
 Operational notes:
 - The live process is a **scheduler** that must keep running until the rebalance time. If the process/service is stopped, the rebalance will not happen.
 - If the bot starts *after* the scheduled time and it hasn’t rebalanced yet for that day, it will **catch up immediately** on startup (and log that it’s doing so).

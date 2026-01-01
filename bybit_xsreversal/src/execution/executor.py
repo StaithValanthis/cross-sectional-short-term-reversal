@@ -42,11 +42,12 @@ class PlannedOrder:
 
 
 class Executor:
-    def __init__(self, *, client: BybitClient, md: MarketData, cfg: BotConfig, dry_run: bool) -> None:
+    def __init__(self, *, client: BybitClient, md: MarketData, cfg: BotConfig, dry_run: bool, equity_usdt: float | None = None) -> None:
         self.client = client
         self.md = md
         self.cfg = cfg
         self.dry_run = dry_run
+        self.equity_usdt = float(equity_usdt) if equity_usdt is not None else None
 
     def _limit_price(self, symbol: str, side: Side) -> float:
         stats = self.md.get_orderbook_stats(symbol)
@@ -103,6 +104,51 @@ class Executor:
         meta = self.md.get_instrument_meta(order.symbol)
         qty_str = self._format_qty_str(order.qty, meta)
         if not qty_str:
+            # Optional: bump tiny orders up to minQty when possible.
+            # This is only safe-ish when we can ensure it doesn't exceed per-symbol notional caps.
+            if (
+                bool(getattr(self.cfg.execution, "bump_to_min_qty", False))
+                and not bool(order.reduce_only)
+                and float(meta.min_qty) > 0
+            ):
+                try:
+                    stats = self.md.get_orderbook_stats(order.symbol)
+                    px_mid = float(stats.mid)
+                except Exception:
+                    px_mid = 0.0
+                min_qty_str = self._format_qty_str(float(meta.min_qty), meta)
+                min_notional = float(meta.min_qty) * float(px_mid) if px_mid > 0 else None
+                # Per-symbol notional cap (if equity is known)
+                cap = None
+                if self.equity_usdt is not None:
+                    cap = min(
+                        float(self.cfg.sizing.max_notional_per_symbol),
+                        float(self.cfg.sizing.max_leverage_per_symbol) * float(self.equity_usdt),
+                    )
+                # Allow bump if we can validate against cap; otherwise keep default skip.
+                if min_qty_str and min_notional is not None and cap is not None and min_notional <= cap:
+                    logger.warning(
+                        "Bumping {} {} qty up to minQty={} (~{:.2f} USDT) because bump_to_min_qty=true (cap~{:.2f} USDT).",
+                        order.symbol,
+                        order.side,
+                        min_qty_str,
+                        float(min_notional),
+                        float(cap),
+                    )
+                    qty_str = min_qty_str
+                else:
+                    if min_notional is not None and cap is not None:
+                        logger.info(
+                            "Skipping {} {}: qty below min step (raw_qty={} qtyStep={} minQty={}); cannot bump (minNotional~{:.2f} > cap~{:.2f} or missing price).",
+                            order.symbol,
+                            order.side,
+                            float(order.qty),
+                            float(meta.qty_step),
+                            float(meta.min_qty),
+                            float(min_notional),
+                            float(cap),
+                        )
+                        return None
             logger.info(
                 "Skipping {} {}: qty below min step (raw_qty={} qtyStep={} minQty={})",
                 order.symbol,

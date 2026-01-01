@@ -95,6 +95,7 @@ class ExecutionConfig(BaseModel):
     price_offset_bps: float = 2.0
     ioc_fallback: bool = True
     cancel_open_orders: Literal["none", "bot_only", "symbols", "all"] = "bot_only"
+    bump_to_min_qty: bool = False
 
 
 class VolSpikeConfig(BaseModel):
