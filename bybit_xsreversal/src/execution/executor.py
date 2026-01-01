@@ -3,12 +3,14 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_DOWN
 from typing import Any, Literal
 
 import numpy as np
 from loguru import logger
 
 from src.config import BotConfig
+from src.data.bybit_client import BybitAPIError
 from src.data.bybit_client import BybitClient
 from src.data.market_data import InstrumentMeta, MarketData
 
@@ -69,16 +71,42 @@ class Executor:
             q = min(q, meta.max_qty)
         return float(q)
 
+    def _format_qty_str(self, qty: float, meta: InstrumentMeta) -> str:
+        """
+        Format qty for Bybit:
+        - round DOWN to the instrument qty_step
+        - enforce min_qty/max_qty
+        - emit fixed-point string (no scientific notation, no float artifacts)
+        """
+        step = Decimal(str(meta.qty_step))
+        q = Decimal(str(abs(qty)))
+        if step > 0:
+            k = (q / step).to_integral_value(rounding=ROUND_DOWN)
+            q = (k * step).quantize(step)
+        # Enforce bounds
+        min_q = Decimal(str(meta.min_qty))
+        if q < min_q:
+            return ""
+        if meta.max_qty is not None:
+            max_q = Decimal(str(meta.max_qty))
+            q = min(q, max_q)
+            if step > 0:
+                k = (q / step).to_integral_value(rounding=ROUND_DOWN)
+                q = (k * step).quantize(step)
+        # fixed-point string
+        s = format(q, "f")
+        return s
+
     def place(self, order: PlannedOrder) -> dict[str, Any] | None:
         meta = self.md.get_instrument_meta(order.symbol)
-        qty = self._format_qty(order.qty, meta)
-        if qty <= 0:
+        qty_str = self._format_qty_str(order.qty, meta)
+        if not qty_str:
             logger.info("Skipping {} {}: qty below min step", order.symbol, order.side)
             return None
 
         if self.dry_run:
             logger.info("[DRY RUN] {} {} qty={} reduceOnly={} type={} px={} reason={}",
-                        order.symbol, order.side, qty, order.reduce_only, order.order_type, order.limit_price, order.reason)
+                        order.symbol, order.side, qty_str, order.reduce_only, order.order_type, order.limit_price, order.reason)
             return None
 
         link_id = f"xsrev-{uuid.uuid4().hex[:16]}"
@@ -87,7 +115,7 @@ class Executor:
                 "symbol": order.symbol,
                 "side": order.side,
                 "orderType": "Market",
-                "qty": str(qty),
+                "qty": qty_str,
                 "timeInForce": "IOC",
                 "reduceOnly": bool(order.reduce_only),
                 "orderLinkId": link_id,
@@ -99,16 +127,37 @@ class Executor:
                 "symbol": order.symbol,
                 "side": order.side,
                 "orderType": "Limit",
-                "qty": str(qty),
+                "qty": qty_str,
                 "price": str(px),
                 "timeInForce": tif,
                 "reduceOnly": bool(order.reduce_only),
                 "orderLinkId": link_id,
             }
 
-        res = self.client.create_order(category=self.cfg.exchange.category, order=payload)
-        logger.info("Order placed: {} {} qty={} type={} id={}", order.symbol, order.side, qty, order.order_type, res.get("orderId"))
-        return res
+        try:
+            res = self.client.create_order(category=self.cfg.exchange.category, order=payload)
+            logger.info(
+                "Order placed: {} {} qty={} type={} id={}",
+                order.symbol,
+                order.side,
+                qty_str,
+                order.order_type,
+                res.get("orderId"),
+            )
+            return res
+        except BybitAPIError as e:
+            logger.error(
+                "Order rejected by Bybit: {} {} qty={} type={} reduceOnly={} reason={} retCode={} retMsg={}",
+                order.symbol,
+                order.side,
+                qty_str,
+                order.order_type,
+                bool(order.reduce_only),
+                order.reason,
+                e.ret_code,
+                e.ret_msg,
+            )
+            return None
 
     def place_with_fallback(self, order: PlannedOrder) -> None:
         """

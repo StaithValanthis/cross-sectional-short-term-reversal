@@ -297,9 +297,15 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                     )
                 return
 
-            res = run_rebalance(cfg=cfg, client=client, md=md, target_notionals=targets.notionals_usd, dry_run=dry_run)
-            (out_dir / "execution_result.json").write_bytes(orjson.dumps(res, option=orjson.OPT_INDENT_2))
-            logger.info("Rebalance done. Result saved to {}", (out_dir / "execution_result.json").resolve())
+            try:
+                res = run_rebalance(cfg=cfg, client=client, md=md, target_notionals=targets.notionals_usd, dry_run=dry_run)
+                (out_dir / "execution_result.json").write_bytes(orjson.dumps(res, option=orjson.OPT_INDENT_2))
+                logger.info("Rebalance done. Result saved to {}", (out_dir / "execution_result.json").resolve())
+            except Exception as e:
+                # Don't take down the scheduler on a single execution error; systemd will restart anyway,
+                # but keeping the process alive gives you cleaner logs and avoids repeated crash loops.
+                logger.exception("Rebalance execution failed (continuing scheduler): {}", e)
+                return
 
             # Update rebalance state
             try:
