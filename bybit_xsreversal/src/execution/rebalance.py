@@ -178,32 +178,21 @@ def plan_rebalance_orders(
         if abs(delta * px) < float(cfg.sizing.min_notional_per_symbol):
             continue
 
-        # Determine if sign flip needed
+        # Determine if sign flip needed.
+        # In ONE-WAY mode (required by this bot), the cleanest approach is to place a single "cross" order
+        # that moves from current to target in one trade (avoids duplicate pending orders and reduce-only
+        # dust truncation issues).
         if cur_size != 0.0 and np.sign(cur_size) != np.sign(tgt_size) and abs(tgt_size) > 0:
-            # 1) reduce-only to flat
-            side_flat: Any = "Sell" if cur_size > 0 else "Buy"
+            side: Any = "Buy" if delta > 0 else "Sell"
             orders.append(
                 PlannedOrder(
                     symbol=sym,
-                    side=side_flat,
-                    qty=abs(cur_size),
-                    reduce_only=True,
-                    order_type=cfg.execution.order_type,
-                    limit_price=None,
-                    reason="sign_flip_flatten",
-                )
-            )
-            # 2) open to target from flat
-            side_open: Any = "Buy" if tgt_size > 0 else "Sell"
-            orders.append(
-                PlannedOrder(
-                    symbol=sym,
-                    side=side_open,
-                    qty=abs(tgt_size),
+                    side=side,
+                    qty=abs(delta),
                     reduce_only=False,
                     order_type=cfg.execution.order_type,
                     limit_price=None,
-                    reason="sign_flip_open",
+                    reason="sign_flip_cross",
                 )
             )
             continue
@@ -244,7 +233,7 @@ def run_rebalance(
     # Otherwise repeated rebalances can accumulate duplicate pending orders and distort position reconciliation.
     canceled: list[dict[str, Any]] = []
     try:
-        open_orders = client.get_open_orders(category=cfg.exchange.category, symbol=None)
+        open_orders = client.get_open_orders(category=cfg.exchange.category, symbol=None, settle_coin="USDT")
         for o in open_orders:
             try:
                 link = str(o.get("orderLinkId") or "")

@@ -236,12 +236,28 @@ class BybitClient:
         body = {"category": category, "symbol": symbol, "orderId": order_id}
         self._request("POST", "/v5/order/cancel", None, body)
 
-    def get_open_orders(self, *, category: str, symbol: str | None = None) -> list[dict[str, Any]]:
+    def get_open_orders(
+        self,
+        *,
+        category: str,
+        symbol: str | None = None,
+        settle_coin: str | None = None,
+        base_coin: str | None = None,
+    ) -> list[dict[str, Any]]:
         if self._auth is None:
             raise ValueError("Auth required for open orders.")
         params: dict[str, Any] = {"category": category, "openOnly": 1, "limit": 50}
         if symbol:
             params["symbol"] = symbol
+        else:
+            # Bybit requires one of: symbol / settleCoin / baseCoin for order/realtime.
+            # Default to USDT-settled perps when not specifying a symbol.
+            if settle_coin is None and base_coin is None:
+                settle_coin = "USDT"
+        if settle_coin:
+            params["settleCoin"] = settle_coin
+        if base_coin:
+            params["baseCoin"] = base_coin
         data = self._request("GET", "/v5/order/realtime", params, None)
         return list((data.get("result") or {}).get("list") or [])
 
