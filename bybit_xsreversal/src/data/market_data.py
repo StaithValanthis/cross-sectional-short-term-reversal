@@ -35,6 +35,7 @@ class InstrumentMeta:
     min_qty: float
     max_qty: float | None
     tick_size: float
+    min_notional: float | None  # minimum order value in USDT, if provided by exchange metadata
 
 
 class MarketData:
@@ -154,6 +155,19 @@ class MarketData:
         qty_step = float(lot.get("qtyStep") or 0.0)
         min_qty = float(lot.get("minOrderQty") or 0.0)
         max_qty = lot.get("maxOrderQty")
+        # Different Bybit instruments can expose min order value under different keys.
+        # We store it as "min_notional" in USDT when available.
+        min_notional_raw = (
+            lot.get("minOrderAmt")
+            or lot.get("minOrderValue")
+            or lot.get("minNotionalValue")
+            or lot.get("minNotional")
+            or lot.get("minOrderValueUSDT")
+        )
+        try:
+            min_notional = float(min_notional_raw) if min_notional_raw not in (None, "", "0") else None
+        except Exception:
+            min_notional = None
         tick_size = float(price_f.get("tickSize") or 0.0)
         meta = InstrumentMeta(
             symbol=symbol,
@@ -161,6 +175,7 @@ class MarketData:
             min_qty=min_qty if min_qty > 0 else 0.0,
             max_qty=float(max_qty) if max_qty not in (None, "", "0") else None,
             tick_size=tick_size if tick_size > 0 else 1e-8,
+            min_notional=min_notional if (min_notional is not None and min_notional > 0) else None,
         )
         self._instrument_cache[symbol] = meta
         return meta

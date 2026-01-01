@@ -96,6 +96,7 @@ class ExecutionConfig(BaseModel):
     ioc_fallback: bool = True
     cancel_open_orders: Literal["none", "bot_only", "symbols", "all"] = "bot_only"
     bump_to_min_qty: bool = False
+    min_order_value_usdt: float | None = 5.0
 
 
 class VolSpikeConfig(BaseModel):

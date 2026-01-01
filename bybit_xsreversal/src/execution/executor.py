@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Any, Literal
 
 import numpy as np
@@ -100,23 +100,37 @@ class Executor:
         s = format(q, "f")
         return s
 
+    def _ceil_qty_str(self, qty: float, meta: InstrumentMeta) -> str:
+        """
+        Round UP to the next qty_step (used when we must satisfy minQty/minNotional).
+        """
+        step = Decimal(str(meta.qty_step))
+        q = Decimal(str(abs(qty)))
+        if step > 0:
+            k = (q / step).to_integral_value(rounding=ROUND_UP)
+            q = (k * step).quantize(step)
+        if q <= 0:
+            return ""
+        # enforce max qty if present
+        if meta.max_qty is not None:
+            max_q = Decimal(str(meta.max_qty))
+            q = min(q, max_q)
+        return format(q, "f")
+
     def place(self, order: PlannedOrder) -> dict[str, Any] | None:
         meta = self.md.get_instrument_meta(order.symbol)
         qty_str = self._format_qty_str(order.qty, meta)
         if not qty_str:
             # Optional: bump tiny orders up to minQty when possible.
             # This is only safe-ish when we can ensure it doesn't exceed per-symbol notional caps.
-            if (
-                bool(getattr(self.cfg.execution, "bump_to_min_qty", False))
-                and not bool(order.reduce_only)
-                and float(meta.min_qty) > 0
-            ):
+            if bool(getattr(self.cfg.execution, "bump_to_min_qty", False)) and float(meta.min_qty) > 0:
                 try:
                     stats = self.md.get_orderbook_stats(order.symbol)
                     px_mid = float(stats.mid)
                 except Exception:
                     px_mid = 0.0
-                min_qty_str = self._format_qty_str(float(meta.min_qty), meta)
+                # Minimum qty as string (ceil to step, just in case)
+                min_qty_str = self._ceil_qty_str(float(meta.min_qty), meta)
                 min_notional = float(meta.min_qty) * float(px_mid) if px_mid > 0 else None
                 # Per-symbol notional cap (if equity is known)
                 cap = None
@@ -158,6 +172,57 @@ class Executor:
                 float(meta.min_qty),
             )
             return None
+
+        # If we have a qty, ensure the order also satisfies minimum order VALUE (minNotional).
+        if bool(getattr(self.cfg.execution, "bump_to_min_qty", False)):
+            try:
+                px_for_notional = float(order.limit_price) if order.limit_price is not None else self._limit_price(order.symbol, order.side)
+            except Exception:
+                px_for_notional = 0.0
+            if px_for_notional > 0:
+                min_val = getattr(meta, "min_notional", None)
+                if min_val is None:
+                    min_val = getattr(self.cfg.execution, "min_order_value_usdt", None)
+                try:
+                    min_val_f = float(min_val) if min_val is not None else None
+                except Exception:
+                    min_val_f = None
+                if min_val_f is not None and min_val_f > 0:
+                    cur_qty_f = float(qty_str)
+                    cur_notional = cur_qty_f * px_for_notional
+                    if cur_notional + 1e-9 < min_val_f:
+                        # Bump qty up to satisfy min order value
+                        need_qty = min_val_f / px_for_notional
+                        bumped_qty_str = self._ceil_qty_str(need_qty, meta)
+                        cap = None
+                        if self.equity_usdt is not None:
+                            cap = min(
+                                float(self.cfg.sizing.max_notional_per_symbol),
+                                float(self.cfg.sizing.max_leverage_per_symbol) * float(self.equity_usdt),
+                            )
+                        bumped_notional = float(bumped_qty_str) * px_for_notional if bumped_qty_str else None
+                        if bumped_qty_str and bumped_notional is not None and cap is not None and bumped_notional <= cap:
+                            logger.warning(
+                                "Bumping {} {} qty up to {} to satisfy min order value {:.2f} USDT (was {:.2f}; cap~{:.2f}).",
+                                order.symbol,
+                                order.side,
+                                bumped_qty_str,
+                                float(min_val_f),
+                                float(cur_notional),
+                                float(cap),
+                            )
+                            qty_str = bumped_qty_str
+                        elif bumped_notional is not None and cap is not None:
+                            logger.info(
+                                "Skipping {} {}: would violate min order value {:.2f} USDT (current {:.2f}); bump would be {:.2f} > cap~{:.2f}.",
+                                order.symbol,
+                                order.side,
+                                float(min_val_f),
+                                float(cur_notional),
+                                float(bumped_notional),
+                                float(cap),
+                            )
+                            return None
 
         if self.dry_run:
             logger.info("[DRY RUN] {} {} qty={} reduceOnly={} type={} px={} reason={}",
