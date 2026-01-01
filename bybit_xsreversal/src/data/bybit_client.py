@@ -256,19 +256,31 @@ class BybitClient:
     ) -> list[dict[str, Any]]:
         if self._auth is None:
             raise ValueError("Auth required for open orders.")
-        params: dict[str, Any] = {"category": category, "openOnly": 1, "limit": 50}
-        if symbol:
-            params["symbol"] = symbol
-        else:
-            # Bybit requires one of: symbol / settleCoin / baseCoin for order/realtime.
-            # Default to USDT-settled perps when not specifying a symbol.
-            if settle_coin is None and base_coin is None:
-                settle_coin = "USDT"
-        if settle_coin:
-            params["settleCoin"] = settle_coin
-        if base_coin:
-            params["baseCoin"] = base_coin
-        data = self._request("GET", "/v5/order/realtime", params, None)
-        return list((data.get("result") or {}).get("list") or [])
+        # Bybit pagination uses nextPageCursor.
+        out: list[dict[str, Any]] = []
+        cursor: str | None = None
+        for _ in range(20):  # hard cap
+            params: dict[str, Any] = {"category": category, "openOnly": 1, "limit": 50}
+            if cursor:
+                params["cursor"] = cursor
+            if symbol:
+                params["symbol"] = symbol
+            else:
+                # Bybit requires one of: symbol / settleCoin / baseCoin for order/realtime.
+                # Default to USDT-settled perps when not specifying a symbol.
+                if settle_coin is None and base_coin is None:
+                    settle_coin = "USDT"
+            if settle_coin:
+                params["settleCoin"] = settle_coin
+            if base_coin:
+                params["baseCoin"] = base_coin
+
+            data = self._request("GET", "/v5/order/realtime", params, None)
+            res = data.get("result") or {}
+            out.extend(list(res.get("list") or []))
+            cursor = res.get("nextPageCursor") or None
+            if not cursor:
+                break
+        return out
 
 
