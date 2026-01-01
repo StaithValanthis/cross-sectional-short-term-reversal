@@ -171,13 +171,51 @@ def plan_rebalance_orders(
         if px <= 0:
             continue
 
+        # Instrument constraints
+        try:
+            meta = md.get_instrument_meta(sym)
+        except Exception as e:
+            logger.warning("Skipping {}: cannot fetch instrument meta: {}", sym, e)
+            continue
+
         tgt_notional = float(target_notionals.get(sym, 0.0))
         tgt_size = tgt_notional / px  # base qty, signed
+
+        # If target is non-zero but below exchange minimum size, only "bump" when opening from flat.
+        # If we already have a position in the same direction, don't keep adding minimum clips.
+        min_qty = float(getattr(meta, "min_qty", 0.0) or 0.0)
+        if abs(tgt_size) > 0 and min_qty > 0 and abs(tgt_size) < min_qty:
+            if cur_size != 0.0 and np.sign(cur_size) == np.sign(tgt_size):
+                logger.info(
+                    "Skipping {}: target below minQty (tgt_qty={:.6g} < minQty={:.6g}) but already positioned in same direction (cur_qty={:.6g}).",
+                    sym,
+                    float(tgt_size),
+                    float(min_qty),
+                    float(cur_size),
+                )
+                continue
+            # Opening from flat: bump to minQty in target direction.
+            tgt_size = float(np.sign(tgt_size) * min_qty)
 
         # Delta in base qty
         delta = tgt_size - cur_size
         if abs(delta * px) < float(cfg.sizing.min_notional_per_symbol):
             continue
+
+        # If this is a reduce-only trim and the delta is below minQty, we can't execute it without over-closing.
+        # Skip to avoid churn (flatten now, reopen next rebalance).
+        if min_qty > 0:
+            reduce_only_candidate = (cur_size > 0 and delta < 0) or (cur_size < 0 and delta > 0)
+            if reduce_only_candidate and abs(delta) < min_qty:
+                logger.info(
+                    "Skipping {}: reduce-only trim below minQty (delta_qty={:.6g} < minQty={:.6g}). cur_qty={:.6g} tgt_qty={:.6g}",
+                    sym,
+                    float(delta),
+                    float(min_qty),
+                    float(cur_size),
+                    float(tgt_size),
+                )
+                continue
 
         # Determine if sign flip needed.
         # In ONE-WAY mode (required by this bot), the cleanest approach is to place a single "cross" order
