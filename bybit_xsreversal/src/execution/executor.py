@@ -123,7 +123,13 @@ class Executor:
         if not qty_str:
             # Optional: bump tiny orders up to minQty when possible.
             # This is only safe-ish when we can ensure it doesn't exceed per-symbol notional caps.
-            if bool(getattr(self.cfg.execution, "bump_to_min_qty", False)) and float(meta.min_qty) > 0:
+            if (
+                bool(getattr(self.cfg.execution, "bump_to_min_qty", False))
+                and float(meta.min_qty) > 0
+                # Do not bump reduce-only "partial trim" orders. Bumping to minQty can over-close (flatten)
+                # and then require re-opening next rebalance, creating churn.
+                and not bool(order.reduce_only)
+            ):
                 bump_mode = str(getattr(self.cfg.execution, "bump_mode", "respect_cap"))
                 try:
                     stats = self.md.get_orderbook_stats(order.symbol)
@@ -184,7 +190,7 @@ class Executor:
                 return None
 
         # If we have a qty, ensure the order also satisfies minimum order VALUE (minNotional).
-        if bool(getattr(self.cfg.execution, "bump_to_min_qty", False)):
+        if bool(getattr(self.cfg.execution, "bump_to_min_qty", False)) and not bool(order.reduce_only):
             bump_mode = str(getattr(self.cfg.execution, "bump_mode", "respect_cap"))
             try:
                 px_for_notional = float(order.limit_price) if order.limit_price is not None else self._limit_price(order.symbol, order.side)
