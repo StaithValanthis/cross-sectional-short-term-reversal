@@ -284,22 +284,29 @@ def run_rebalance(
                     except Exception as e:
                         logger.warning("Failed to cancel open order for {}: {}", sym, e)
         elif mode == "all":
-            # Cancel ALL open LIMIT orders in the USDT-settled account.
-            open_orders = client.get_open_orders(category=cfg.exchange.category, symbol=None, settle_coin="USDT")
-            for o in open_orders:
-                try:
-                    sym = normalize_symbol(str(o.get("symbol") or ""))
-                    oid = str(o.get("orderId") or "")
-                    if not sym or not oid:
-                        continue
-                    ot = str(o.get("orderType") or "").lower()
-                    if ot and ot != "limit":
-                        continue
-                    link = str(o.get("orderLinkId") or "")
-                    client.cancel_order(category=cfg.exchange.category, symbol=sym, order_id=oid)
-                    canceled.append({"symbol": sym, "orderId": oid, "orderLinkId": link})
-                except Exception as e:
-                    logger.warning("Failed to cancel open order: {}", e)
+            # Cancel ALL open orders in the dedicated account (scoped to USDT settle).
+            # Use Bybit's cancel-all endpoint first (more reliable than per-order cancels).
+            try:
+                client.cancel_all_orders(category=cfg.exchange.category, settle_coin="USDT")
+            except Exception as e:
+                logger.warning("Cancel-all endpoint failed (falling back to per-order cancels): {}", e)
+                open_orders = client.get_open_orders(category=cfg.exchange.category, symbol=None, settle_coin="USDT")
+                for o in open_orders:
+                    try:
+                        sym = normalize_symbol(str(o.get("symbol") or ""))
+                        oid = str(o.get("orderId") or "")
+                        if not sym or not oid:
+                            continue
+                        link = str(o.get("orderLinkId") or "")
+                        client.cancel_order(category=cfg.exchange.category, symbol=sym, order_id=oid)
+                        canceled.append({"symbol": sym, "orderId": oid, "orderLinkId": link})
+                    except Exception as e2:
+                        logger.warning("Failed to cancel open order: {}", e2)
+            else:
+                # Verify how many remain (sometimes exchange reports eventual consistency).
+                remaining = client.get_open_orders(category=cfg.exchange.category, symbol=None, settle_coin="USDT")
+                if remaining:
+                    logger.warning("Cancel-all completed but {} open orders still remain (will continue anyway).", len(remaining))
         else:
             # none
             pass

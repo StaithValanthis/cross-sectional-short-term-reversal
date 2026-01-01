@@ -246,6 +246,19 @@ class BybitClient:
                 return
             raise
 
+    def cancel_all_orders(self, *, category: str, settle_coin: str | None = "USDT") -> dict[str, Any]:
+        """
+        Cancel all open orders for the account (optionally scoped by settleCoin).
+        This is the most reliable way to ensure a clean slate before rebalancing on a dedicated sub-account.
+        """
+        if self._auth is None:
+            raise ValueError("Auth required for cancel_all_orders.")
+        body: dict[str, Any] = {"category": category}
+        if settle_coin:
+            body["settleCoin"] = settle_coin
+        data = self._request("POST", "/v5/order/cancel-all", None, body)
+        return dict(data.get("result") or {})
+
     def get_open_orders(
         self,
         *,
