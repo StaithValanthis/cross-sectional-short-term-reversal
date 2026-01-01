@@ -932,7 +932,19 @@ def optimize_config(
             }
 
         k2 = int(stage2_topk) if stage2_topk is not None else _level_to_stage2_topk(level)
-        k2 = max(5, min(k2, len(feasible)))
+        k2 = min(k2, len(feasible))  # Don't exceed available feasible candidates
+        if k2 == 0:
+            logger.warning("No feasible candidates available for Stage2 (feasible={} total={}).", len(feasible), len(rows))
+            out = Path(output_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            return {
+                "status": "no_feasible_candidate",
+                "output_dir": str(out.resolve()),
+                "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
+                "universe_size": len(symbols),
+                "candidates": len(rows),
+                "feasible": len(feasible),
+            }
         stage2_candidates = [Candidate(**feasible[i]["candidate"]) for i in range(k2)]
 
         stage2_rows: list[dict[str, Any]] = []
