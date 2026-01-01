@@ -17,6 +17,7 @@ from src.data.market_data import MarketData, normalize_symbol
 from src.execution.rebalance import fetch_equity_usdt, run_rebalance
 from src.execution.risk import RiskManager
 from src.strategy.xs_reversal import compute_targets_from_daily_candles
+from src.utils.lock import FileLock
 from src.utils.time import last_complete_daily_close, next_run_time, now_utc, parse_hhmm, utc_day_start
 
 
@@ -81,86 +82,92 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
         )
 
         def _rebalance_once() -> None:
+            # Prevent concurrent rebalances across processes (e.g. systemd service + a manual run).
+            lock = FileLock(Path("outputs") / "state" / "rebalance.lock")
+            if not lock.acquire():
+                logger.warning("Rebalance lock is held by another process; skipping this run to avoid duplicate orders.")
+                return
+            try:
             # small delay to ensure daily candle is finalized
-            time.sleep(max(0, int(cfg.rebalance.candle_close_delay_seconds)))
+                time.sleep(max(0, int(cfg.rebalance.candle_close_delay_seconds)))
 
-            rb_now = now_utc()  # use current wall time after delay
-            close_ts = last_complete_daily_close(rb_now, cfg.rebalance.candle_close_delay_seconds)
-            asof_bar = close_ts - timedelta(days=1)
-            logger.info("Rebalance now={} using last complete daily bar start={}", rb_now.isoformat(), asof_bar.isoformat())
+                rb_now = now_utc()  # use current wall time after delay
+                close_ts = last_complete_daily_close(rb_now, cfg.rebalance.candle_close_delay_seconds)
+                asof_bar = close_ts - timedelta(days=1)
+                logger.info("Rebalance now={} using last complete daily bar start={}", rb_now.isoformat(), asof_bar.isoformat())
 
             # Rebalance interval control (stateful)
-            interval_days = max(1, int(cfg.rebalance.interval_days))
-            if not force and interval_days > 1 and state_path.exists():
-                try:
-                    st = orjson.loads(state_path.read_bytes())
-                    last = st.get("last_rebalance_day")
-                    if last:
-                        last_dt = datetime.fromisoformat(last).replace(tzinfo=UTC)
-                        if (asof_bar.date() - last_dt.date()).days < interval_days:
-                            logger.info("Skipping rebalance due to interval_days={} (last={})", interval_days, last_dt.date().isoformat())
-                            return
-                except Exception as e:
-                    logger.warning("Failed to parse rebalance_state.json: {}", e)
-
-            # Universe + microstructure filtering
-            symbols = [normalize_symbol(s) for s in md.get_liquidity_ranked_symbols()]
-            passed: list[str] = []
-            micro_meta: dict[str, Any] = {}
-            for s in symbols:
-                try:
-                    ok, info = md.passes_microstructure_filters(s)
-                    micro_meta[s] = info
-                    if ok:
-                        passed.append(s)
-                except Exception as e:
-                    micro_meta[s] = {"error": str(e)}
-
-            if len(passed) < 5:
-                logger.warning("Universe too small after spread/depth filters: {}", len(passed))
-                return
-
-            logger.info(
-                "Universe: {} symbols (top_n_by_volume={}), passed microstructure filters: {}",
-                len(symbols),
-                int(cfg.universe.top_n_by_volume),
-                len(passed),
-            )
-
-            # Funding filter (optional)
-            funding_meta: dict[str, Any] = {}
-            if cfg.funding.filter.enabled:
-                force_mainnet = bool(cfg.funding.filter.use_mainnet_data_even_on_testnet and cfg.exchange.testnet)
-                max_abs = float(cfg.funding.filter.max_abs_daily_funding_rate)
-                kept: list[str] = []
-                for s in passed:
+                interval_days = max(1, int(cfg.rebalance.interval_days))
+                if not force and interval_days > 1 and state_path.exists():
                     try:
-                        fr = md.get_latest_daily_funding_rate(s, force_mainnet=force_mainnet)
-                        funding_meta[s] = {"daily_funding_rate": fr}
-                        if fr is None or abs(float(fr)) <= max_abs:
-                            kept.append(s)
+                        st = orjson.loads(state_path.read_bytes())
+                        last = st.get("last_rebalance_day")
+                        if last:
+                            last_dt = datetime.fromisoformat(last).replace(tzinfo=UTC)
+                            if (asof_bar.date() - last_dt.date()).days < interval_days:
+                                logger.info("Skipping rebalance due to interval_days={} (last={})", interval_days, last_dt.date().isoformat())
+                                return
                     except Exception as e:
-                        funding_meta[s] = {"error": str(e)}
-                passed = kept
+                        logger.warning("Failed to parse rebalance_state.json: {}", e)
 
-            if len(passed) < 5:
-                logger.warning("Universe too small after funding filter: {}", len(passed))
-                return
+                # Universe + microstructure filtering
+                symbols = [normalize_symbol(s) for s in md.get_liquidity_ranked_symbols()]
+                passed: list[str] = []
+                micro_meta: dict[str, Any] = {}
+                for s in symbols:
+                    try:
+                        ok, info = md.passes_microstructure_filters(s)
+                        micro_meta[s] = info
+                        if ok:
+                            passed.append(s)
+                    except Exception as e:
+                        micro_meta[s] = {"error": str(e)}
 
-            # Equity + risk check
-            equity = fetch_equity_usdt(client=client)
-            logger.info(
-                "Equity: {:.4f} USDT (min_notional_per_symbol={} USDT)",
-                float(equity),
-                float(cfg.sizing.min_notional_per_symbol),
-            )
-            if float(equity) <= 0.0:
-                logger.error("Equity is <= 0 USDT; cannot size trades. Skipping rebalance.")
-                return
-            ok, risk_info = risk.check(equity)
-            if not ok:
-                logger.error("Risk kill-switch active; skipping trades: {}", risk_info)
-                return
+                if len(passed) < 5:
+                    logger.warning("Universe too small after spread/depth filters: {}", len(passed))
+                    return
+
+                logger.info(
+                    "Universe: {} symbols (top_n_by_volume={}), passed microstructure filters: {}",
+                    len(symbols),
+                    int(cfg.universe.top_n_by_volume),
+                    len(passed),
+                )
+
+                # Funding filter (optional)
+                funding_meta: dict[str, Any] = {}
+                if cfg.funding.filter.enabled:
+                    force_mainnet = bool(cfg.funding.filter.use_mainnet_data_even_on_testnet and cfg.exchange.testnet)
+                    max_abs = float(cfg.funding.filter.max_abs_daily_funding_rate)
+                    kept: list[str] = []
+                    for s in passed:
+                        try:
+                            fr = md.get_latest_daily_funding_rate(s, force_mainnet=force_mainnet)
+                            funding_meta[s] = {"daily_funding_rate": fr}
+                            if fr is None or abs(float(fr)) <= max_abs:
+                                kept.append(s)
+                        except Exception as e:
+                            funding_meta[s] = {"error": str(e)}
+                    passed = kept
+
+                if len(passed) < 5:
+                    logger.warning("Universe too small after funding filter: {}", len(passed))
+                    return
+
+                # Equity + risk check
+                equity = fetch_equity_usdt(client=client)
+                logger.info(
+                    "Equity: {:.4f} USDT (min_notional_per_symbol={} USDT)",
+                    float(equity),
+                    float(cfg.sizing.min_notional_per_symbol),
+                )
+                if float(equity) <= 0.0:
+                    logger.error("Equity is <= 0 USDT; cannot size trades. Skipping rebalance.")
+                    return
+                ok, risk_info = risk.check(equity)
+                if not ok:
+                    logger.error("Risk kill-switch active; skipping trades: {}", risk_info)
+                    return
 
             # Current weights from positions (for turnover controls)
             current_weights: dict[str, float] = {}
@@ -297,15 +304,17 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                     )
                 return
 
-            try:
-                res = run_rebalance(cfg=cfg, client=client, md=md, target_notionals=targets.notionals_usd, dry_run=dry_run)
-                (out_dir / "execution_result.json").write_bytes(orjson.dumps(res, option=orjson.OPT_INDENT_2))
-                logger.info("Rebalance done. Result saved to {}", (out_dir / "execution_result.json").resolve())
-            except Exception as e:
-                # Don't take down the scheduler on a single execution error; systemd will restart anyway,
-                # but keeping the process alive gives you cleaner logs and avoids repeated crash loops.
-                logger.exception("Rebalance execution failed (continuing scheduler): {}", e)
-                return
+                try:
+                    res = run_rebalance(cfg=cfg, client=client, md=md, target_notionals=targets.notionals_usd, dry_run=dry_run)
+                    (out_dir / "execution_result.json").write_bytes(orjson.dumps(res, option=orjson.OPT_INDENT_2))
+                    logger.info("Rebalance done. Result saved to {}", (out_dir / "execution_result.json").resolve())
+                except Exception as e:
+                    # Don't take down the scheduler on a single execution error; systemd will restart anyway,
+                    # but keeping the process alive gives you cleaner logs and avoids repeated crash loops.
+                    logger.exception("Rebalance execution failed (continuing scheduler): {}", e)
+                    return
+            finally:
+                lock.release()
 
             # Update rebalance state
             try:
