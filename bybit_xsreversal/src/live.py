@@ -82,13 +82,12 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
         )
 
         def _rebalance_once() -> None:
-            # Prevent concurrent rebalances across processes (e.g. systemd service + a manual run).
             lock = FileLock(Path("outputs") / "state" / "rebalance.lock")
             if not lock.acquire():
                 logger.warning("Rebalance lock is held by another process; skipping this run to avoid duplicate orders.")
                 return
             try:
-            # small delay to ensure daily candle is finalized
+                # small delay to ensure daily candle is finalized
                 time.sleep(max(0, int(cfg.rebalance.candle_close_delay_seconds)))
 
                 rb_now = now_utc()  # use current wall time after delay
@@ -96,7 +95,7 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                 asof_bar = close_ts - timedelta(days=1)
                 logger.info("Rebalance now={} using last complete daily bar start={}", rb_now.isoformat(), asof_bar.isoformat())
 
-            # Rebalance interval control (stateful)
+                # Rebalance interval control (stateful)
                 interval_days = max(1, int(cfg.rebalance.interval_days))
                 if not force and interval_days > 1 and state_path.exists():
                     try:
@@ -105,7 +104,11 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                         if last:
                             last_dt = datetime.fromisoformat(last).replace(tzinfo=UTC)
                             if (asof_bar.date() - last_dt.date()).days < interval_days:
-                                logger.info("Skipping rebalance due to interval_days={} (last={})", interval_days, last_dt.date().isoformat())
+                                logger.info(
+                                    "Skipping rebalance due to interval_days={} (last={})",
+                                    interval_days,
+                                    last_dt.date().isoformat(),
+                                )
                                 return
                     except Exception as e:
                         logger.warning("Failed to parse rebalance_state.json: {}", e)
@@ -116,9 +119,9 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                 micro_meta: dict[str, Any] = {}
                 for s in symbols:
                     try:
-                        ok, info = md.passes_microstructure_filters(s)
+                        ok_ms, info = md.passes_microstructure_filters(s)
                         micro_meta[s] = info
-                        if ok:
+                        if ok_ms:
                             passed.append(s)
                     except Exception as e:
                         micro_meta[s] = {"error": str(e)}
@@ -164,164 +167,159 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                 if float(equity) <= 0.0:
                     logger.error("Equity is <= 0 USDT; cannot size trades. Skipping rebalance.")
                     return
-                ok, risk_info = risk.check(equity)
-                if not ok:
+                ok_risk, risk_info = risk.check(equity)
+                if not ok_risk:
                     logger.error("Risk kill-switch active; skipping trades: {}", risk_info)
                     return
 
-            # Current weights from positions (for turnover controls)
-            current_weights: dict[str, float] = {}
-            try:
-                positions = client.get_positions(category=cfg.exchange.category, settle_coin="USDT")
-                for p in positions:
-                    sym = normalize_symbol(str(p.get("symbol", "")))
-                    side = str(p.get("side", ""))
-                    size = float(p.get("size") or 0.0)
-                    mark = float(p.get("markPrice") or p.get("avgPrice") or 0.0)
-                    if mark <= 0 or size == 0:
-                        continue
-                    signed = size if side == "Buy" else -size
-                    notional = signed * mark
-                    current_weights[sym] = float(notional) / float(equity) if equity > 0 else 0.0
-            except Exception as e:
-                logger.warning("Failed to compute current weights from positions: {}", e)
-
-            # Fetch candles needed for indicators/signal.
-            # Must cover min_history_days; otherwise all symbols can be filtered out as "insufficient_history".
-            buffer_days = int(
-                max(
-                    cfg.universe.min_history_days + 10,
-                    cfg.sizing.vol_lookback_days + 10,
-                    cfg.signal.lookback_days + 5,
-                    cfg.filters.regime_filter.ema_slow + 20,
-                    40,
-                )
-            )
-            start = asof_bar - timedelta(days=buffer_days)
-            end = asof_bar + timedelta(days=1)
-            logger.info(
-                "Candle window: start={} end={} (buffer_days={}, min_history_days={})",
-                start.date().isoformat(),
-                end.date().isoformat(),
-                buffer_days,
-                int(cfg.universe.min_history_days),
-            )
-
-            candles: dict[str, Any] = {}
-            candle_skip: dict[str, int] = {"load_error": 0, "missing_asof_bar": 0}
-            for s in passed:
+                # Current weights from positions (for turnover controls)
+                current_weights: dict[str, float] = {}
                 try:
-                    df = md.get_daily_candles(s, start, end, use_cache=True, cache_write=True)
-                    if asof_bar in df.index:
-                        candles[s] = df
-                    else:
-                        candle_skip["missing_asof_bar"] += 1
+                    positions = client.get_positions(category=cfg.exchange.category, settle_coin="USDT")
+                    for p in positions:
+                        sym = normalize_symbol(str(p.get("symbol", "")))
+                        side = str(p.get("side", ""))
+                        size = float(p.get("size") or 0.0)
+                        mark = float(p.get("markPrice") or p.get("avgPrice") or 0.0)
+                        if mark <= 0 or size == 0:
+                            continue
+                        signed = size if side == "Buy" else -size
+                        notional = signed * mark
+                        current_weights[sym] = float(notional) / float(equity) if equity > 0 else 0.0
                 except Exception as e:
-                    logger.warning("Skipping {}: candle load failed: {}", s, e)
-                    candle_skip["load_error"] += 1
+                    logger.warning("Failed to compute current weights from positions: {}", e)
 
-            logger.info(
-                "Candles loaded: {} / {} symbols have required asof_bar={}",
-                len(candles),
-                len(passed),
-                asof_bar.date().isoformat(),
-            )
-            if candle_skip["missing_asof_bar"] or candle_skip["load_error"]:
+                # Fetch candles needed for indicators/signal.
+                buffer_days = int(
+                    max(
+                        cfg.universe.min_history_days + 10,
+                        cfg.sizing.vol_lookback_days + 10,
+                        cfg.signal.lookback_days + 5,
+                        cfg.filters.regime_filter.ema_slow + 20,
+                        40,
+                    )
+                )
+                start = asof_bar - timedelta(days=buffer_days)
+                end = asof_bar + timedelta(days=1)
                 logger.info(
-                    "Candle skips: missing_asof_bar={}, load_error={}",
-                    int(candle_skip["missing_asof_bar"]),
-                    int(candle_skip["load_error"]),
+                    "Candle window: start={} end={} (buffer_days={}, min_history_days={})",
+                    start.date().isoformat(),
+                    end.date().isoformat(),
+                    buffer_days,
+                    int(cfg.universe.min_history_days),
                 )
 
-            market_df = None
-            if cfg.filters.regime_filter.enabled and cfg.filters.regime_filter.use_market_regime:
-                proxy = cfg.filters.regime_filter.market_proxy_symbol
+                candles: dict[str, Any] = {}
+                candle_skip: dict[str, int] = {"load_error": 0, "missing_asof_bar": 0}
+                for s in passed:
+                    try:
+                        df = md.get_daily_candles(s, start, end, use_cache=True, cache_write=True)
+                        if asof_bar in df.index:
+                            candles[s] = df
+                        else:
+                            candle_skip["missing_asof_bar"] += 1
+                    except Exception as e:
+                        logger.warning("Skipping {}: candle load failed: {}", s, e)
+                        candle_skip["load_error"] += 1
+
+                logger.info(
+                    "Candles loaded: {} / {} symbols have required asof_bar={}",
+                    len(candles),
+                    len(passed),
+                    asof_bar.date().isoformat(),
+                )
+                if candle_skip["missing_asof_bar"] or candle_skip["load_error"]:
+                    logger.info(
+                        "Candle skips: missing_asof_bar={}, load_error={}",
+                        int(candle_skip["missing_asof_bar"]),
+                        int(candle_skip["load_error"]),
+                    )
+
+                market_df = None
+                if cfg.filters.regime_filter.enabled and cfg.filters.regime_filter.use_market_regime:
+                    proxy = cfg.filters.regime_filter.market_proxy_symbol
+                    try:
+                        market_df = md.get_daily_candles(proxy, start, end, use_cache=True, cache_write=True)
+                    except Exception as e:
+                        logger.warning("Market proxy candles unavailable: {}", e)
+
                 try:
-                    market_df = md.get_daily_candles(proxy, start, end, use_cache=True, cache_write=True)
+                    targets, snapshot = compute_targets_from_daily_candles(
+                        candles=candles,
+                        config=cfg,
+                        equity_usd=equity,
+                        asof=asof_bar,
+                        market_proxy_candles=market_df,
+                        current_weights=current_weights,
+                    )
+                except ValueError as e:
+                    logger.warning("Skipping rebalance: {}", str(e))
+                    return
                 except Exception as e:
-                    logger.warning("Market proxy candles unavailable: {}", e)
+                    logger.exception("Unexpected error during target computation; skipping rebalance: {}", e)
+                    return
 
-            try:
-                targets, snapshot = compute_targets_from_daily_candles(
-                    candles=candles,
-                    config=cfg,
-                    equity_usd=equity,
-                    asof=asof_bar,
-                    market_proxy_candles=market_df,
-                    current_weights=current_weights,
+                gross_w = float(sum(abs(w) for w in targets.weights.values()))
+                logger.info(
+                    "Targets: {} symbols (longs={}, shorts={}), gross_weight={:.3f}, signal_mode={}",
+                    len(targets.notionals_usd),
+                    len(snapshot.selected_longs),
+                    len(snapshot.selected_shorts),
+                    gross_w,
+                    str(snapshot.filters.get("signal_mode")),
                 )
-            except ValueError as e:
-                # Common: universe too small (new listings, missing candles, insufficient history)
-                logger.warning("Skipping rebalance: {}", str(e))
-                return
-            except Exception as e:
-                logger.exception("Unexpected error during target computation; skipping rebalance: {}", e)
-                return
 
-            # High-signal rebalance summary for journald visibility.
-            gross_w = float(sum(abs(w) for w in targets.weights.values()))
-            logger.info(
-                "Targets: {} symbols (longs={}, shorts={}), gross_weight={:.3f}, signal_mode={}",
-                len(targets.notionals_usd),
-                len(snapshot.selected_longs),
-                len(snapshot.selected_shorts),
-                gross_w,
-                str(snapshot.filters.get("signal_mode")),
-            )
+                _print_targets(console, targets.notionals_usd)
 
-            _print_targets(console, targets.notionals_usd)
+                out_dir = _ts_dir(Path("outputs") / "live")
+                snap_path = out_dir / "rebalance_snapshot.json"
+                snap_payload = {
+                    "asof_bar": asof_bar.isoformat(),
+                    "equity_usd": equity,
+                    "targets": targets.notionals_usd,
+                    "snapshot": snapshot.__dict__,
+                    "microstructure": micro_meta,
+                    "funding": funding_meta,
+                    "risk": risk_info,
+                    "config": cfg.model_dump(),
+                }
+                snap_path.write_bytes(orjson.dumps(snap_payload, option=orjson.OPT_INDENT_2))
+                logger.info("Saved rebalance snapshot: {}", snap_path.resolve())
 
-            out_dir = _ts_dir(Path("outputs") / "live")
-            snap_path = out_dir / "rebalance_snapshot.json"
-            snap_payload = {
-                "asof_bar": asof_bar.isoformat(),
-                "equity_usd": equity,
-                "targets": targets.notionals_usd,
-                "snapshot": snapshot.__dict__,
-                "microstructure": micro_meta,
-                "funding": funding_meta,
-                "risk": risk_info,
-                "config": cfg.model_dump(),
-            }
-            snap_path.write_bytes(orjson.dumps(snap_payload, option=orjson.OPT_INDENT_2))
-            logger.info("Saved rebalance snapshot: {}", snap_path.resolve())
-
-            # Safety: if the strategy produced an empty target book, do NOT interpret that as
-            # "flatten everything" by default. This usually means filters/thresholds removed all targets.
-            if not targets.notionals_usd:
-                if bool(getattr(cfg.rebalance, "flatten_on_empty_targets", False)):
-                    logger.warning(
-                        "Empty target book and flatten_on_empty_targets=true: flattening all positions. See snapshot: {}",
-                        snap_path.resolve(),
-                    )
-                    res = run_rebalance(cfg=cfg, client=client, md=md, target_notionals={}, dry_run=dry_run)
-                    (out_dir / "execution_result.json").write_bytes(orjson.dumps(res, option=orjson.OPT_INDENT_2))
-                    logger.info("Flatten done. Result saved to {}", (out_dir / "execution_result.json").resolve())
-                else:
-                    logger.warning(
-                        "No target notionals produced (empty target book). Skipping execution. See snapshot: {}",
-                        snap_path.resolve(),
-                    )
-                return
+                if not targets.notionals_usd:
+                    if bool(getattr(cfg.rebalance, "flatten_on_empty_targets", False)):
+                        logger.warning(
+                            "Empty target book and flatten_on_empty_targets=true: flattening all positions. See snapshot: {}",
+                            snap_path.resolve(),
+                        )
+                        res0 = run_rebalance(cfg=cfg, client=client, md=md, target_notionals={}, dry_run=dry_run)
+                        (out_dir / "execution_result.json").write_bytes(orjson.dumps(res0, option=orjson.OPT_INDENT_2))
+                        logger.info("Flatten done. Result saved to {}", (out_dir / "execution_result.json").resolve())
+                    else:
+                        logger.warning(
+                            "No target notionals produced (empty target book). Skipping execution. See snapshot: {}",
+                            snap_path.resolve(),
+                        )
+                    return
 
                 try:
                     res = run_rebalance(cfg=cfg, client=client, md=md, target_notionals=targets.notionals_usd, dry_run=dry_run)
                     (out_dir / "execution_result.json").write_bytes(orjson.dumps(res, option=orjson.OPT_INDENT_2))
                     logger.info("Rebalance done. Result saved to {}", (out_dir / "execution_result.json").resolve())
                 except Exception as e:
-                    # Don't take down the scheduler on a single execution error; systemd will restart anyway,
-                    # but keeping the process alive gives you cleaner logs and avoids repeated crash loops.
                     logger.exception("Rebalance execution failed (continuing scheduler): {}", e)
                     return
+
+                # Update rebalance state
+                try:
+                    state_path.parent.mkdir(parents=True, exist_ok=True)
+                    state_path.write_bytes(
+                        orjson.dumps({"last_rebalance_day": asof_bar.date().isoformat()}, option=orjson.OPT_INDENT_2)
+                    )
+                except Exception as e:
+                    logger.warning("Failed to write rebalance_state.json: {}", e)
             finally:
                 lock.release()
-
-            # Update rebalance state
-            try:
-                state_path.parent.mkdir(parents=True, exist_ok=True)
-                state_path.write_bytes(orjson.dumps({"last_rebalance_day": asof_bar.date().isoformat()}, option=orjson.OPT_INDENT_2))
-            except Exception as e:
-                logger.warning("Failed to write rebalance_state.json: {}", e)
 
         if run_once:
             logger.info("run_once enabled: executing a single rebalance immediately.")
