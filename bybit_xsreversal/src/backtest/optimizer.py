@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Literal
+import time
 
 import numpy as np
 import pandas as pd
@@ -779,8 +780,25 @@ def optimize_config(
                 best_cagr="n/a",
             )
 
+        # When progress bars are disabled (e.g. systemd / --no-progress), the optimizer can appear "stuck"
+        # for hours. Emit lightweight periodic logs so the operator can confirm it's making progress.
+        hb_every_env = os.getenv("BYBIT_OPT_STAGE1_LOG_EVERY", "").strip()
+        hb_secs_env = os.getenv("BYBIT_OPT_STAGE1_LOG_SECS", "").strip()
         try:
-            for cand in candidates_list:
+            hb_every = int(hb_every_env) if hb_every_env else 500
+        except Exception:
+            hb_every = 500
+        try:
+            hb_secs = float(hb_secs_env) if hb_secs_env else 300.0
+        except Exception:
+            hb_secs = 300.0
+        hb_every = max(1, hb_every)
+        hb_secs = max(5.0, hb_secs)
+        t0 = time.time()
+        last_hb = t0
+
+        try:
+            for i, cand in enumerate(candidates_list, start=1):
                 # Evaluate candidate quickly (vectorized)
                 use_maker = bool(cfg.execution.order_type == "limit" and cfg.execution.post_only)
                 m = _simulate_candidate_vectorized(
@@ -859,6 +877,24 @@ def optimize_config(
 
                 if progress_ctx is not None and task_id is not None:
                     progress_ctx.advance(task_id, 1)
+                else:
+                    # Heartbeat logs for non-interactive environments
+                    now = time.time()
+                    if (i % hb_every == 0) or ((now - last_hb) >= hb_secs):
+                        last_hb = now
+                        best_sh = fmt_or_na(float(best[1].get("sharpe", float("nan"))), ".3f") if best is not None else "n/a"
+                        best_dd = fmt_or_na(float(best[1].get("max_drawdown", float("nan"))), ".2%") if best is not None else "n/a"
+                        best_cg = fmt_or_na(float(best[1].get("cagr", float("nan"))), ".2%") if best is not None else "n/a"
+                        logger.info(
+                            "Stage1 progress: {}/{} ({:.1%}) elapsed={}s best_sharpe={} best_dd={} best_cagr={} (set BYBIT_OPT_STAGE1_LOG_EVERY / BYBIT_OPT_STAGE1_LOG_SECS)",
+                            i,
+                            len(candidates_list),
+                            float(i) / float(max(1, len(candidates_list))),
+                            int(now - t0),
+                            best_sh,
+                            best_dd,
+                            best_cg,
+                        )
         finally:
             if progress_ctx is not None:
                 progress_ctx.stop()
