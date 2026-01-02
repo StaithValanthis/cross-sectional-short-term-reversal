@@ -210,7 +210,12 @@ class MarketData:
                 return cached.loc[start_day:end_day].copy()
 
         df = self._fetch_daily_candles_remote(symbol=symbol, start=start_day, end=end_day)
+        # If remote returned nothing (API gap/outage), fall back to cache to avoid noisy warnings and keep behavior stable.
+        if (df is None) or df.empty:
+            if cached is not None and not cached.empty:
+                df = cached
         if cached is not None and not cached.empty:
+            # Avoid FutureWarning when concatenating with an empty frame by guarding above.
             df = pd.concat([cached, df]).sort_index()
             df = df[~df.index.duplicated(keep="last")]
         if cache_write:
@@ -321,7 +326,12 @@ class MarketData:
                 return cached.loc[start:end].copy()
 
         df = self._fetch_funding_remote(symbol=symbol, start=start, end=end, force_mainnet=force_mainnet)
+        # If remote returned nothing, fall back to cache to avoid noisy warnings and keep behavior stable.
+        if (df is None) or df.empty:
+            if cached is not None and not cached.empty:
+                df = cached
         if cached is not None and not cached.empty:
+            # Avoid FutureWarning when concatenating with an empty frame by guarding above.
             df = pd.concat([cached, df]).sort_index()
             df = df[~df.index.duplicated(keep="last")]
         if cache_write:
