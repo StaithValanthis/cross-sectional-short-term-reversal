@@ -13,6 +13,18 @@ def ensure_dir(p: str | Path) -> Path:
     return path
 
 
+def _chmod_best_effort(path: Path, mode: int) -> None:
+    """
+    Best-effort permission normalization.
+    This prevents cache files created by systemd/root runs (or strict umask) from becoming unreadable
+    for later manual runs under a different user.
+    """
+    try:
+        path.chmod(mode)
+    except Exception:
+        pass
+
+
 def write_json(path: str | Path, obj: Any) -> None:
     p = Path(path)
     ensure_dir(p.parent)
@@ -48,6 +60,7 @@ def save_cached_candles(cache_dir: str | Path, symbol: str, interval: str, df: p
     out = out.sort_index()
     out = out.reset_index().rename(columns={"index": "ts"})
     out.to_csv(p, index=False)
+    _chmod_best_effort(p, 0o644)
 
 
 def funding_cache_path(cache_dir: str | Path, symbol: str) -> Path:
@@ -72,5 +85,6 @@ def save_cached_funding(cache_dir: str | Path, symbol: str, df: pd.DataFrame) ->
     ensure_dir(p.parent)
     out = df.sort_index().reset_index().rename(columns={"index": "ts"})
     out.to_csv(p, index=False)
+    _chmod_best_effort(p, 0o644)
 
 
