@@ -1,0 +1,44 @@
+[Unit]
+Description=Bybit XS Reversal Optimizer (one-shot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+#
+# NOTE: This file is a TEMPLATE.
+# Copy to /etc/systemd/system/bybit_xsreversal-optimize.service and edit paths for your install.
+#
+# If you install manually, set these to your actual PROJECT_DIR:
+# WorkingDirectory=/home/ubuntu/cross-sectional-short-term-reversal/bybit_xsreversal
+# EnvironmentFile=/home/ubuntu/cross-sectional-short-term-reversal/bybit_xsreversal/.env
+# ExecStart=/home/ubuntu/cross-sectional-short-term-reversal/bybit_xsreversal/scripts/run_optimize.sh
+#
+WorkingDirectory=/opt/bybit_xsreversal/bybit_xsreversal
+EnvironmentFile=/opt/bybit_xsreversal/bybit_xsreversal/.env
+
+# Optimizer settings (override as needed)
+Environment=OPT_METHOD=random
+Environment=OPT_CANDIDATES=50000
+Environment=OPT_STAGE2_TOPK=2000
+Environment=OPT_SEED=42
+Environment=OPT_NO_WRITE=1
+
+# Optional: loosen Stage1 screening without touching config.yaml
+# Environment=BYBIT_OPT_STAGE1_MAX_DD_PCT=50
+# Environment=BYBIT_OPT_STAGE1_MAX_TURNOVER=10
+
+ExecStart=/opt/bybit_xsreversal/bybit_xsreversal/scripts/run_optimize.sh
+
+# Long runs are expected
+TimeoutStartSec=infinity
+
+# Lower priority so it doesn't interfere with live trading
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=multi-user.target
+
+

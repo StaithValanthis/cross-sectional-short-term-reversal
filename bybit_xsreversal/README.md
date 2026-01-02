@@ -74,6 +74,61 @@ Useful environment overrides:
 
 Results are written to `outputs/optimize/<timestamp>/` including `best.json` and (if enabled) OOS metrics.
 
+### Run optimizer without keeping an SSH connection open
+
+If your internet/SSH session drops, a normal foreground process may be terminated. Use one of these:
+
+#### Option A: `tmux` (recommended)
+
+```bash
+tmux new -s opt
+./scripts/run_optimize.sh
+# detach: Ctrl-b then d
+```
+
+Reattach later:
+
+```bash
+tmux attach -t opt
+```
+
+#### Option B: `nohup`
+
+```bash
+nohup ./scripts/run_optimize.sh > outputs/logs/optimize-nohup.log 2>&1 & disown
+```
+
+#### Option C: systemd one-shot service
+
+This runs the optimizer as a background service (survives SSH disconnects).
+
+1) Copy the template and edit paths:
+
+```bash
+sudo cp systemd/bybit_xsreversal-optimize.service /etc/systemd/system/bybit_xsreversal-optimize.service
+sudo nano /etc/systemd/system/bybit_xsreversal-optimize.service
+```
+
+Set:
+- `WorkingDirectory=.../bybit_xsreversal`
+- `EnvironmentFile=.../bybit_xsreversal/.env`
+- `ExecStart=.../bybit_xsreversal/scripts/run_optimize.sh`
+
+2) Reload and start:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl start bybit_xsreversal-optimize.service
+```
+
+3) Watch logs:
+
+```bash
+journalctl -u bybit_xsreversal-optimize.service -f
+```
+
+The wrapper writes a file log to `outputs/logs/optimize-<timestamp>.log`.
+
 ### Minimum order size behavior (exchange constraints)
 
 Some perps have exchange minimums (e.g. `ETHUSDT` min qty) that can exceed your intended notional when equity is small.
