@@ -1175,6 +1175,7 @@ def optimize_config(
 
         # Evaluate the selected params Out-Of-Sample (test window) for sanity.
         oos_metrics: dict[str, Any] | None = None
+        m_oos: Metrics | None = None
         if len(cal_test) >= 2:
             try:
                 trial = cfg.model_copy(deep=True)
@@ -1248,6 +1249,7 @@ def optimize_config(
                 )
             except Exception as e:
                 logger.warning("OOS evaluation failed; continuing without OOS metrics: {}", e)
+                m_oos = None
 
         # Debug: summarize stage2 outcomes (why did we get no results?)
         try:
@@ -1315,6 +1317,70 @@ def optimize_config(
                 "universe_size": len(symbols),
                 "candidates": len(rows),
             }
+
+        # Optional: OOS profitability gate (recommended when you want the optimizer to only "accept" configs
+        # that are profitable out-of-sample).
+        #
+        # Defaults:
+        #   BYBIT_OPT_REQUIRE_OOS=0  (do not reject if OOS isn't available)
+        #   BYBIT_OPT_MIN_OOS_SHARPE=0.0
+        #   BYBIT_OPT_MIN_OOS_CAGR=0.0
+        require_oos_env = os.getenv("BYBIT_OPT_REQUIRE_OOS", "").strip().lower()
+        require_oos = require_oos_env in ("1", "true", "yes", "y")
+        min_oos_sh_env = os.getenv("BYBIT_OPT_MIN_OOS_SHARPE", "").strip()
+        min_oos_cagr_env = os.getenv("BYBIT_OPT_MIN_OOS_CAGR", "").strip()
+        try:
+            min_oos_sharpe = float(min_oos_sh_env) if min_oos_sh_env else 0.0
+        except Exception:
+            min_oos_sharpe = 0.0
+        try:
+            min_oos_cagr = float(min_oos_cagr_env) if min_oos_cagr_env else 0.0
+        except Exception:
+            min_oos_cagr = 0.0
+
+        if require_oos and m_oos is None:
+            out = Path(output_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "stage1_results.json").write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
+            (out / "best.json").write_text(json.dumps(best_row, indent=2, sort_keys=True), encoding="utf-8")
+            logger.warning("Optimizer rejected: OOS metrics required (BYBIT_OPT_REQUIRE_OOS=1) but were unavailable.")
+            return {
+                "status": "rejected_by_oos_threshold",
+                "reason": "oos_metrics_unavailable",
+                "min_oos_sharpe": min_oos_sharpe,
+                "min_oos_cagr": min_oos_cagr,
+                "output_dir": str(out.resolve()),
+                "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
+                "universe_size": len(symbols),
+                "candidates": len(rows),
+            }
+
+        if require_oos and m_oos is not None:
+            oos_sh = float(m_oos.sharpe)
+            oos_cg = float(m_oos.cagr)
+            if (not np.isfinite(oos_sh)) or (not np.isfinite(oos_cg)) or (oos_sh < min_oos_sharpe) or (oos_cg < min_oos_cagr):
+                out = Path(output_dir)
+                out.mkdir(parents=True, exist_ok=True)
+                (out / "stage1_results.json").write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
+                (out / "best.json").write_text(json.dumps(best_row, indent=2, sort_keys=True), encoding="utf-8")
+                logger.warning(
+                    "Optimizer rejected by OOS thresholds: OOS Sharpe {:.3f} (min {:.3f}), OOS CAGR {:.2%} (min {:.2%}).",
+                    oos_sh,
+                    min_oos_sharpe,
+                    oos_cg,
+                    min_oos_cagr,
+                )
+                return {
+                    "status": "rejected_by_oos_threshold",
+                    "min_oos_sharpe": min_oos_sharpe,
+                    "min_oos_cagr": min_oos_cagr,
+                    "oos_sharpe": oos_sh,
+                    "oos_cagr": oos_cg,
+                    "output_dir": str(out.resolve()),
+                    "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
+                    "universe_size": len(symbols),
+                    "candidates": len(rows),
+                }
 
         if write_config:
             # Patch config.yaml (deep merge)
