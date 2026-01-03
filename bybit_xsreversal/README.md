@@ -98,6 +98,23 @@ tmux attach -t opt
 nohup ./scripts/run_optimize.sh > outputs/logs/optimize-nohup.log 2>&1 & disown
 ```
 
+#### Option B2: run seeds until you find a profitable Stage2 result
+
+This will iterate seeds and stop on the first run whose **Stage2-selected Sharpe** meets your threshold:
+
+```bash
+chmod +x ./scripts/optimize_until_profitable.sh
+export BYBIT_OPT_MIN_SHARPE=0.5
+export OPT_METHOD=random
+export OPT_CANDIDATES=10000
+export OPT_STAGE2_TOPK=400
+export START_SEED=1
+export MAX_SEEDS=50
+./scripts/optimize_until_profitable.sh
+```
+
+Outputs are written under `outputs/optimize/untilprof-<timestamp>/seed-<n>/`.
+
 #### Option C: systemd one-shot service
 
 This runs the optimizer as a background service (survives SSH disconnects).
