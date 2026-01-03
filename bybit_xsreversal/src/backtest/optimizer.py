@@ -21,6 +21,7 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
+from rich.console import Console
 
 from src.backtest.metrics import compute_metrics
 from src.config import BotConfig, load_config, load_yaml_config
@@ -754,6 +755,9 @@ def optimize_config(
         candidates_list = cand_list
 
         # Progress bar + ETA
+        # Rich Progress bars may not render in non-interactive terminals or when output is redirected.
+        # We'll create the progress context, but if it doesn't render, the heartbeat logs will still show progress.
+        console = Console(force_terminal=True, force_interactive=False)
         progress_ctx = (
             Progress(
                 SpinnerColumn(),
@@ -766,6 +770,7 @@ def optimize_config(
                 TextColumn("best_dd={task.fields[best_dd]}"),
                 TextColumn("best_cagr={task.fields[best_cagr]}"),
                 transient=False,
+                console=console,
             )
             if show_progress
             else None
