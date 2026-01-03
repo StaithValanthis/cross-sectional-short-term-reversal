@@ -12,6 +12,7 @@ class BacktestMetrics:
     sharpe: float
     sortino: float
     max_drawdown: float
+    calmar: float  # CAGR / abs(max_drawdown), or 0 if max_drawdown == 0
     profit_factor: float
     win_rate: float
     avg_daily_turnover: float
@@ -67,14 +68,27 @@ def _profit_factor(r: pd.Series) -> float:
     return float(pos / neg)
 
 
+def _calmar(cagr: float, max_drawdown: float) -> float:
+    """Calmar ratio: CAGR / abs(max_drawdown). Higher is better."""
+    if max_drawdown == 0.0 or not np.isfinite(max_drawdown):
+        return 0.0 if cagr == 0.0 else float("inf") if cagr > 0 else float("-inf")
+    dd_abs = abs(max_drawdown)
+    if dd_abs == 0.0:
+        return 0.0 if cagr == 0.0 else float("inf") if cagr > 0 else float("-inf")
+    return float(cagr / dd_abs)
+
+
 def compute_metrics(equity: pd.Series, daily_returns: pd.Series, daily_turnover: pd.Series) -> BacktestMetrics:
     daily_returns = daily_returns.dropna()
     win_rate = float((daily_returns > 0).mean()) if len(daily_returns) else 0.0
+    cagr = _cagr(equity)
+    max_dd = _max_drawdown(equity)
     return BacktestMetrics(
-        cagr=_cagr(equity),
+        cagr=cagr,
         sharpe=_sharpe(daily_returns),
         sortino=_sortino(daily_returns),
-        max_drawdown=_max_drawdown(equity),
+        max_drawdown=max_dd,
+        calmar=_calmar(cagr, max_dd),
         profit_factor=_profit_factor(daily_returns),
         win_rate=win_rate,
         avg_daily_turnover=float(daily_turnover.dropna().mean()) if len(daily_turnover) else 0.0,

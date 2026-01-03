@@ -571,7 +571,15 @@ def _simulate_candidate_vectorized(
     # CAGR on window length
     years = max(1e-9, (len(equity) - 1) / 365.0)
     cagr = float((float(equity.iloc[-1]) / float(equity.iloc[0])) ** (1.0 / years) - 1.0)
-    return {"sharpe": sharpe, "cagr": cagr, "max_drawdown": max_dd, "avg_daily_turnover": avg_turnover}
+    
+    # Calmar ratio: CAGR / abs(max_drawdown)
+    calmar = 0.0
+    if max_dd != 0.0 and np.isfinite(max_dd):
+        dd_abs = abs(max_dd)
+        if dd_abs > 0:
+            calmar = float(cagr / dd_abs) if np.isfinite(cagr) else 0.0
+    
+    return {"sharpe": sharpe, "cagr": cagr, "max_drawdown": max_dd, "calmar": calmar, "avg_daily_turnover": avg_turnover}
 
 
 def optimize_config(
@@ -847,21 +855,58 @@ def optimize_config(
                     "sharpe": float(m["sharpe"]),
                     "cagr": float(m["cagr"]),
                     "max_drawdown": float(m["max_drawdown"]),
+                    "calmar": float(m.get("calmar", 0.0)),
                     "avg_daily_turnover": float(m["avg_daily_turnover"]),
                     "rejected": False,
                     "reject_reason": None,
                 }
 
-                # Objective (lexicographic):
-                #   1) maximize Sharpe
-                #   2) maximize CAGR
-                #   3) minimize drawdown magnitude
-                #   4) minimize turnover
-                # We'll store as a key where smaller is better.
-                key = (-float(row["sharpe"]), -float(row["cagr"]), abs(float(row["max_drawdown"])), float(row["avg_daily_turnover"]))
-                # Also keep a scalar score for reporting/debugging
-                score = float(row["sharpe"]) + 0.25 * float(row["cagr"]) - 0.05 * float(row["avg_daily_turnover"])
-                row["score"] = score
+                # Composite objective function (configurable via env vars)
+                # Default weights: sharpe=0.4, calmar=0.3, cagr=0.2, sortino=0.0, turnover_penalty=0.1
+                # Set BYBIT_OPT_OBJ_WEIGHT_SHARPE, BYBIT_OPT_OBJ_WEIGHT_CALMAR, etc. to customize
+                w_sharpe_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_SHARPE", "").strip()
+                w_calmar_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_CALMAR", "").strip()
+                w_cagr_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_CAGR", "").strip()
+                w_turnover_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_TURNOVER", "").strip()
+                use_composite_env = os.getenv("BYBIT_OPT_USE_COMPOSITE", "").strip().lower()
+                
+                try:
+                    w_sharpe = float(w_sharpe_env) if w_sharpe_env else 0.4
+                    w_calmar = float(w_calmar_env) if w_calmar_env else 0.3
+                    w_cagr = float(w_cagr_env) if w_cagr_env else 0.2
+                    w_turnover = float(w_turnover_env) if w_turnover_env else 0.1
+                except Exception:
+                    w_sharpe, w_calmar, w_cagr, w_turnover = 0.4, 0.3, 0.2, 0.1
+                
+                use_composite = use_composite_env in ("1", "true", "yes", "y")
+                
+                if use_composite:
+                    # Composite score: weighted combination of normalized metrics
+                    # Normalize: sharpe (typically -2 to +3), calmar (typically -5 to +10), cagr (typically -1 to +1), turnover (typically 0 to 5)
+                    sharpe_norm = float(row["sharpe"])  # Already in reasonable scale
+                    calmar_norm = float(row["calmar"]) if np.isfinite(row["calmar"]) else 0.0
+                    cagr_norm = float(row["cagr"]) * 100.0  # Scale CAGR to percentage points for better balance
+                    turnover_norm = -float(row["avg_daily_turnover"])  # Penalty (negative)
+                    
+                    composite_score = (
+                        w_sharpe * sharpe_norm +
+                        w_calmar * calmar_norm +
+                        w_cagr * cagr_norm +
+                        w_turnover * turnover_norm
+                    )
+                    row["composite_score"] = composite_score
+                    # For ranking: higher composite_score is better, so negate for "smaller is better" key
+                    key = (-composite_score,)
+                else:
+                    # Legacy lexicographic objective:
+                    #   1) maximize Sharpe
+                    #   2) maximize CAGR
+                    #   3) minimize drawdown magnitude
+                    #   4) minimize turnover
+                    key = (-float(row["sharpe"]), -float(row["cagr"]), abs(float(row["max_drawdown"])), float(row["avg_daily_turnover"]))
+                    # Also keep a scalar score for reporting/debugging
+                    score = float(row["sharpe"]) + 0.25 * float(row["cagr"]) - 0.05 * float(row["avg_daily_turnover"])
+                    row["score"] = score
                 rows.append(row)
 
                 if best_key is None or key < best_key:
@@ -952,7 +997,13 @@ def optimize_config(
 
         # Stage 2: re-evaluate top-K candidates with the full backtester logic.
         feasible = [r for r in rows if (not r.get("rejected")) and np.isfinite(float(r.get("sharpe", float("nan"))))]
-        feasible.sort(key=lambda r: float(r.get("sharpe", -1e9)), reverse=True)
+        # Sort by composite_score if available, otherwise by sharpe
+        use_composite_env = os.getenv("BYBIT_OPT_USE_COMPOSITE", "").strip().lower()
+        use_composite = use_composite_env in ("1", "true", "yes", "y")
+        if use_composite:
+            feasible.sort(key=lambda r: float(r.get("composite_score", -1e9)), reverse=True)
+        else:
+            feasible.sort(key=lambda r: float(r.get("sharpe", -1e9)), reverse=True)
 
         if not feasible:
             logger.warning("Stage1 found {} feasible candidates, but all were rejected. Skipping Stage2.", len(rows))
@@ -1029,14 +1080,52 @@ def optimize_config(
                         min_pts = max(30, min_pts)
                         if eq2.empty or dr2.empty or len(eq2) < min_pts or len(dr2) < min_pts or not _metrics_ok(m2):
                             raise ValueError("stage2_invalid_metrics")
-                        key2 = (-float(m2.sharpe), -float(m2.cagr), abs(float(m2.max_drawdown)), float(m2.avg_daily_turnover))
+                        
+                        # Use same composite objective as Stage1 if enabled
+                        use_composite_env = os.getenv("BYBIT_OPT_USE_COMPOSITE", "").strip().lower()
+                        use_composite = use_composite_env in ("1", "true", "yes", "y")
+                        
+                        if use_composite:
+                            w_sharpe_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_SHARPE", "").strip()
+                            w_calmar_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_CALMAR", "").strip()
+                            w_cagr_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_CAGR", "").strip()
+                            w_turnover_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_TURNOVER", "").strip()
+                            try:
+                                w_sharpe = float(w_sharpe_env) if w_sharpe_env else 0.4
+                                w_calmar = float(w_calmar_env) if w_calmar_env else 0.3
+                                w_cagr = float(w_cagr_env) if w_cagr_env else 0.2
+                                w_turnover = float(w_turnover_env) if w_turnover_env else 0.1
+                            except Exception:
+                                w_sharpe, w_calmar, w_cagr, w_turnover = 0.4, 0.3, 0.2, 0.1
+                            
+                            sharpe_norm = float(m2.sharpe)
+                            calmar_norm = float(m2.calmar) if np.isfinite(m2.calmar) else 0.0
+                            cagr_norm = float(m2.cagr) * 100.0
+                            turnover_norm = -float(m2.avg_daily_turnover)
+                            
+                            composite_score = (
+                                w_sharpe * sharpe_norm +
+                                w_calmar * calmar_norm +
+                                w_cagr * cagr_norm +
+                                w_turnover * turnover_norm
+                            )
+                            key2 = (-composite_score,)
+                        else:
+                            key2 = (-float(m2.sharpe), -float(m2.cagr), abs(float(m2.max_drawdown)), float(m2.avg_daily_turnover))
+                        
                         row2 = {
                             "candidate": cand2.__dict__,
                             "sharpe": float(m2.sharpe),
                             "cagr": float(m2.cagr),
                             "max_drawdown": float(m2.max_drawdown),
+                            "calmar": float(m2.calmar),
+                            "sortino": float(m2.sortino),
+                            "profit_factor": float(m2.profit_factor),
+                            "win_rate": float(m2.win_rate),
                             "avg_daily_turnover": float(m2.avg_daily_turnover),
                         }
+                        if use_composite:
+                            row2["composite_score"] = composite_score
                         if stage2_best_key is None or key2 < stage2_best_key:
                             stage2_best_key = key2
                             stage2_best = (cand2, row2)
@@ -1214,11 +1303,52 @@ def optimize_config(
                     "sharpe": float(m_oos.sharpe),
                     "cagr": float(m_oos.cagr),
                     "max_drawdown": float(m_oos.max_drawdown),
+                    "calmar": float(m_oos.calmar),
+                    "sortino": float(m_oos.sortino),
+                    "profit_factor": float(m_oos.profit_factor),
+                    "win_rate": float(m_oos.win_rate),
                     "avg_daily_turnover": float(m_oos.avg_daily_turnover),
                     "test_days": int(len(eq_oos)),
                     "test_start": cal_test[0].date().isoformat(),
                     "test_end": cal_test[-1].date().isoformat(),
                 }
+                
+                # Overfitting detection: compare train vs test metrics
+                train_sharpe = float(best_row.get("sharpe", 0.0))
+                train_cagr = float(best_row.get("cagr", 0.0))
+                train_calmar = float(best_row.get("calmar", 0.0))
+                test_sharpe = float(m_oos.sharpe)
+                test_cagr = float(m_oos.cagr)
+                test_calmar = float(m_oos.calmar)
+                
+                overfitting_flags = []
+                if np.isfinite(train_sharpe) and np.isfinite(test_sharpe) and train_sharpe > 0:
+                    sharpe_degradation = (train_sharpe - test_sharpe) / train_sharpe
+                    if sharpe_degradation > 0.5:  # Test Sharpe is < 50% of train Sharpe
+                        overfitting_flags.append(f"Sharpe degradation: {sharpe_degradation:.1%} (train={train_sharpe:.3f} test={test_sharpe:.3f})")
+                
+                if np.isfinite(train_cagr) and np.isfinite(test_cagr) and train_cagr > 0:
+                    cagr_degradation = (train_cagr - test_cagr) / train_cagr
+                    if cagr_degradation > 0.5:  # Test CAGR is < 50% of train CAGR
+                        overfitting_flags.append(f"CAGR degradation: {cagr_degradation:.1%} (train={train_cagr:.2%} test={test_cagr:.2%})")
+                
+                if np.isfinite(train_calmar) and np.isfinite(test_calmar) and train_calmar > 0:
+                    calmar_degradation = (train_calmar - test_calmar) / train_calmar
+                    if calmar_degradation > 0.5:  # Test Calmar is < 50% of train Calmar
+                        overfitting_flags.append(f"Calmar degradation: {calmar_degradation:.1%} (train={train_calmar:.3f} test={test_calmar:.3f})")
+                
+                overfitting_warning = None
+                if overfitting_flags:
+                    overfitting_warning = " | ".join(overfitting_flags)
+                    logger.warning("Potential overfitting detected: {}", overfitting_warning)
+                
+                oos_metrics["overfitting_warning"] = overfitting_warning
+                oos_metrics["train_vs_test"] = {
+                    "sharpe": {"train": train_sharpe, "test": test_sharpe, "degradation_pct": float((train_sharpe - test_sharpe) / train_sharpe * 100) if train_sharpe > 0 and np.isfinite(train_sharpe) and np.isfinite(test_sharpe) else None},
+                    "cagr": {"train": train_cagr, "test": test_cagr, "degradation_pct": float((train_cagr - test_cagr) / train_cagr * 100) if train_cagr > 0 and np.isfinite(train_cagr) and np.isfinite(test_cagr) else None},
+                    "calmar": {"train": train_calmar, "test": test_calmar, "degradation_pct": float((train_calmar - test_calmar) / train_calmar * 100) if train_calmar > 0 and np.isfinite(train_calmar) and np.isfinite(test_calmar) else None},
+                }
+                
                 (out / "oos_best.json").write_text(
                     json.dumps(
                         {
@@ -1240,10 +1370,11 @@ def optimize_config(
                     encoding="utf-8",
                 )
                 logger.info(
-                    "OOS (test) metrics for selected params: Sharpe={:.3f} CAGR={:.2%} MaxDD={:.2%} Turnover={:.3f} Days={}",
+                    "OOS (test) metrics for selected params: Sharpe={:.3f} CAGR={:.2%} MaxDD={:.2%} Calmar={:.3f} Turnover={:.3f} Days={}",
                     float(m_oos.sharpe),
                     float(m_oos.cagr),
                     float(m_oos.max_drawdown),
+                    float(m_oos.calmar),
                     float(m_oos.avg_daily_turnover),
                     int(len(eq_oos)),
                 )
