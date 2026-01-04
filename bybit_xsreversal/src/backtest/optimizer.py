@@ -1129,141 +1129,141 @@ def optimize_config(
             stage2_best_key: tuple[float, float, float, float] | None = None
 
             if show_progress:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[bold]stage2[/bold] full backtest"),
-                BarColumn(),
-                MofNCompleteColumn(),
-                TimeElapsedColumn(),
-                TimeRemainingColumn(),
-                TextColumn("best_sharpe={task.fields[best_sharpe]}"),
-                TextColumn("best_dd={task.fields[best_dd]}"),
-                TextColumn("best_cagr={task.fields[best_cagr]}"),
-            ) as p2:
-                t2 = p2.add_task("stage2", total=len(stage2_candidates), best_sharpe="n/a", best_dd="n/a", best_cagr="n/a")
-                for cand2 in stage2_candidates:
-                    row2: dict[str, Any] | None = None
-                    try:
-                        trial = cfg.model_copy(deep=True)
-                        trial.signal.lookback_days = int(cand2.lookback_days)  # type: ignore[assignment]
-                        trial.signal.long_quantile = float(cand2.long_quantile)
-                        trial.signal.short_quantile = float(cand2.short_quantile)
-                        trial.sizing.target_gross_leverage = float(cand2.target_gross_leverage)
-                        trial.sizing.vol_lookback_days = int(cand2.vol_lookback_days)
-                        trial.rebalance.time_utc = str(cand2.rebalance_time_utc)
-                        trial.rebalance.interval_days = int(cand2.interval_days)
-                        trial.rebalance.rebalance_fraction = float(cand2.rebalance_fraction)
-                        trial.rebalance.min_weight_change_bps = float(cand2.min_weight_change_bps)
-                        trial.filters.regime_filter.action = str(cand2.regime_action)  # type: ignore[assignment]
-                        trial.funding.filter.enabled = bool(cand2.funding_filter_enabled)
-                        trial.funding.filter.max_abs_daily_funding_rate = float(cand2.funding_max_abs_daily_rate)
-
-                        eq2, dr2, to2 = _simulate_candidate_full(cfg=trial, candles=candles_stage2, market_df=market_df, calendar=cal_train, funding_daily=funding_daily)
-                        m2 = compute_metrics(eq2, dr2, to2)
-                        # Reject degenerate curves: if we barely traded / produced too few daily points,
-                        # annualized metrics (especially CAGR) can become meaningless.
-                        min_pts_env = os.getenv("BYBIT_OPT_MIN_POINTS", "").strip()
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[bold]stage2[/bold] full backtest"),
+                    BarColumn(),
+                    MofNCompleteColumn(),
+                    TimeElapsedColumn(),
+                    TimeRemainingColumn(),
+                    TextColumn("best_sharpe={task.fields[best_sharpe]}"),
+                    TextColumn("best_dd={task.fields[best_dd]}"),
+                    TextColumn("best_cagr={task.fields[best_cagr]}"),
+                ) as p2:
+                    t2 = p2.add_task("stage2", total=len(stage2_candidates), best_sharpe="n/a", best_dd="n/a", best_cagr="n/a")
+                    for cand2 in stage2_candidates:
+                        row2: dict[str, Any] | None = None
                         try:
-                            min_pts = int(min_pts_env) if min_pts_env else 90
-                        except Exception:
-                            min_pts = 90
-                        min_pts = max(30, min_pts)
-                        if eq2.empty or dr2.empty or len(eq2) < min_pts or len(dr2) < min_pts or not _metrics_ok(m2):
-                            raise ValueError("stage2_invalid_metrics")
-                        
-                        # Use same composite objective as Stage1 if enabled
-                        use_composite_env = os.getenv("BYBIT_OPT_USE_COMPOSITE", "").strip().lower()
-                        use_composite = use_composite_env in ("1", "true", "yes", "y")
-                        
-                        if use_composite:
-                            w_sharpe_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_SHARPE", "").strip()
-                            w_calmar_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_CALMAR", "").strip()
-                            w_cagr_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_CAGR", "").strip()
-                            w_turnover_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_TURNOVER", "").strip()
+                            trial = cfg.model_copy(deep=True)
+                            trial.signal.lookback_days = int(cand2.lookback_days)  # type: ignore[assignment]
+                            trial.signal.long_quantile = float(cand2.long_quantile)
+                            trial.signal.short_quantile = float(cand2.short_quantile)
+                            trial.sizing.target_gross_leverage = float(cand2.target_gross_leverage)
+                            trial.sizing.vol_lookback_days = int(cand2.vol_lookback_days)
+                            trial.rebalance.time_utc = str(cand2.rebalance_time_utc)
+                            trial.rebalance.interval_days = int(cand2.interval_days)
+                            trial.rebalance.rebalance_fraction = float(cand2.rebalance_fraction)
+                            trial.rebalance.min_weight_change_bps = float(cand2.min_weight_change_bps)
+                            trial.filters.regime_filter.action = str(cand2.regime_action)  # type: ignore[assignment]
+                            trial.funding.filter.enabled = bool(cand2.funding_filter_enabled)
+                            trial.funding.filter.max_abs_daily_funding_rate = float(cand2.funding_max_abs_daily_rate)
+
+                            eq2, dr2, to2 = _simulate_candidate_full(cfg=trial, candles=candles_stage2, market_df=market_df, calendar=cal_train, funding_daily=funding_daily)
+                            m2 = compute_metrics(eq2, dr2, to2)
+                            # Reject degenerate curves: if we barely traded / produced too few daily points,
+                            # annualized metrics (especially CAGR) can become meaningless.
+                            min_pts_env = os.getenv("BYBIT_OPT_MIN_POINTS", "").strip()
                             try:
-                                w_sharpe = float(w_sharpe_env) if w_sharpe_env else 0.4
-                                w_calmar = float(w_calmar_env) if w_calmar_env else 0.3
-                                w_cagr = float(w_cagr_env) if w_cagr_env else 0.2
-                                w_turnover = float(w_turnover_env) if w_turnover_env else 0.1
+                                min_pts = int(min_pts_env) if min_pts_env else 90
                             except Exception:
-                                w_sharpe, w_calmar, w_cagr, w_turnover = 0.4, 0.3, 0.2, 0.1
+                                min_pts = 90
+                            min_pts = max(30, min_pts)
+                            if eq2.empty or dr2.empty or len(eq2) < min_pts or len(dr2) < min_pts or not _metrics_ok(m2):
+                                raise ValueError("stage2_invalid_metrics")
                             
-                            sharpe_norm = float(m2.sharpe)
-                            calmar_norm = float(m2.calmar) if np.isfinite(m2.calmar) else 0.0
-                            cagr_norm = float(m2.cagr) * 100.0
-                            turnover_norm = -float(m2.avg_daily_turnover)
+                            # Use same composite objective as Stage1 if enabled
+                            use_composite_env = os.getenv("BYBIT_OPT_USE_COMPOSITE", "").strip().lower()
+                            use_composite = use_composite_env in ("1", "true", "yes", "y")
                             
-                            composite_score = (
-                                w_sharpe * sharpe_norm +
-                                w_calmar * calmar_norm +
-                                w_cagr * cagr_norm +
-                                w_turnover * turnover_norm
-                            )
-                            key2 = (-composite_score,)
-                        else:
-                            key2 = (-float(m2.sharpe), -float(m2.cagr), abs(float(m2.max_drawdown)), float(m2.avg_daily_turnover))
-                        
-                        row2 = {
-                            "candidate": cand2.__dict__,
-                            "sharpe": float(m2.sharpe),
-                            "cagr": float(m2.cagr),
-                            "max_drawdown": float(m2.max_drawdown),
-                            "calmar": float(m2.calmar),
-                            "sortino": float(m2.sortino),
-                            "profit_factor": float(m2.profit_factor),
-                            "win_rate": float(m2.win_rate),
-                            "avg_daily_turnover": float(m2.avg_daily_turnover),
-                        }
-                        if use_composite:
-                            row2["composite_score"] = composite_score
-                        if stage2_best_key is None or key2 < stage2_best_key:
-                            stage2_best_key = key2
-                            stage2_best = (cand2, row2)
-                            p2.update(
-                                t2,
-                                best_sharpe=fmt_or_na(float(row2.get("sharpe", float("nan"))), ".3f"),
-                                best_dd=fmt_or_na(float(row2.get("max_drawdown", float("nan"))), ".2%"),
-                                best_cagr=fmt_or_na(float(row2.get("cagr", float("nan"))), ".2%"),
-                            )
-                    except (ValueError, KeyError, IndexError) as e:
-                        err_msg = str(e)
-                        if "Universe too small" in err_msg:
-                            logger.debug("Stage2 candidate {} rejected: empty universe (likely funding/min_history filter too strict)", cand2.__dict__)
-                        else:
-                            logger.debug("Stage2 candidate {} rejected: {}", cand2.__dict__, err_msg)
-                        row2 = {
-                            "candidate": cand2.__dict__,
-                            "rejected": True,
-                            "error": err_msg,
-                            "sharpe": float("nan"),
-                            "cagr": float("nan"),
-                            "max_drawdown": float("nan"),
-                            "avg_daily_turnover": float("nan"),
-                        }
-                    except Exception as e:
-                        logger.warning("Stage2 candidate {} failed with unexpected error: {}", cand2.__dict__, e)
-                        row2 = {
-                            "candidate": cand2.__dict__,
-                            "rejected": True,
-                            "error": str(e),
-                            "sharpe": float("nan"),
-                            "cagr": float("nan"),
-                            "max_drawdown": float("nan"),
-                            "avg_daily_turnover": float("nan"),
-                        }
-                    finally:
-                        if row2 is None:
+                            if use_composite:
+                                w_sharpe_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_SHARPE", "").strip()
+                                w_calmar_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_CALMAR", "").strip()
+                                w_cagr_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_CAGR", "").strip()
+                                w_turnover_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_TURNOVER", "").strip()
+                                try:
+                                    w_sharpe = float(w_sharpe_env) if w_sharpe_env else 0.4
+                                    w_calmar = float(w_calmar_env) if w_calmar_env else 0.3
+                                    w_cagr = float(w_cagr_env) if w_cagr_env else 0.2
+                                    w_turnover = float(w_turnover_env) if w_turnover_env else 0.1
+                                except Exception:
+                                    w_sharpe, w_calmar, w_cagr, w_turnover = 0.4, 0.3, 0.2, 0.1
+                                
+                                sharpe_norm = float(m2.sharpe)
+                                calmar_norm = float(m2.calmar) if np.isfinite(m2.calmar) else 0.0
+                                cagr_norm = float(m2.cagr) * 100.0
+                                turnover_norm = -float(m2.avg_daily_turnover)
+                                
+                                composite_score = (
+                                    w_sharpe * sharpe_norm +
+                                    w_calmar * calmar_norm +
+                                    w_cagr * cagr_norm +
+                                    w_turnover * turnover_norm
+                                )
+                                key2 = (-composite_score,)
+                            else:
+                                key2 = (-float(m2.sharpe), -float(m2.cagr), abs(float(m2.max_drawdown)), float(m2.avg_daily_turnover))
+                            
+                            row2 = {
+                                "candidate": cand2.__dict__,
+                                "sharpe": float(m2.sharpe),
+                                "cagr": float(m2.cagr),
+                                "max_drawdown": float(m2.max_drawdown),
+                                "calmar": float(m2.calmar),
+                                "sortino": float(m2.sortino),
+                                "profit_factor": float(m2.profit_factor),
+                                "win_rate": float(m2.win_rate),
+                                "avg_daily_turnover": float(m2.avg_daily_turnover),
+                            }
+                            if use_composite:
+                                row2["composite_score"] = composite_score
+                            if stage2_best_key is None or key2 < stage2_best_key:
+                                stage2_best_key = key2
+                                stage2_best = (cand2, row2)
+                                p2.update(
+                                    t2,
+                                    best_sharpe=fmt_or_na(float(row2.get("sharpe", float("nan"))), ".3f"),
+                                    best_dd=fmt_or_na(float(row2.get("max_drawdown", float("nan"))), ".2%"),
+                                    best_cagr=fmt_or_na(float(row2.get("cagr", float("nan"))), ".2%"),
+                                )
+                        except (ValueError, KeyError, IndexError) as e:
+                            err_msg = str(e)
+                            if "Universe too small" in err_msg:
+                                logger.debug("Stage2 candidate {} rejected: empty universe (likely funding/min_history filter too strict)", cand2.__dict__)
+                            else:
+                                logger.debug("Stage2 candidate {} rejected: {}", cand2.__dict__, err_msg)
                             row2 = {
                                 "candidate": cand2.__dict__,
                                 "rejected": True,
-                                "error": "stage2_unknown_error",
+                                "error": err_msg,
                                 "sharpe": float("nan"),
                                 "cagr": float("nan"),
                                 "max_drawdown": float("nan"),
                                 "avg_daily_turnover": float("nan"),
                             }
-                    stage2_rows.append(row2)
-                    p2.advance(t2, 1)
+                        except Exception as e:
+                            logger.warning("Stage2 candidate {} failed with unexpected error: {}", cand2.__dict__, e)
+                            row2 = {
+                                "candidate": cand2.__dict__,
+                                "rejected": True,
+                                "error": str(e),
+                                "sharpe": float("nan"),
+                                "cagr": float("nan"),
+                                "max_drawdown": float("nan"),
+                                "avg_daily_turnover": float("nan"),
+                            }
+                        finally:
+                            if row2 is None:
+                                row2 = {
+                                    "candidate": cand2.__dict__,
+                                    "rejected": True,
+                                    "error": "stage2_unknown_error",
+                                    "sharpe": float("nan"),
+                                    "cagr": float("nan"),
+                                    "max_drawdown": float("nan"),
+                                    "avg_daily_turnover": float("nan"),
+                                }
+                        stage2_rows.append(row2)
+                        p2.advance(t2, 1)
             else:
                 for cand2 in stage2_candidates:
                     row2: dict[str, Any] | None = None
