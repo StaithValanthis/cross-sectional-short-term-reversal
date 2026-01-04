@@ -1071,19 +1071,21 @@ def optimize_config(
                     "{}Optimization found no feasible candidates. Skipping this window.",
                     window_prefix,
                 )
-                # Skip this window in walk-forward mode
+                # Skip this window in walk-forward mode, otherwise return error
                 if wf_enabled:
-                    continue
-                # For single window, return error
-                return {
-                    "status": "no_feasible_candidate",
-                    "output_dir": str(out.resolve()),
-                    "window": {"start": window_start.date().isoformat(), "end": window_end.date().isoformat()},
-                    "universe_size": len(symbols),
-                    "candidates": len(rows),
-                }
+                    # Continue to next window in walk-forward analysis
+                    continue  # noqa: F701
+                else:
+                    # For single window, return error
+                    return {
+                        "status": "no_feasible_candidate",
+                        "output_dir": str(out.resolve()),
+                        "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
+                        "universe_size": len(symbols),
+                        "candidates": len(rows),
+                    }
 
-                best_cand, best_row = best
+            best_cand, best_row = best
 
             # Stage 2: re-evaluate top-K candidates with the full backtester logic.
             feasible = [r for r in rows if (not r.get("rejected")) and np.isfinite(float(r.get("sharpe", float("nan"))))]
