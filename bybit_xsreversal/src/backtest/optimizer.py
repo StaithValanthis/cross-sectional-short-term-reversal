@@ -840,16 +840,18 @@ def optimize_config(
             best_key: tuple[float, float, float, float] | None = None
             rows: list[dict[str, Any]] = []
 
-        budget = int(candidates) if candidates is not None else _level_to_budget(level)
-        if method == "grid":
-            cand_list = _grid_candidates(default_time_utc=cfg.rebalance.time_utc)
-        else:
-            cand_list = _random_candidates(n=budget, default_time_utc=cfg.rebalance.time_utc, seed=seed)
-        # If grid, respect budget if provided
-        if candidates is not None:
-            cand_list = cand_list[: int(candidates)]
-        # If random produced fewer uniques than budget, that's OK.
-        candidates_list = cand_list
+            budget = int(candidates) if candidates is not None else _level_to_budget(level)
+            if method == "grid":
+                cand_list = _grid_candidates(default_time_utc=cfg.rebalance.time_utc)
+            else:
+                # Use window-specific seed to ensure different candidates per window
+                window_seed = seed + window_idx * 1000
+                cand_list = _random_candidates(n=budget, default_time_utc=cfg.rebalance.time_utc, seed=window_seed)
+            # If grid, respect budget if provided
+            if candidates is not None:
+                cand_list = cand_list[: int(candidates)]
+            # If random produced fewer uniques than budget, that's OK.
+            candidates_list = cand_list
 
             # Progress bar + ETA
             # Rich Progress bars may not render in non-interactive terminals or when output is redirected.
@@ -906,140 +908,141 @@ def optimize_config(
             last_hb = t0
 
             try:
-            for i, cand in enumerate(candidates_list, start=1):
-                # Evaluate candidate quickly (vectorized)
-                use_maker = bool(cfg.execution.order_type == "limit" and cfg.execution.post_only)
-                m = _simulate_candidate_vectorized(
-                    close=close_train,
-                    lookback_days=int(cand.lookback_days),
-                    vol_lookback_days=int(cand.vol_lookback_days),
-                    q=float(cand.long_quantile),
-                    gross_leverage=float(cand.target_gross_leverage),
-                    interval_days=int(cand.interval_days),
-                    rebalance_fraction=float(cand.rebalance_fraction),
-                    min_weight_change_bps=float(cand.min_weight_change_bps),
-                    maker_fee_bps=float(cfg.backtest.maker_fee_bps),
-                    taker_fee_bps=float(cfg.backtest.taker_fee_bps),
-                    slippage_bps=float(cfg.backtest.slippage_bps),
-                    use_maker=use_maker,
-                    initial_equity=float(cfg.backtest.initial_equity),
-                    max_dd_limit=float(stage1_max_dd),
-                    max_turnover=float(stage1_max_turnover),
-                )
+                for i, cand in enumerate(candidates_list, start=1):
+                    # Evaluate candidate quickly (vectorized)
+                    use_maker = bool(cfg.execution.order_type == "limit" and cfg.execution.post_only)
+                    m = _simulate_candidate_vectorized(
+                        close=close_train,
+                        lookback_days=int(cand.lookback_days),
+                        vol_lookback_days=int(cand.vol_lookback_days),
+                        q=float(cand.long_quantile),
+                        gross_leverage=float(cand.target_gross_leverage),
+                        interval_days=int(cand.interval_days),
+                        rebalance_fraction=float(cand.rebalance_fraction),
+                        min_weight_change_bps=float(cand.min_weight_change_bps),
+                        maker_fee_bps=float(cfg.backtest.maker_fee_bps),
+                        taker_fee_bps=float(cfg.backtest.taker_fee_bps),
+                        slippage_bps=float(cfg.backtest.slippage_bps),
+                        use_maker=use_maker,
+                        initial_equity=float(cfg.backtest.initial_equity),
+                        max_dd_limit=float(stage1_max_dd),
+                        max_turnover=float(stage1_max_turnover),
+                    )
 
-                # Record candidate metrics even if rejected (for debugging)
-                if m is None or "reject_reason" in m:
-                    reject_reason = m.get("reject_reason", "unknown") if m is not None else "unknown"
+                    # Record candidate metrics even if rejected (for debugging)
+                    if m is None or "reject_reason" in m:
+                        reject_reason = m.get("reject_reason", "unknown") if m is not None else "unknown"
+                        row = {
+                            "candidate": cand.__dict__,
+                            "sharpe": float("nan"),
+                            "cagr": float("nan"),
+                            "max_drawdown": float(m.get("max_dd", float("nan"))) if m is not None and "max_dd" in m else float("nan"),
+                            "avg_daily_turnover": float(m.get("avg_turnover", float("nan"))) if m is not None and "avg_turnover" in m else float("nan"),
+                            "rejected": True,
+                            "reject_reason": reject_reason,
+                        }
+                        # Store limit values for diagnostic logging
+                        if m is not None:
+                            if "max_dd_limit" in m:
+                                row["max_dd_limit"] = float(m["max_dd_limit"])
+                            if "max_turnover" in m:
+                                row["max_turnover"] = float(m["max_turnover"])
+                        rows.append(row)
+                        if progress_ctx is not None and task_id is not None:
+                            progress_ctx.advance(task_id, 1)
+                        continue
+
                     row = {
                         "candidate": cand.__dict__,
-                        "sharpe": float("nan"),
-                        "cagr": float("nan"),
-                        "max_drawdown": float(m.get("max_dd", float("nan"))) if m is not None and "max_dd" in m else float("nan"),
-                        "avg_daily_turnover": float(m.get("avg_turnover", float("nan"))) if m is not None and "avg_turnover" in m else float("nan"),
-                        "rejected": True,
-                        "reject_reason": reject_reason,
+                        "sharpe": float(m["sharpe"]),
+                        "cagr": float(m["cagr"]),
+                        "max_drawdown": float(m["max_drawdown"]),
+                        "calmar": float(m.get("calmar", 0.0)),
+                        "avg_daily_turnover": float(m["avg_daily_turnover"]),
+                        "rejected": False,
+                        "reject_reason": None,
                     }
-                    # Store limit values for diagnostic logging
-                    if m is not None:
-                        if "max_dd_limit" in m:
-                            row["max_dd_limit"] = float(m["max_dd_limit"])
-                        if "max_turnover" in m:
-                            row["max_turnover"] = float(m["max_turnover"])
+
+                    # Composite objective function (configurable via env vars)
+                    # Default weights: sharpe=0.4, calmar=0.3, cagr=0.2, sortino=0.0, turnover_penalty=0.1
+                    # Set BYBIT_OPT_OBJ_WEIGHT_SHARPE, BYBIT_OPT_OBJ_WEIGHT_CALMAR, etc. to customize
+                    w_sharpe_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_SHARPE", "").strip()
+                    w_calmar_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_CALMAR", "").strip()
+                    w_cagr_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_CAGR", "").strip()
+                    w_turnover_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_TURNOVER", "").strip()
+                    use_composite_env = os.getenv("BYBIT_OPT_USE_COMPOSITE", "").strip().lower()
+                    
+                    try:
+                        w_sharpe = float(w_sharpe_env) if w_sharpe_env else 0.4
+                        w_calmar = float(w_calmar_env) if w_calmar_env else 0.3
+                        w_cagr = float(w_cagr_env) if w_cagr_env else 0.2
+                        w_turnover = float(w_turnover_env) if w_turnover_env else 0.1
+                    except Exception:
+                        w_sharpe, w_calmar, w_cagr, w_turnover = 0.4, 0.3, 0.2, 0.1
+                    
+                    use_composite = use_composite_env in ("1", "true", "yes", "y")
+                    
+                    if use_composite:
+                        # Composite score: weighted combination of normalized metrics
+                        # Normalize: sharpe (typically -2 to +3), calmar (typically -5 to +10), cagr (typically -1 to +1), turnover (typically 0 to 5)
+                        sharpe_norm = float(row["sharpe"])  # Already in reasonable scale
+                        calmar_norm = float(row["calmar"]) if np.isfinite(row["calmar"]) else 0.0
+                        cagr_norm = float(row["cagr"]) * 100.0  # Scale CAGR to percentage points for better balance
+                        turnover_norm = -float(row["avg_daily_turnover"])  # Penalty (negative)
+                        
+                        composite_score = (
+                            w_sharpe * sharpe_norm +
+                            w_calmar * calmar_norm +
+                            w_cagr * cagr_norm +
+                            w_turnover * turnover_norm
+                        )
+                        row["composite_score"] = composite_score
+                        # For ranking: higher composite_score is better, so negate for "smaller is better" key
+                        key = (-composite_score,)
+                    else:
+                        # Legacy lexicographic objective:
+                        #   1) maximize Sharpe
+                        #   2) maximize CAGR
+                        #   3) minimize drawdown magnitude
+                        #   4) minimize turnover
+                        key = (-float(row["sharpe"]), -float(row["cagr"]), abs(float(row["max_drawdown"])), float(row["avg_daily_turnover"]))
+                        # Also keep a scalar score for reporting/debugging
+                        score = float(row["sharpe"]) + 0.25 * float(row["cagr"]) - 0.05 * float(row["avg_daily_turnover"])
+                        row["score"] = score
                     rows.append(row)
+
+                    if best_key is None or key < best_key:
+                        best_key = key
+                        best = (cand, row)
+                        if progress_ctx is not None and task_id is not None:
+                            progress_ctx.update(
+                                task_id,
+                                best_sharpe=fmt_or_na(float(row.get("sharpe", float("nan"))), ".3f"),
+                                best_dd=fmt_or_na(float(row.get("max_drawdown", float("nan"))), ".2%"),
+                                best_cagr=fmt_or_na(float(row.get("cagr", float("nan"))), ".2%"),
+                            )
+
                     if progress_ctx is not None and task_id is not None:
                         progress_ctx.advance(task_id, 1)
-                    continue
-
-                row = {
-                    "candidate": cand.__dict__,
-                    "sharpe": float(m["sharpe"]),
-                    "cagr": float(m["cagr"]),
-                    "max_drawdown": float(m["max_drawdown"]),
-                    "calmar": float(m.get("calmar", 0.0)),
-                    "avg_daily_turnover": float(m["avg_daily_turnover"]),
-                    "rejected": False,
-                    "reject_reason": None,
-                }
-
-                # Composite objective function (configurable via env vars)
-                # Default weights: sharpe=0.4, calmar=0.3, cagr=0.2, sortino=0.0, turnover_penalty=0.1
-                # Set BYBIT_OPT_OBJ_WEIGHT_SHARPE, BYBIT_OPT_OBJ_WEIGHT_CALMAR, etc. to customize
-                w_sharpe_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_SHARPE", "").strip()
-                w_calmar_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_CALMAR", "").strip()
-                w_cagr_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_CAGR", "").strip()
-                w_turnover_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_TURNOVER", "").strip()
-                use_composite_env = os.getenv("BYBIT_OPT_USE_COMPOSITE", "").strip().lower()
-                
-                try:
-                    w_sharpe = float(w_sharpe_env) if w_sharpe_env else 0.4
-                    w_calmar = float(w_calmar_env) if w_calmar_env else 0.3
-                    w_cagr = float(w_cagr_env) if w_cagr_env else 0.2
-                    w_turnover = float(w_turnover_env) if w_turnover_env else 0.1
-                except Exception:
-                    w_sharpe, w_calmar, w_cagr, w_turnover = 0.4, 0.3, 0.2, 0.1
-                
-                use_composite = use_composite_env in ("1", "true", "yes", "y")
-                
-                if use_composite:
-                    # Composite score: weighted combination of normalized metrics
-                    # Normalize: sharpe (typically -2 to +3), calmar (typically -5 to +10), cagr (typically -1 to +1), turnover (typically 0 to 5)
-                    sharpe_norm = float(row["sharpe"])  # Already in reasonable scale
-                    calmar_norm = float(row["calmar"]) if np.isfinite(row["calmar"]) else 0.0
-                    cagr_norm = float(row["cagr"]) * 100.0  # Scale CAGR to percentage points for better balance
-                    turnover_norm = -float(row["avg_daily_turnover"])  # Penalty (negative)
-                    
-                    composite_score = (
-                        w_sharpe * sharpe_norm +
-                        w_calmar * calmar_norm +
-                        w_cagr * cagr_norm +
-                        w_turnover * turnover_norm
-                    )
-                    row["composite_score"] = composite_score
-                    # For ranking: higher composite_score is better, so negate for "smaller is better" key
-                    key = (-composite_score,)
-                else:
-                    # Legacy lexicographic objective:
-                    #   1) maximize Sharpe
-                    #   2) maximize CAGR
-                    #   3) minimize drawdown magnitude
-                    #   4) minimize turnover
-                    key = (-float(row["sharpe"]), -float(row["cagr"]), abs(float(row["max_drawdown"])), float(row["avg_daily_turnover"]))
-                    # Also keep a scalar score for reporting/debugging
-                    score = float(row["sharpe"]) + 0.25 * float(row["cagr"]) - 0.05 * float(row["avg_daily_turnover"])
-                    row["score"] = score
-                rows.append(row)
-
-                if best_key is None or key < best_key:
-                    best_key = key
-                    best = (cand, row)
-                    if progress_ctx is not None and task_id is not None:
-                        progress_ctx.update(
-                            task_id,
-                            best_sharpe=fmt_or_na(float(row.get("sharpe", float("nan"))), ".3f"),
-                            best_dd=fmt_or_na(float(row.get("max_drawdown", float("nan"))), ".2%"),
-                            best_cagr=fmt_or_na(float(row.get("cagr", float("nan"))), ".2%"),
-                        )
-
-                if progress_ctx is not None and task_id is not None:
-                    progress_ctx.advance(task_id, 1)
-                else:
-                    # Heartbeat logs for non-interactive environments
-                    now = time.time()
-                    if (i % hb_every == 0) or ((now - last_hb) >= hb_secs):
-                        last_hb = now
-                        best_sh = fmt_or_na(float(best[1].get("sharpe", float("nan"))), ".3f") if best is not None else "n/a"
-                        best_dd = fmt_or_na(float(best[1].get("max_drawdown", float("nan"))), ".2%") if best is not None else "n/a"
-                        best_cg = fmt_or_na(float(best[1].get("cagr", float("nan"))), ".2%") if best is not None else "n/a"
-                        logger.info(
-                            "Stage1 progress: {}/{} ({:.1%}) elapsed={}s best_sharpe={} best_dd={} best_cagr={} (set BYBIT_OPT_STAGE1_LOG_EVERY / BYBIT_OPT_STAGE1_LOG_SECS)",
-                            i,
-                            len(candidates_list),
-                            float(i) / float(max(1, len(candidates_list))),
-                            int(now - t0),
-                            best_sh,
-                            best_dd,
-                            best_cg,
-                        )
+                    else:
+                        # Heartbeat logs for non-interactive environments
+                        now = time.time()
+                        if (i % hb_every == 0) or ((now - last_hb) >= hb_secs):
+                            last_hb = now
+                            best_sh = fmt_or_na(float(best[1].get("sharpe", float("nan"))), ".3f") if best is not None else "n/a"
+                            best_dd = fmt_or_na(float(best[1].get("max_drawdown", float("nan"))), ".2%") if best is not None else "n/a"
+                            best_cg = fmt_or_na(float(best[1].get("cagr", float("nan"))), ".2%") if best is not None else "n/a"
+                            logger.info(
+                                "{}Stage1 progress: {}/{} ({:.1%}) elapsed={}s best_sharpe={} best_dd={} best_cagr={} (set BYBIT_OPT_STAGE1_LOG_EVERY / BYBIT_OPT_STAGE1_LOG_SECS)",
+                                window_prefix,
+                                i,
+                                len(candidates_list),
+                                float(i) / float(max(1, len(candidates_list))),
+                                int(now - t0),
+                                best_sh,
+                                best_dd,
+                                best_cg,
+                            )
             finally:
                 if progress_ctx is not None:
                     progress_ctx.stop()
