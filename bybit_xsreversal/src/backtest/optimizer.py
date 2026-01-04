@@ -598,6 +598,11 @@ def optimize_config(
     """
     Optimize a small parameter grid and (optionally) write best params back to config.yaml.
     Returns summary dict.
+    
+    Supports walk-forward analysis via environment variables:
+    - BYBIT_OPT_WALK_FORWARD=1: Enable walk-forward mode
+    - BYBIT_OPT_WF_NUM_WINDOWS=5: Number of rolling windows (default: 5)
+    - BYBIT_OPT_WF_WINDOW_STEP_DAYS=30: Days to step between windows (default: 30)
     """
     cfg = load_config(config_path)
     start, end = _ensure_backtest_range(cfg)
@@ -644,70 +649,162 @@ def optimize_config(
             raise ValueError("Not enough aligned daily bars for optimization window.")
 
         # -----------------------
-        # Train/Test split (OOS)
+        # Walk-Forward Analysis (if enabled)
         # -----------------------
-        train_frac_env = os.getenv("BYBIT_OPT_TRAIN_FRAC", "").strip()
-        try:
-            train_frac = float(train_frac_env) if train_frac_env else 0.7
-        except Exception:
-            train_frac = 0.7
-        train_frac = float(min(0.9, max(0.5, train_frac)))
+        wf_enabled_env = os.getenv("BYBIT_OPT_WALK_FORWARD", "").strip().lower()
+        wf_enabled = wf_enabled_env in ("1", "true", "yes", "y")
+        
+        if wf_enabled:
+            # Walk-forward: create multiple rolling windows
+            wf_num_windows_env = os.getenv("BYBIT_OPT_WF_NUM_WINDOWS", "").strip()
+            wf_step_days_env = os.getenv("BYBIT_OPT_WF_WINDOW_STEP_DAYS", "").strip()
+            try:
+                wf_num_windows = int(wf_num_windows_env) if wf_num_windows_env else 5
+            except Exception:
+                wf_num_windows = 5
+            try:
+                wf_step_days = int(wf_step_days_env) if wf_step_days_env else 30
+            except Exception:
+                wf_step_days = 30
+            
+            train_frac_env = os.getenv("BYBIT_OPT_TRAIN_FRAC", "").strip()
+            try:
+                train_frac = float(train_frac_env) if train_frac_env else 0.7
+            except Exception:
+                train_frac = 0.7
+            train_frac = float(min(0.9, max(0.5, train_frac)))
+            
+            min_test_days_env = os.getenv("BYBIT_OPT_MIN_TEST_DAYS", "").strip()
+            try:
+                min_test_days = int(min_test_days_env) if min_test_days_env else 60
+            except Exception:
+                min_test_days = 60
+            min_test_days = max(30, min_test_days)
+            
+            # Create rolling windows
+            windows: list[tuple[pd.DatetimeIndex, pd.DatetimeIndex]] = []
+            train_len = int(np.floor(len(cal) * train_frac))
+            train_len = max(60, train_len)  # Minimum train window
+            
+            for w in range(wf_num_windows):
+                window_start_idx = w * wf_step_days
+                if window_start_idx + train_len >= len(cal):
+                    break  # Not enough data for this window
+                
+                train_end_idx = window_start_idx + train_len
+                test_end_idx = min(train_end_idx + min_test_days, len(cal))
+                
+                if test_end_idx - train_end_idx < min_test_days:
+                    break  # Not enough test data
+                
+                cal_train_w = cal[window_start_idx:train_end_idx]
+                cal_test_w = cal[train_end_idx:test_end_idx]
+                windows.append((cal_train_w, cal_test_w))
+            
+            if not windows:
+                logger.warning("Walk-forward enabled but no valid windows could be created. Falling back to single window.")
+                wf_enabled = False
+            else:
+                logger.info(
+                    "Walk-forward analysis: {} windows, step={} days, train_len={} days, test_len={} days",
+                    len(windows),
+                    wf_step_days,
+                    train_len,
+                    len(windows[0][1]) if windows else min_test_days,
+                )
+        
+        # -----------------------
+        # Train/Test split (OOS) - Single window mode
+        # -----------------------
+        if not wf_enabled:
+            train_frac_env = os.getenv("BYBIT_OPT_TRAIN_FRAC", "").strip()
+            try:
+                train_frac = float(train_frac_env) if train_frac_env else 0.7
+            except Exception:
+                train_frac = 0.7
+            train_frac = float(min(0.9, max(0.5, train_frac)))
 
-        min_test_days_env = os.getenv("BYBIT_OPT_MIN_TEST_DAYS", "").strip()
-        try:
-            min_test_days = int(min_test_days_env) if min_test_days_env else 60
-        except Exception:
-            min_test_days = 60
-        min_test_days = max(30, min_test_days)
+            min_test_days_env = os.getenv("BYBIT_OPT_MIN_TEST_DAYS", "").strip()
+            try:
+                min_test_days = int(min_test_days_env) if min_test_days_env else 60
+            except Exception:
+                min_test_days = 60
+            min_test_days = max(30, min_test_days)
 
-        split_idx = int(np.floor(len(cal) * train_frac))
-        split_idx = max(2, min(split_idx, len(cal) - 2))
-        cal_train = cal[:split_idx]
-        cal_test = cal[split_idx:]
-        if len(cal_test) < min_test_days:
-            # If the window is too small to support a useful OOS slice, fall back to a single window.
-            logger.warning(
-                "Optimization window too small for test split (cal={} train={} test={} < min_test_days={}); disabling OOS split for this run.",
-                len(cal),
-                len(cal_train),
-                len(cal_test),
-                min_test_days,
-            )
-            cal_train = cal
-            cal_test = pd.DatetimeIndex([])
-        else:
-            logger.info(
-                "Optimizer train/test split: train_days={} ({} -> {}), test_days={} ({} -> {})",
-                len(cal_train),
-                cal_train[0].date().isoformat(),
-                cal_train[-1].date().isoformat(),
-                len(cal_test),
-                cal_test[0].date().isoformat(),
-                cal_test[-1].date().isoformat(),
-            )
+            split_idx = int(np.floor(len(cal) * train_frac))
+            split_idx = max(2, min(split_idx, len(cal) - 2))
+            cal_train = cal[:split_idx]
+            cal_test = cal[split_idx:]
+            if len(cal_test) < min_test_days:
+                # If the window is too small to support a useful OOS slice, fall back to a single window.
+                logger.warning(
+                    "Optimization window too small for test split (cal={} train={} test={} < min_test_days={}); disabling OOS split for this run.",
+                    len(cal),
+                    len(cal_train),
+                    len(cal_test),
+                    min_test_days,
+                )
+                cal_train = cal
+                cal_test = pd.DatetimeIndex([])
+            else:
+                logger.info(
+                    "Optimizer train/test split: train_days={} ({} -> {}), test_days={} ({} -> {})",
+                    len(cal_train),
+                    cal_train[0].date().isoformat(),
+                    cal_train[-1].date().isoformat(),
+                    len(cal_test),
+                    cal_test[0].date().isoformat(),
+                    cal_test[-1].date().isoformat(),
+                )
+            windows = [(cal_train, cal_test)]  # Single window for compatibility
 
-        # Prepare data matrix once for fast candidate evaluation.
-        # IMPORTANT: This history requirement must be aligned with stage2's shared strategy logic,
-        # which enforces cfg.universe.min_history_days. If stage1 uses a looser min history,
-        # it may select candidates that cannot trade at all in stage2 (empty universe -> no results).
-        min_hist = int(max(80, int(cfg.universe.min_history_days), 2 * max(cfg.sizing.vol_lookback_days, 30)))
-        close = _prepare_close_matrix(candles, start=start, end=end, min_history_days=min_hist, max_symbols=60)
-        opt_symbols = list(close.columns) if close is not None and not close.empty else list(candles.keys())
-        # Keep stage2 universe consistent with stage1 (reduces sparse-history issues in stage2)
-        candles_stage2 = {s: candles[s] for s in opt_symbols if s in candles and candles[s] is not None and not candles[s].empty}
+        # Walk-forward: process each window and aggregate results
+        all_window_results: list[dict[str, Any]] = []
+        
+        for window_idx, (cal_train_w, cal_test_w) in enumerate(windows):
+            window_prefix = f"[WF Window {window_idx + 1}/{len(windows)}] " if wf_enabled and len(windows) > 1 else ""
+            if wf_enabled and len(windows) > 1:
+                logger.info(
+                    "{}Processing window: train={} ({} -> {}), test={} ({} -> {})",
+                    window_prefix,
+                    len(cal_train_w),
+                    cal_train_w[0].date().isoformat(),
+                    cal_train_w[-1].date().isoformat(),
+                    len(cal_test_w),
+                    cal_test_w[0].date().isoformat() if len(cal_test_w) > 0 else "N/A",
+                    cal_test_w[-1].date().isoformat() if len(cal_test_w) > 0 else "N/A",
+                )
+            
+            # Use this window's train/test split
+            cal_train = cal_train_w
+            cal_test = cal_test_w
+            
+            # Prepare data matrix once for fast candidate evaluation.
+            # IMPORTANT: This history requirement must be aligned with stage2's shared strategy logic,
+            # which enforces cfg.universe.min_history_days. If stage1 uses a looser min history,
+            # it may select candidates that cannot trade at all in stage2 (empty universe -> no results).
+            min_hist = int(max(80, int(cfg.universe.min_history_days), 2 * max(cfg.sizing.vol_lookback_days, 30)))
+            window_start = cal_train[0].to_pydatetime()
+            window_end = cal_test[-1].to_pydatetime() if len(cal_test) > 0 else cal_train[-1].to_pydatetime()
+            close = _prepare_close_matrix(candles, start=window_start, end=window_end, min_history_days=min_hist, max_symbols=60)
+            opt_symbols = list(close.columns) if close is not None and not close.empty else list(candles.keys())
+            # Keep stage2 universe consistent with stage1 (reduces sparse-history issues in stage2)
+            candles_stage2 = {s: candles[s] for s in opt_symbols if s in candles and candles[s] is not None and not candles[s].empty}
 
-        # For stage2, use calendar based on the optimization symbol subset (more stable).
-        cal_stage2 = _calendar_from_any(candles_stage2, start, end)
-        if len(cal_stage2) >= 30:
-            cal = cal_stage2
+            # For stage2, use calendar based on the optimization symbol subset (more stable).
+            cal_stage2 = _calendar_from_any(candles_stage2, window_start, window_end)
+            if len(cal_stage2) >= 30:
+                cal_window = cal_stage2
+            else:
+                cal_window = cal_train.append(cal_test) if len(cal_test) > 0 else cal_train
 
-        # Stage1 should optimize on TRAIN only (to avoid leaking test data into selection)
-        if close is not None and not close.empty:
-            close_train = close.loc[(close.index >= cal_train[0]) & (close.index <= cal_train[-1])]
-        else:
-            close_train = close
+            # Stage1 should optimize on TRAIN only (to avoid leaking test data into selection)
+            if close is not None and not close.empty:
+                close_train = close.loc[(close.index >= cal_train[0]) & (close.index <= cal_train[-1])]
+            else:
+                close_train = close
 
-        # Stage1 feasibility gates (used only for the fast screening model).
+            # Stage1 feasibility gates (used only for the fast screening model).
         # These can be overridden via env vars to avoid rejecting every candidate due to overly strict constraints.
         # - BYBIT_OPT_STAGE1_MAX_DD_PCT: e.g. "50" means allow up to 50% drawdown in stage1 screen
         # - BYBIT_OPT_STAGE1_MAX_TURNOVER: e.g. "10" means allow avg daily turnover up to 10 (weight-space)
@@ -721,27 +818,28 @@ def optimize_config(
             stage1_max_turnover = float(to_env) if to_env else float(cfg.risk.max_turnover)
         except Exception:
             stage1_max_turnover = float(cfg.risk.max_turnover)
-        logger.info(
-            "Stage1 feasibility gates: max_dd_limit={:.2%} max_turnover={:.3f} (env overrides: BYBIT_OPT_STAGE1_MAX_DD_PCT={}, BYBIT_OPT_STAGE1_MAX_TURNOVER={})",
-            float(stage1_max_dd),
-            float(stage1_max_turnover),
-            dd_env or "n/a",
-            to_env or "n/a",
-        )
+            logger.info(
+                "{}Stage1 feasibility gates: max_dd_limit={:.2%} max_turnover={:.3f} (env overrides: BYBIT_OPT_STAGE1_MAX_DD_PCT={}, BYBIT_OPT_STAGE1_MAX_TURNOVER={})",
+                window_prefix,
+                float(stage1_max_dd),
+                float(stage1_max_turnover),
+                dd_env or "n/a",
+                to_env or "n/a",
+            )
 
-        # Funding daily rates cache for stage2 (and for optional funding filter)
-        funding_daily: dict[str, pd.Series] = {}
-        force_mainnet_funding = bool(cfg.funding.filter.use_mainnet_data_even_on_testnet and cfg.exchange.testnet)
-        if cfg.funding.model_in_backtest or cfg.funding.filter.enabled:
-            for s in opt_symbols:
-                try:
-                    funding_daily[s] = md.get_daily_funding_rate(s, fetch_start, fetch_end, force_mainnet=force_mainnet_funding)
-                except Exception:
-                    continue
+            # Funding daily rates cache for stage2 (and for optional funding filter)
+            funding_daily: dict[str, pd.Series] = {}
+            force_mainnet_funding = bool(cfg.funding.filter.use_mainnet_data_even_on_testnet and cfg.exchange.testnet)
+            if cfg.funding.model_in_backtest or cfg.funding.filter.enabled:
+                for s in opt_symbols:
+                    try:
+                        funding_daily[s] = md.get_daily_funding_rate(s, fetch_start, fetch_end, force_mainnet=force_mainnet_funding)
+                    except Exception:
+                        continue
 
-        best = None
-        best_key: tuple[float, float, float, float] | None = None
-        rows: list[dict[str, Any]] = []
+            best = None
+            best_key: tuple[float, float, float, float] | None = None
+            rows: list[dict[str, Any]] = []
 
         budget = int(candidates) if candidates is not None else _level_to_budget(level)
         if method == "grid":
@@ -772,45 +870,45 @@ def optimize_config(
                 transient=False,
                 console=console,
             )
-            if show_progress
-            else None
-        )
-
-        def fmt_or_na(x: float | None, fmt: str) -> str:
-            if x is None or not np.isfinite(x):
-                return "n/a"
-            return format(float(x), fmt)
-
-        if progress_ctx is None:
-            task_id = None
-        else:
-            progress_ctx.start()
-            task_id = progress_ctx.add_task(
-                "optimize",
-                total=len(candidates_list),
-                best_sharpe="n/a",
-                best_dd="n/a",
-                best_cagr="n/a",
+                if show_progress
+                else None
             )
 
-        # When progress bars are disabled (e.g. systemd / --no-progress), the optimizer can appear "stuck"
-        # for hours. Emit lightweight periodic logs so the operator can confirm it's making progress.
-        hb_every_env = os.getenv("BYBIT_OPT_STAGE1_LOG_EVERY", "").strip()
-        hb_secs_env = os.getenv("BYBIT_OPT_STAGE1_LOG_SECS", "").strip()
-        try:
-            hb_every = int(hb_every_env) if hb_every_env else 500
-        except Exception:
-            hb_every = 500
-        try:
-            hb_secs = float(hb_secs_env) if hb_secs_env else 300.0
-        except Exception:
-            hb_secs = 300.0
-        hb_every = max(1, hb_every)
-        hb_secs = max(5.0, hb_secs)
-        t0 = time.time()
-        last_hb = t0
+            def fmt_or_na(x: float | None, fmt: str) -> str:
+            if x is None or not np.isfinite(x):
+                return "n/a"
+                return format(float(x), fmt)
 
-        try:
+            if progress_ctx is None:
+                task_id = None
+            else:
+                progress_ctx.start()
+                task_id = progress_ctx.add_task(
+                    "optimize",
+                    total=len(candidates_list),
+                    best_sharpe="n/a",
+                    best_dd="n/a",
+                    best_cagr="n/a",
+                )
+
+            # When progress bars are disabled (e.g. systemd / --no-progress), the optimizer can appear "stuck"
+            # for hours. Emit lightweight periodic logs so the operator can confirm it's making progress.
+            hb_every_env = os.getenv("BYBIT_OPT_STAGE1_LOG_EVERY", "").strip()
+            hb_secs_env = os.getenv("BYBIT_OPT_STAGE1_LOG_SECS", "").strip()
+            try:
+                hb_every = int(hb_every_env) if hb_every_env else 500
+            except Exception:
+                hb_every = 500
+            try:
+                hb_secs = float(hb_secs_env) if hb_secs_env else 300.0
+            except Exception:
+                hb_secs = 300.0
+            hb_every = max(1, hb_every)
+            hb_secs = max(5.0, hb_secs)
+            t0 = time.time()
+            last_hb = t0
+
+            try:
             for i, cand in enumerate(candidates_list, start=1):
                 # Evaluate candidate quickly (vectorized)
                 use_maker = bool(cfg.execution.order_type == "limit" and cfg.execution.post_only)
@@ -945,105 +1043,92 @@ def optimize_config(
                             best_dd,
                             best_cg,
                         )
-        finally:
-            if progress_ctx is not None:
-                progress_ctx.stop()
+            finally:
+                if progress_ctx is not None:
+                    progress_ctx.stop()
 
-        out = Path(output_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        (out / "stage1_results.json").write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
-
-        if best is None:
             out = Path(output_dir)
+            if wf_enabled and len(windows) > 1:
+                out = out / f"window_{window_idx + 1}"
             out.mkdir(parents=True, exist_ok=True)
-            # Helpful diagnostics
-            if close_train is None or getattr(close_train, "empty", False):
-                logger.error("Stage1 close_train matrix is empty; cannot evaluate candidates (check data window/min_history).")
-            try:
-                rej = [r.get("reject_reason") for r in rows if r.get("rejected")]
-                counts: dict[str, int] = {}
-                for x in rej:
-                    k = str(x or "unknown")
-                    counts[k] = counts.get(k, 0) + 1
-                top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
-                logger.error("Stage1 rejection reasons (top 5): {}", top)
-                # Show sample values for common rejection reasons
-                dd_rejects = [r for r in rows if r.get("reject_reason") == "max_drawdown_exceeded"]
-                to_rejects = [r for r in rows if r.get("reject_reason") == "max_turnover_exceeded"]
-                if dd_rejects:
-                    sample_dd = dd_rejects[0]
-                    logger.warning(
-                        "Sample max_drawdown rejection: dd={:.2%} limit={:.2%} (relax with BYBIT_OPT_STAGE1_MAX_DD_PCT)",
-                        sample_dd.get("max_dd", float("nan")),
-                        sample_dd.get("max_dd_limit", float("nan")),
-                    )
-                if to_rejects:
-                    sample_to = to_rejects[0]
-                    logger.warning(
-                        "Sample max_turnover rejection: turnover={:.3f} limit={:.3f} (relax with BYBIT_OPT_STAGE1_MAX_TURNOVER)",
-                        sample_to.get("avg_turnover", float("nan")),
-                        sample_to.get("max_turnover", float("nan")),
-                    )
-            except Exception as e:
-                logger.debug("Failed to generate rejection diagnostics: {}", e)
-            logger.error(
-                "Optimization found no feasible candidates. Leaving config unchanged. Results: {}",
-                (out / "stage1_results.json").resolve(),
-            )
-            return {
-                "status": "no_feasible_candidate",
-                "output_dir": str(out.resolve()),
-                "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
-                "universe_size": len(symbols),
-                "candidates": len(rows),
-            }
+            (out / "stage1_results.json").write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
 
-        best_cand, best_row = best
+            if best is None:
+                # Helpful diagnostics
+                if close_train is None or getattr(close_train, "empty", False):
+                    logger.error("{}Stage1 close_train matrix is empty; cannot evaluate candidates (check data window/min_history).", window_prefix)
+                try:
+                    rej = [r.get("reject_reason") for r in rows if r.get("rejected")]
+                    counts: dict[str, int] = {}
+                    for x in rej:
+                        k = str(x or "unknown")
+                        counts[k] = counts.get(k, 0) + 1
+                    top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+                    logger.error("{}Stage1 rejection reasons (top 5): {}", window_prefix, top)
+                except Exception as e:
+                    logger.debug("Failed to generate rejection diagnostics: {}", e)
+                logger.warning(
+                    "{}Optimization found no feasible candidates. Skipping this window.",
+                    window_prefix,
+                )
+                # Skip this window in walk-forward mode
+                if wf_enabled:
+                    continue
+                # For single window, return error
+                return {
+                    "status": "no_feasible_candidate",
+                    "output_dir": str(out.resolve()),
+                    "window": {"start": window_start.date().isoformat(), "end": window_end.date().isoformat()},
+                    "universe_size": len(symbols),
+                    "candidates": len(rows),
+                }
 
-        # Stage 2: re-evaluate top-K candidates with the full backtester logic.
-        feasible = [r for r in rows if (not r.get("rejected")) and np.isfinite(float(r.get("sharpe", float("nan"))))]
-        # Sort by composite_score if available, otherwise by sharpe
-        use_composite_env = os.getenv("BYBIT_OPT_USE_COMPOSITE", "").strip().lower()
-        use_composite = use_composite_env in ("1", "true", "yes", "y")
-        if use_composite:
-            feasible.sort(key=lambda r: float(r.get("composite_score", -1e9)), reverse=True)
-        else:
-            feasible.sort(key=lambda r: float(r.get("sharpe", -1e9)), reverse=True)
+                best_cand, best_row = best
 
-        if not feasible:
-            logger.warning("Stage1 found {} feasible candidates, but all were rejected. Skipping Stage2.", len(rows))
-            out = Path(output_dir)
-            out.mkdir(parents=True, exist_ok=True)
-            return {
-                "status": "no_feasible_candidate",
-                "output_dir": str(out.resolve()),
-                "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
-                "universe_size": len(symbols),
-                "candidates": len(rows),
-                "feasible": 0,
-            }
+            # Stage 2: re-evaluate top-K candidates with the full backtester logic.
+            feasible = [r for r in rows if (not r.get("rejected")) and np.isfinite(float(r.get("sharpe", float("nan"))))]
+            # Sort by composite_score if available, otherwise by sharpe
+            use_composite_env = os.getenv("BYBIT_OPT_USE_COMPOSITE", "").strip().lower()
+            use_composite = use_composite_env in ("1", "true", "yes", "y")
+            if use_composite:
+                feasible.sort(key=lambda r: float(r.get("composite_score", -1e9)), reverse=True)
+            else:
+                feasible.sort(key=lambda r: float(r.get("sharpe", -1e9)), reverse=True)
 
-        k2 = int(stage2_topk) if stage2_topk is not None else _level_to_stage2_topk(level)
-        k2 = min(k2, len(feasible))  # Don't exceed available feasible candidates
-        if k2 == 0:
-            logger.warning("No feasible candidates available for Stage2 (feasible={} total={}).", len(feasible), len(rows))
-            out = Path(output_dir)
-            out.mkdir(parents=True, exist_ok=True)
-            return {
-                "status": "no_feasible_candidate",
-                "output_dir": str(out.resolve()),
-                "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
-                "universe_size": len(symbols),
-                "candidates": len(rows),
-                "feasible": len(feasible),
-            }
-        stage2_candidates = [Candidate(**feasible[i]["candidate"]) for i in range(k2)]
+            if not feasible:
+                logger.warning("{}Stage1 found {} feasible candidates, but all were rejected. Skipping Stage2.", window_prefix, len(rows))
+                if wf_enabled:
+                    continue
+                return {
+                    "status": "no_feasible_candidate",
+                    "output_dir": str(out.resolve()),
+                    "window": {"start": window_start.date().isoformat(), "end": window_end.date().isoformat()},
+                    "universe_size": len(symbols),
+                    "candidates": len(rows),
+                    "feasible": 0,
+                }
 
-        stage2_rows: list[dict[str, Any]] = []
-        stage2_best: tuple[Candidate, dict[str, Any]] | None = None
-        stage2_best_key: tuple[float, float, float, float] | None = None
+            k2 = int(stage2_topk) if stage2_topk is not None else _level_to_stage2_topk(level)
+            k2 = min(k2, len(feasible))  # Don't exceed available feasible candidates
+            if k2 == 0:
+                logger.warning("{}No feasible candidates available for Stage2 (feasible={} total={}).", window_prefix, len(feasible), len(rows))
+                if wf_enabled:
+                    continue
+                return {
+                    "status": "no_feasible_candidate",
+                    "output_dir": str(out.resolve()),
+                    "window": {"start": window_start.date().isoformat(), "end": window_end.date().isoformat()},
+                    "universe_size": len(symbols),
+                    "candidates": len(rows),
+                    "feasible": len(feasible),
+                }
+            stage2_candidates = [Candidate(**feasible[i]["candidate"]) for i in range(k2)]
 
-        if show_progress:
+            stage2_rows: list[dict[str, Any]] = []
+            stage2_best: tuple[Candidate, dict[str, Any]] | None = None
+            stage2_best_key: tuple[float, float, float, float] | None = None
+
+            if show_progress:
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[bold]stage2[/bold] full backtest"),
@@ -1177,100 +1262,138 @@ def optimize_config(
                                 "max_drawdown": float("nan"),
                                 "avg_daily_turnover": float("nan"),
                             }
-                        stage2_rows.append(row2)
-                        p2.advance(t2, 1)
-        else:
-            for cand2 in stage2_candidates:
-                row2: dict[str, Any] | None = None
-                try:
-                    trial = cfg.model_copy(deep=True)
-                    trial.signal.lookback_days = int(cand2.lookback_days)  # type: ignore[assignment]
-                    trial.signal.long_quantile = float(cand2.long_quantile)
-                    trial.signal.short_quantile = float(cand2.short_quantile)
-                    trial.sizing.target_gross_leverage = float(cand2.target_gross_leverage)
-                    trial.sizing.vol_lookback_days = int(cand2.vol_lookback_days)
-                    trial.rebalance.time_utc = str(cand2.rebalance_time_utc)
-                    trial.rebalance.interval_days = int(cand2.interval_days)
-                    trial.rebalance.rebalance_fraction = float(cand2.rebalance_fraction)
-                    trial.rebalance.min_weight_change_bps = float(cand2.min_weight_change_bps)
-                    trial.filters.regime_filter.action = str(cand2.regime_action)  # type: ignore[assignment]
-                    trial.funding.filter.enabled = bool(cand2.funding_filter_enabled)
-                    trial.funding.filter.max_abs_daily_funding_rate = float(cand2.funding_max_abs_daily_rate)
-
-                    eq2, dr2, to2 = _simulate_candidate_full(cfg=trial, candles=candles_stage2, market_df=market_df, calendar=cal_train, funding_daily=funding_daily)
-                    m2 = compute_metrics(eq2, dr2, to2)
-                    min_pts_env = os.getenv("BYBIT_OPT_MIN_POINTS", "").strip()
+                    stage2_rows.append(row2)
+                    p2.advance(t2, 1)
+            else:
+                for cand2 in stage2_candidates:
+                    row2: dict[str, Any] | None = None
                     try:
-                        min_pts = int(min_pts_env) if min_pts_env else 90
-                    except Exception:
-                        min_pts = 90
-                    min_pts = max(30, min_pts)
-                    if eq2.empty or dr2.empty or len(eq2) < min_pts or len(dr2) < min_pts or not _metrics_ok(m2):
-                        raise ValueError("stage2_invalid_metrics")
-                    key2 = (-float(m2.sharpe), -float(m2.cagr), abs(float(m2.max_drawdown)), float(m2.avg_daily_turnover))
-                    row2 = {
-                        "candidate": cand2.__dict__,
-                        "sharpe": float(m2.sharpe),
-                        "cagr": float(m2.cagr),
-                        "max_drawdown": float(m2.max_drawdown),
-                        "avg_daily_turnover": float(m2.avg_daily_turnover),
-                    }
-                    if stage2_best_key is None or key2 < stage2_best_key:
-                        stage2_best_key = key2
-                        stage2_best = (cand2, row2)
-                except (ValueError, KeyError, IndexError) as e:
-                    err_msg = str(e)
-                    if "Universe too small" in err_msg:
-                        logger.debug("Stage2 candidate {} rejected: empty universe (likely funding/min_history filter too strict)", cand2.__dict__)
-                    else:
-                        logger.debug("Stage2 candidate {} rejected: {}", cand2.__dict__, err_msg)
-                    row2 = {
-                        "candidate": cand2.__dict__,
-                        "rejected": True,
-                        "error": err_msg,
-                        "sharpe": float("nan"),
-                        "cagr": float("nan"),
-                        "max_drawdown": float("nan"),
-                        "avg_daily_turnover": float("nan"),
-                    }
-                except Exception as e:
-                    logger.warning("Stage2 candidate {} failed with unexpected error: {}", cand2.__dict__, e)
-                    row2 = {
-                        "candidate": cand2.__dict__,
-                        "rejected": True,
-                        "error": str(e),
-                        "sharpe": float("nan"),
-                        "cagr": float("nan"),
-                        "max_drawdown": float("nan"),
-                        "avg_daily_turnover": float("nan"),
-                    }
-                finally:
-                    if row2 is None:
+                        trial = cfg.model_copy(deep=True)
+                        trial.signal.lookback_days = int(cand2.lookback_days)  # type: ignore[assignment]
+                        trial.signal.long_quantile = float(cand2.long_quantile)
+                        trial.signal.short_quantile = float(cand2.short_quantile)
+                        trial.sizing.target_gross_leverage = float(cand2.target_gross_leverage)
+                        trial.sizing.vol_lookback_days = int(cand2.vol_lookback_days)
+                        trial.rebalance.time_utc = str(cand2.rebalance_time_utc)
+                        trial.rebalance.interval_days = int(cand2.interval_days)
+                        trial.rebalance.rebalance_fraction = float(cand2.rebalance_fraction)
+                        trial.rebalance.min_weight_change_bps = float(cand2.min_weight_change_bps)
+                        trial.filters.regime_filter.action = str(cand2.regime_action)  # type: ignore[assignment]
+                        trial.funding.filter.enabled = bool(cand2.funding_filter_enabled)
+                        trial.funding.filter.max_abs_daily_funding_rate = float(cand2.funding_max_abs_daily_rate)
+
+                        eq2, dr2, to2 = _simulate_candidate_full(cfg=trial, candles=candles_stage2, market_df=market_df, calendar=cal_train, funding_daily=funding_daily)
+                        m2 = compute_metrics(eq2, dr2, to2)
+                        min_pts_env = os.getenv("BYBIT_OPT_MIN_POINTS", "").strip()
+                        try:
+                            min_pts = int(min_pts_env) if min_pts_env else 90
+                        except Exception:
+                            min_pts = 90
+                        min_pts = max(30, min_pts)
+                        if eq2.empty or dr2.empty or len(eq2) < min_pts or len(dr2) < min_pts or not _metrics_ok(m2):
+                            raise ValueError("stage2_invalid_metrics")
+                        
+                        # Use same composite objective as Stage1 if enabled
+                        use_composite_env = os.getenv("BYBIT_OPT_USE_COMPOSITE", "").strip().lower()
+                        use_composite = use_composite_env in ("1", "true", "yes", "y")
+                        
+                        if use_composite:
+                            w_sharpe_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_SHARPE", "").strip()
+                            w_calmar_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_CALMAR", "").strip()
+                            w_cagr_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_CAGR", "").strip()
+                            w_turnover_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_TURNOVER", "").strip()
+                            try:
+                                w_sharpe = float(w_sharpe_env) if w_sharpe_env else 0.4
+                                w_calmar = float(w_calmar_env) if w_calmar_env else 0.3
+                                w_cagr = float(w_cagr_env) if w_cagr_env else 0.2
+                                w_turnover = float(w_turnover_env) if w_turnover_env else 0.1
+                            except Exception:
+                                w_sharpe, w_calmar, w_cagr, w_turnover = 0.4, 0.3, 0.2, 0.1
+                            
+                            sharpe_norm = float(m2.sharpe)
+                            calmar_norm = float(m2.calmar) if np.isfinite(m2.calmar) else 0.0
+                            cagr_norm = float(m2.cagr) * 100.0
+                            turnover_norm = -float(m2.avg_daily_turnover)
+                            
+                            composite_score = (
+                                w_sharpe * sharpe_norm +
+                                w_calmar * calmar_norm +
+                                w_cagr * cagr_norm +
+                                w_turnover * turnover_norm
+                            )
+                            key2 = (-composite_score,)
+                        else:
+                            key2 = (-float(m2.sharpe), -float(m2.cagr), abs(float(m2.max_drawdown)), float(m2.avg_daily_turnover))
+                        
+                        row2 = {
+                            "candidate": cand2.__dict__,
+                            "sharpe": float(m2.sharpe),
+                            "cagr": float(m2.cagr),
+                            "max_drawdown": float(m2.max_drawdown),
+                            "calmar": float(m2.calmar),
+                            "sortino": float(m2.sortino),
+                            "profit_factor": float(m2.profit_factor),
+                            "win_rate": float(m2.win_rate),
+                            "avg_daily_turnover": float(m2.avg_daily_turnover),
+                        }
+                        if use_composite:
+                            row2["composite_score"] = composite_score
+                        if stage2_best_key is None or key2 < stage2_best_key:
+                            stage2_best_key = key2
+                            stage2_best = (cand2, row2)
+                    except (ValueError, KeyError, IndexError) as e:
+                        err_msg = str(e)
+                        if "Universe too small" in err_msg:
+                            logger.debug("Stage2 candidate {} rejected: empty universe (likely funding/min_history filter too strict)", cand2.__dict__)
+                        else:
+                            logger.debug("Stage2 candidate {} rejected: {}", cand2.__dict__, err_msg)
                         row2 = {
                             "candidate": cand2.__dict__,
                             "rejected": True,
-                            "error": "stage2_unknown_error",
+                            "error": err_msg,
                             "sharpe": float("nan"),
                             "cagr": float("nan"),
                             "max_drawdown": float("nan"),
                             "avg_daily_turnover": float("nan"),
                         }
-                    stage2_rows.append(row2)
+                    except Exception as e:
+                        logger.warning("Stage2 candidate {} failed with unexpected error: {}", cand2.__dict__, e)
+                        row2 = {
+                            "candidate": cand2.__dict__,
+                            "rejected": True,
+                            "error": str(e),
+                            "sharpe": float("nan"),
+                            "cagr": float("nan"),
+                            "max_drawdown": float("nan"),
+                            "avg_daily_turnover": float("nan"),
+                        }
+                    finally:
+                        if row2 is None:
+                            row2 = {
+                                "candidate": cand2.__dict__,
+                                "rejected": True,
+                                "error": "stage2_unknown_error",
+                                "sharpe": float("nan"),
+                                "cagr": float("nan"),
+                                "max_drawdown": float("nan"),
+                                "avg_daily_turnover": float("nan"),
+                            }
+                        stage2_rows.append(row2)
 
-        (out / "stage2_results.json").write_text(json.dumps(stage2_rows, indent=2, sort_keys=True), encoding="utf-8")
+            (out / "stage2_results.json").write_text(json.dumps(stage2_rows, indent=2, sort_keys=True), encoding="utf-8")
 
-        # Use Stage 2 best if available, otherwise fall back to Stage 1
-        if stage2_best is not None:
-            best_cand, best_row = stage2_best
-            logger.info("Stage2 selected best candidate based on full backtest metrics.")
-        else:
-            logger.warning("Stage2 had no results; falling back to stage1 selection.")
-            # best_cand and best_row are already set from Stage 1 above
+            # Use Stage 2 best if available, otherwise fall back to Stage 1
+            if stage2_best is not None:
+                best_cand, best_row = stage2_best
+                logger.info("{}Stage2 selected best candidate based on full backtest metrics.", window_prefix)
+            else:
+                logger.warning("{}Stage2 had no results; falling back to stage1 selection.", window_prefix)
+                # best_cand and best_row are already set from Stage 1 above
 
-        # Evaluate the selected params Out-Of-Sample (test window) for sanity.
-        oos_metrics: dict[str, Any] | None = None
-        m_oos: Metrics | None = None
-        if len(cal_test) >= 2:
+            # Evaluate the selected params Out-Of-Sample (test window) for sanity.
+            oos_metrics: dict[str, Any] | None = None
+            m_oos: Any | None = None
+            if len(cal_test) >= 2:
             try:
                 trial = cfg.model_copy(deep=True)
                 trial.signal.lookback_days = int(best_cand.lookback_days)  # type: ignore[assignment]
@@ -1384,189 +1507,382 @@ def optimize_config(
                     int(len(eq_oos)),
                 )
             except Exception as e:
-                logger.warning("OOS evaluation failed; continuing without OOS metrics: {}", e)
+                logger.warning("{}OOS evaluation failed; continuing without OOS metrics: {}", window_prefix, e)
                 m_oos = None
 
-        # Debug: summarize stage2 outcomes (why did we get no results?)
-        try:
-            total2 = len(stage2_rows)
-            ok2 = [r for r in stage2_rows if not r.get("rejected") and np.isfinite(float(r.get("sharpe", float("nan"))))]
-            rej2 = [r for r in stage2_rows if r.get("rejected")]
-            if not ok2:
-                # Count by error string (top few)
-                err_counts: dict[str, int] = {}
-                for r in rej2:
-                    err = str(r.get("error") or "unknown")
-                    err_counts[err] = err_counts.get(err, 0) + 1
-                top_err = sorted(err_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+            # Debug: summarize stage2 outcomes (why did we get no results?)
+            try:
+                total2 = len(stage2_rows)
+                ok2 = [r for r in stage2_rows if not r.get("rejected") and np.isfinite(float(r.get("sharpe", float("nan"))))]
+                rej2 = [r for r in stage2_rows if r.get("rejected")]
+                if not ok2:
+                    # Count by error string (top few)
+                    err_counts: dict[str, int] = {}
+                    for r in rej2:
+                        err = str(r.get("error") or "unknown")
+                        err_counts[err] = err_counts.get(err, 0) + 1
+                    top_err = sorted(err_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+                    logger.warning(
+                        "{}Stage2 produced 0 successful candidates (total={} rejected={}). Top reject reasons: {}",
+                        window_prefix,
+                        total2,
+                        len(rej2),
+                        top_err,
+                    )
+                else:
+                    logger.info("{}Stage2 produced {} successful candidates out of {}", window_prefix, len(ok2), total2)
+            except Exception:
+                pass
+
+            # Helpful transparency: show top-by-sharpe in logs (stage2 if available).
+            try:
+                df = pd.DataFrame(stage2_rows if stage2_rows else [r for r in rows if not r.get("rejected")])
+                if not df.empty:
+                    if "rejected" in df.columns:
+                        df = df[df["rejected"] != True]  # noqa: E712
+                    # Drop rows with NaN/inf sharpe
+                    df = df[pd.to_numeric(df["sharpe"], errors="coerce").notna()]
+                    top_sh = df.sort_values("sharpe", ascending=False).head(5)[
+                        ["sharpe", "cagr", "max_drawdown", "avg_daily_turnover", "candidate"]
+                    ]
+                    logger.info("{}Top 5 by Sharpe:\n{}", window_prefix, top_sh.to_string(index=False))
+            except Exception:
+                pass
+
+            # Guardrail: don't write params that are statistically/financially "worse than nothing".
+            # Default: reject negative Sharpe (BYBIT_OPT_MIN_SHARPE=0.0).
+            min_sharpe_env = os.getenv("BYBIT_OPT_MIN_SHARPE", "").strip()
+            try:
+                min_sharpe = float(min_sharpe_env) if min_sharpe_env else 0.0
+            except Exception:
+                min_sharpe = 0.0
+            best_sharpe = float(best_row.get("sharpe", 0.0))
+            if not np.isfinite(best_sharpe) or best_sharpe < min_sharpe:
                 logger.warning(
-                    "Stage2 produced 0 successful candidates (total={} rejected={}). Top reject reasons: {}",
-                    total2,
-                    len(rej2),
-                    top_err,
+                    "{}Optimizer best Sharpe {:.3f} < min {:.3f}; skipping this window.",
+                    window_prefix,
+                    best_sharpe,
+                    min_sharpe,
                 )
-            else:
-                logger.info("Stage2 produced {} successful candidates out of {}", len(ok2), total2)
-        except Exception:
-            pass
-
-        # Helpful transparency: show top-by-sharpe in logs (stage2 if available).
-        try:
-            df = pd.DataFrame(stage2_rows if stage2_rows else [r for r in rows if not r.get("rejected")])
-            if not df.empty:
-                if "rejected" in df.columns:
-                    df = df[df["rejected"] != True]  # noqa: E712
-                # Drop rows with NaN/inf sharpe
-                df = df[pd.to_numeric(df["sharpe"], errors="coerce").notna()]
-                top_sh = df.sort_values("sharpe", ascending=False).head(5)[
-                    ["sharpe", "cagr", "max_drawdown", "avg_daily_turnover", "candidate"]
-                ]
-                logger.info("Top 5 by Sharpe:\n{}", top_sh.to_string(index=False))
-        except Exception:
-            pass
-
-        # Guardrail: don't write params that are statistically/financially "worse than nothing".
-        # Default: reject negative Sharpe (BYBIT_OPT_MIN_SHARPE=0.0).
-        min_sharpe_env = os.getenv("BYBIT_OPT_MIN_SHARPE", "").strip()
-        try:
-            min_sharpe = float(min_sharpe_env) if min_sharpe_env else 0.0
-        except Exception:
-            min_sharpe = 0.0
-        best_sharpe = float(best_row.get("sharpe", 0.0))
-        if not np.isfinite(best_sharpe) or best_sharpe < min_sharpe:
-            out = Path(output_dir)
-            out.mkdir(parents=True, exist_ok=True)
-            (out / "stage1_results.json").write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
-            (out / "best.json").write_text(json.dumps(best_row, indent=2, sort_keys=True), encoding="utf-8")
-            logger.warning(
-                "Optimizer best Sharpe {:.3f} < min {:.3f}; leaving config unchanged. Best: {}",
-                best_sharpe,
-                min_sharpe,
-                (out / "best.json").resolve(),
-            )
-            return {
-                "status": "rejected_by_threshold",
-                "min_sharpe": min_sharpe,
-                "best": best_row,
-                "output_dir": str(out.resolve()),
-                "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
-                "universe_size": len(symbols),
-                "candidates": len(rows),
-            }
-
-        # Optional: OOS profitability gate (recommended when you want the optimizer to only "accept" configs
-        # that are profitable out-of-sample).
-        #
-        # Defaults:
-        #   BYBIT_OPT_REQUIRE_OOS=0  (do not reject if OOS isn't available)
-        #   BYBIT_OPT_MIN_OOS_SHARPE=0.0
-        #   BYBIT_OPT_MIN_OOS_CAGR=0.0
-        require_oos_env = os.getenv("BYBIT_OPT_REQUIRE_OOS", "").strip().lower()
-        require_oos = require_oos_env in ("1", "true", "yes", "y")
-        min_oos_sh_env = os.getenv("BYBIT_OPT_MIN_OOS_SHARPE", "").strip()
-        min_oos_cagr_env = os.getenv("BYBIT_OPT_MIN_OOS_CAGR", "").strip()
-        try:
-            min_oos_sharpe = float(min_oos_sh_env) if min_oos_sh_env else 0.0
-        except Exception:
-            min_oos_sharpe = 0.0
-        try:
-            min_oos_cagr = float(min_oos_cagr_env) if min_oos_cagr_env else 0.0
-        except Exception:
-            min_oos_cagr = 0.0
-
-        if require_oos and m_oos is None:
-            out = Path(output_dir)
-            out.mkdir(parents=True, exist_ok=True)
-            (out / "stage1_results.json").write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
-            (out / "best.json").write_text(json.dumps(best_row, indent=2, sort_keys=True), encoding="utf-8")
-            logger.warning("Optimizer rejected: OOS metrics required (BYBIT_OPT_REQUIRE_OOS=1) but were unavailable.")
-            return {
-                "status": "rejected_by_oos_threshold",
-                "reason": "oos_metrics_unavailable",
-                "min_oos_sharpe": min_oos_sharpe,
-                "min_oos_cagr": min_oos_cagr,
-                "output_dir": str(out.resolve()),
-                "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
-                "universe_size": len(symbols),
-                "candidates": len(rows),
-            }
-
-        if require_oos and m_oos is not None:
-            oos_sh = float(m_oos.sharpe)
-            oos_cg = float(m_oos.cagr)
-            if (not np.isfinite(oos_sh)) or (not np.isfinite(oos_cg)) or (oos_sh < min_oos_sharpe) or (oos_cg < min_oos_cagr):
-                out = Path(output_dir)
-                out.mkdir(parents=True, exist_ok=True)
-                (out / "stage1_results.json").write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
-                (out / "best.json").write_text(json.dumps(best_row, indent=2, sort_keys=True), encoding="utf-8")
-                logger.warning(
-                    "Optimizer rejected by OOS thresholds: OOS Sharpe {:.3f} (min {:.3f}), OOS CAGR {:.2%} (min {:.2%}).",
-                    oos_sh,
-                    min_oos_sharpe,
-                    oos_cg,
-                    min_oos_cagr,
-                )
+                if wf_enabled:
+                    continue
                 return {
-                    "status": "rejected_by_oos_threshold",
-                    "min_oos_sharpe": min_oos_sharpe,
-                    "min_oos_cagr": min_oos_cagr,
-                    "oos_sharpe": oos_sh,
-                    "oos_cagr": oos_cg,
+                    "status": "rejected_by_threshold",
+                    "min_sharpe": min_sharpe,
+                    "best": best_row,
                     "output_dir": str(out.resolve()),
-                    "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
+                    "window": {"start": window_start.date().isoformat(), "end": window_end.date().isoformat()},
                     "universe_size": len(symbols),
                     "candidates": len(rows),
                 }
 
-        if write_config:
-            # Patch config.yaml (deep merge)
-            raw = load_yaml_config(config_path)
-            raw.setdefault("signal", {})
-            raw.setdefault("rebalance", {})
-            raw.setdefault("sizing", {})
+            # Optional: OOS profitability gate (recommended when you want the optimizer to only "accept" configs
+            # that are profitable out-of-sample).
+            #
+            # Defaults:
+            #   BYBIT_OPT_REQUIRE_OOS=0  (do not reject if OOS isn't available)
+            #   BYBIT_OPT_MIN_OOS_SHARPE=0.0
+            #   BYBIT_OPT_MIN_OOS_CAGR=0.0
+            require_oos_env = os.getenv("BYBIT_OPT_REQUIRE_OOS", "").strip().lower()
+            require_oos = require_oos_env in ("1", "true", "yes", "y")
+            min_oos_sh_env = os.getenv("BYBIT_OPT_MIN_OOS_SHARPE", "").strip()
+            min_oos_cagr_env = os.getenv("BYBIT_OPT_MIN_OOS_CAGR", "").strip()
+            try:
+                min_oos_sharpe = float(min_oos_sh_env) if min_oos_sh_env else 0.0
+            except Exception:
+                min_oos_sharpe = 0.0
+            try:
+                min_oos_cagr = float(min_oos_cagr_env) if min_oos_cagr_env else 0.0
+            except Exception:
+                min_oos_cagr = 0.0
 
-            raw["signal"]["lookback_days"] = int(best_cand.lookback_days)
-            raw["signal"]["long_quantile"] = float(best_cand.long_quantile)
-            raw["signal"]["short_quantile"] = float(best_cand.short_quantile)
-            raw["rebalance"]["time_utc"] = str(best_cand.rebalance_time_utc)
-            raw["rebalance"]["interval_days"] = int(best_cand.interval_days)
-            raw["rebalance"]["rebalance_fraction"] = float(best_cand.rebalance_fraction)
-            raw["rebalance"]["min_weight_change_bps"] = float(best_cand.min_weight_change_bps)
-            raw["sizing"]["target_gross_leverage"] = float(best_cand.target_gross_leverage)
-            raw["sizing"]["vol_lookback_days"] = int(best_cand.vol_lookback_days)
-            raw.setdefault("filters", {}).setdefault("regime_filter", {})
-            raw["filters"]["regime_filter"]["action"] = str(best_cand.regime_action)
-            raw.setdefault("funding", {}).setdefault("filter", {})
-            raw["funding"]["filter"]["enabled"] = bool(best_cand.funding_filter_enabled)
-            raw["funding"]["filter"]["max_abs_daily_funding_rate"] = float(best_cand.funding_max_abs_daily_rate)
+            if require_oos and m_oos is None:
+                logger.warning("{}Optimizer rejected: OOS metrics required (BYBIT_OPT_REQUIRE_OOS=1) but were unavailable.", window_prefix)
+                if wf_enabled:
+                    continue
+                return {
+                    "status": "rejected_by_oos_threshold",
+                    "reason": "oos_metrics_unavailable",
+                    "min_oos_sharpe": min_oos_sharpe,
+                    "min_oos_cagr": min_oos_cagr,
+                    "output_dir": str(out.resolve()),
+                    "window": {"start": window_start.date().isoformat(), "end": window_end.date().isoformat()},
+                    "universe_size": len(symbols),
+                    "candidates": len(rows),
+                }
 
-            import yaml
+            if require_oos and m_oos is not None:
+                oos_sh = float(m_oos.sharpe)
+                oos_cg = float(m_oos.cagr)
+                if (not np.isfinite(oos_sh)) or (not np.isfinite(oos_cg)) or (oos_sh < min_oos_sharpe) or (oos_cg < min_oos_cagr):
+                    logger.warning(
+                        "{}Optimizer rejected by OOS thresholds: OOS Sharpe {:.3f} (min {:.3f}), OOS CAGR {:.2%} (min {:.2%}).",
+                        window_prefix,
+                        oos_sh,
+                        min_oos_sharpe,
+                        oos_cg,
+                        min_oos_cagr,
+                    )
+                    if wf_enabled:
+                        continue
+                    return {
+                        "status": "rejected_by_oos_threshold",
+                        "min_oos_sharpe": min_oos_sharpe,
+                        "min_oos_cagr": min_oos_cagr,
+                        "oos_sharpe": oos_sh,
+                        "oos_cagr": oos_cg,
+                        "output_dir": str(out.resolve()),
+                        "window": {"start": window_start.date().isoformat(), "end": window_end.date().isoformat()},
+                        "universe_size": len(symbols),
+                        "candidates": len(rows),
+                    }
 
-            Path(config_path).write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
-        else:
-            logger.warning("write_config=false: NOT writing params back to {} (see best.json in output dir).", Path(config_path).resolve())
+            # Collect window result for walk-forward aggregation
+            window_result = {
+                "window_idx": window_idx,
+                "train_start": cal_train[0].date().isoformat(),
+                "train_end": cal_train[-1].date().isoformat(),
+                "test_start": cal_test[0].date().isoformat() if len(cal_test) > 0 else None,
+                "test_end": cal_test[-1].date().isoformat() if len(cal_test) > 0 else None,
+                "best_candidate": best_cand.__dict__,
+                "train_metrics": best_row,
+                "oos_metrics": oos_metrics,
+            }
+            all_window_results.append(window_result)
+            
+            # For single window mode, write config and return immediately
+            if not wf_enabled:
+                if write_config:
+                    # Patch config.yaml (deep merge)
+                    raw = load_yaml_config(config_path)
+                    raw.setdefault("signal", {})
+                    raw.setdefault("rebalance", {})
+                    raw.setdefault("sizing", {})
 
-        (out / "best.json").write_text(json.dumps(best_row, indent=2, sort_keys=True), encoding="utf-8")
+                    raw["signal"]["lookback_days"] = int(best_cand.lookback_days)
+                    raw["signal"]["long_quantile"] = float(best_cand.long_quantile)
+                    raw["signal"]["short_quantile"] = float(best_cand.short_quantile)
+                    raw["rebalance"]["time_utc"] = str(best_cand.rebalance_time_utc)
+                    raw["rebalance"]["interval_days"] = int(best_cand.interval_days)
+                    raw["rebalance"]["rebalance_fraction"] = float(best_cand.rebalance_fraction)
+                    raw["rebalance"]["min_weight_change_bps"] = float(best_cand.min_weight_change_bps)
+                    raw["sizing"]["target_gross_leverage"] = float(best_cand.target_gross_leverage)
+                    raw["sizing"]["vol_lookback_days"] = int(best_cand.vol_lookback_days)
+                    raw.setdefault("filters", {}).setdefault("regime_filter", {})
+                    raw["filters"]["regime_filter"]["action"] = str(best_cand.regime_action)
+                    raw.setdefault("funding", {}).setdefault("filter", {})
+                    raw["funding"]["filter"]["enabled"] = bool(best_cand.funding_filter_enabled)
+                    raw["funding"]["filter"]["max_abs_daily_funding_rate"] = float(best_cand.funding_max_abs_daily_rate)
 
-        logger.info(
-            "Optimization complete. Best sharpe={:.3f} cagr={:.2%} maxDD={:.2%} turnover={:.3f} params={}",
-            float(best_row.get("sharpe", 0.0)),
-            float(best_row.get("cagr", 0.0)),
-            float(best_row.get("max_drawdown", 0.0)),
-            float(best_row.get("avg_daily_turnover", 0.0)),
-            best_cand.__dict__,
-        )
-        return {
-            "best": best_row,
-            "oos": oos_metrics,
-            "output_dir": str(out.resolve()),
-            "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
-            "universe_size": len(symbols),
-            "candidates": len(rows),
-            "evaluated": len(candidates_list),
-            "stage2_topk": int(stage2_topk) if stage2_topk is not None else _level_to_stage2_topk(level),
-            "write_config": bool(write_config),
-        }
+                    import yaml
+
+                    Path(config_path).write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+                else:
+                    logger.warning("write_config=false: NOT writing params back to {} (see best.json in output dir).", Path(config_path).resolve())
+
+                (out / "best.json").write_text(json.dumps(best_row, indent=2, sort_keys=True), encoding="utf-8")
+
+                logger.info(
+                    "Optimization complete. Best sharpe={:.3f} cagr={:.2%} maxDD={:.2%} turnover={:.3f} params={}",
+                    float(best_row.get("sharpe", 0.0)),
+                    float(best_row.get("cagr", 0.0)),
+                    float(best_row.get("max_drawdown", 0.0)),
+                    float(best_row.get("avg_daily_turnover", 0.0)),
+                    best_cand.__dict__,
+                )
+                return {
+                    "best": best_row,
+                    "oos": oos_metrics,
+                    "output_dir": str(out.resolve()),
+                    "window": {"start": window_start.date().isoformat(), "end": window_end.date().isoformat()},
+                    "universe_size": len(symbols),
+                    "candidates": len(rows),
+                    "evaluated": len(candidates_list),
+                    "stage2_topk": int(stage2_topk) if stage2_topk is not None else _level_to_stage2_topk(level),
+                    "write_config": bool(write_config),
+                }
+        
+        # Walk-forward aggregation: select best candidate across all windows
+        if wf_enabled and len(all_window_results) > 0:
+            logger.info("Aggregating results across {} walk-forward windows...", len(all_window_results))
+            
+            # Count how many times each candidate appears (robustness metric)
+            candidate_counts: dict[tuple, list[dict[str, Any]]] = {}
+            for wr in all_window_results:
+                cand_dict = wr["best_candidate"]
+                # Create a hashable key from candidate params
+                cand_key = (
+                    cand_dict.get("lookback_days"),
+                    cand_dict.get("long_quantile"),
+                    cand_dict.get("short_quantile"),
+                    cand_dict.get("target_gross_leverage"),
+                    cand_dict.get("vol_lookback_days"),
+                    cand_dict.get("interval_days"),
+                    cand_dict.get("rebalance_fraction"),
+                    cand_dict.get("min_weight_change_bps"),
+                    cand_dict.get("regime_action"),
+                    cand_dict.get("funding_filter_enabled"),
+                    cand_dict.get("funding_max_abs_daily_rate"),
+                )
+                if cand_key not in candidate_counts:
+                    candidate_counts[cand_key] = []
+                candidate_counts[cand_key].append(wr)
+            
+            # Rank candidates by average OOS Sharpe (or composite score if enabled)
+            use_composite_env = os.getenv("BYBIT_OPT_USE_COMPOSITE", "").strip().lower()
+            use_composite = use_composite_env in ("1", "true", "yes", "y")
+            
+            candidate_scores: list[tuple[tuple, float, int, dict[str, Any]]] = []
+            for cand_key, window_results in candidate_counts.items():
+                oos_sharpes = []
+                oos_calmars = []
+                oos_cagrs = []
+                for wr in window_results:
+                    oos = wr.get("oos_metrics")
+                    if oos and oos.get("sharpe") is not None:
+                        sh = float(oos.get("sharpe", 0.0))
+                        if np.isfinite(sh):
+                            oos_sharpes.append(sh)
+                    if oos and oos.get("calmar") is not None:
+                        cm = float(oos.get("calmar", 0.0))
+                        if np.isfinite(cm):
+                            oos_calmars.append(cm)
+                    if oos and oos.get("cagr") is not None:
+                        cg = float(oos.get("cagr", 0.0))
+                        if np.isfinite(cg):
+                            oos_cagrs.append(cg)
+                
+                if oos_sharpes:
+                    avg_sharpe = float(np.mean(oos_sharpes))
+                    avg_calmar = float(np.mean(oos_calmars)) if oos_calmars else 0.0
+                    avg_cagr = float(np.mean(oos_cagrs)) if oos_cagrs else 0.0
+                    appearance_count = len(window_results)
+                    
+                    if use_composite:
+                        w_sharpe_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_SHARPE", "").strip()
+                        w_calmar_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_CALMAR", "").strip()
+                        w_cagr_env = os.getenv("BYBIT_OPT_OBJ_WEIGHT_CAGR", "").strip()
+                        try:
+                            w_sharpe = float(w_sharpe_env) if w_sharpe_env else 0.4
+                            w_calmar = float(w_calmar_env) if w_calmar_env else 0.3
+                            w_cagr = float(w_cagr_env) if w_cagr_env else 0.2
+                        except Exception:
+                            w_sharpe, w_calmar, w_cagr = 0.4, 0.3, 0.2
+                        
+                        score = w_sharpe * avg_sharpe + w_calmar * avg_calmar + w_cagr * avg_cagr * 100.0
+                    else:
+                        score = avg_sharpe
+                    
+                    # Boost score by appearance count (robustness bonus)
+                    score = score * (1.0 + 0.1 * (appearance_count - 1))
+                    candidate_scores.append((cand_key, score, appearance_count, window_results[0]))
+            
+            if candidate_scores:
+                # Sort by score (descending), then by appearance count
+                candidate_scores.sort(key=lambda x: (-x[1], -x[2]))
+                best_key, best_score, best_count, best_window_result = candidate_scores[0]
+                
+                logger.info(
+                    "Walk-forward best candidate: avg_OOS_Sharpe={:.3f} (appeared in {}/{} windows), params={}",
+                    best_score / (1.0 + 0.1 * (best_count - 1)) if best_count > 1 else best_score,
+                    best_count,
+                    len(all_window_results),
+                    best_window_result["best_candidate"],
+                )
+                
+                # Update best_cand and best_row for final write
+                best_cand = Candidate(**best_window_result["best_candidate"])
+                best_row = best_window_result["train_metrics"]
+                oos_metrics = best_window_result["oos_metrics"]
+                
+                # Save walk-forward summary
+                out = Path(output_dir)
+                out.mkdir(parents=True, exist_ok=True)
+                wf_summary = {
+                    "num_windows": len(all_window_results),
+                    "best_candidate": best_cand.__dict__,
+                    "best_score": best_score,
+                    "appearance_count": best_count,
+                    "all_windows": all_window_results,
+                    "candidate_rankings": [
+                        {
+                            "candidate": wr["best_candidate"],
+                            "score": score,
+                            "appearance_count": count,
+                            "avg_oos_sharpe": float(np.mean([w.get("oos_metrics", {}).get("sharpe", 0.0) for w in candidate_counts[key] if w.get("oos_metrics", {}).get("sharpe") is not None])),
+                        }
+                        for key, score, count, wr in candidate_scores[:10]  # Top 10
+                    ],
+                }
+                (out / "walkforward_summary.json").write_text(json.dumps(wf_summary, indent=2, sort_keys=True), encoding="utf-8")
+            else:
+                logger.warning("Walk-forward: No valid candidates with OOS metrics across windows. Using last window result.")
+                best_window_result = all_window_results[-1]
+                best_cand = Candidate(**best_window_result["best_candidate"])
+                best_row = best_window_result["train_metrics"]
+                oos_metrics = best_window_result["oos_metrics"]
+            
+            # Write final config
+            if write_config:
+                raw = load_yaml_config(config_path)
+                raw.setdefault("signal", {})
+                raw.setdefault("rebalance", {})
+                raw.setdefault("sizing", {})
+
+                raw["signal"]["lookback_days"] = int(best_cand.lookback_days)
+                raw["signal"]["long_quantile"] = float(best_cand.long_quantile)
+                raw["signal"]["short_quantile"] = float(best_cand.short_quantile)
+                raw["rebalance"]["time_utc"] = str(best_cand.rebalance_time_utc)
+                raw["rebalance"]["interval_days"] = int(best_cand.interval_days)
+                raw["rebalance"]["rebalance_fraction"] = float(best_cand.rebalance_fraction)
+                raw["rebalance"]["min_weight_change_bps"] = float(best_cand.min_weight_change_bps)
+                raw["sizing"]["target_gross_leverage"] = float(best_cand.target_gross_leverage)
+                raw["sizing"]["vol_lookback_days"] = int(best_cand.vol_lookback_days)
+                raw.setdefault("filters", {}).setdefault("regime_filter", {})
+                raw["filters"]["regime_filter"]["action"] = str(best_cand.regime_action)
+                raw.setdefault("funding", {}).setdefault("filter", {})
+                raw["funding"]["filter"]["enabled"] = bool(best_cand.funding_filter_enabled)
+                raw["funding"]["filter"]["max_abs_daily_funding_rate"] = float(best_cand.funding_max_abs_daily_rate)
+
+                import yaml
+
+                Path(config_path).write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+            
+            out = Path(output_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "best.json").write_text(json.dumps(best_row, indent=2, sort_keys=True), encoding="utf-8")
+            
+            logger.info(
+                "Walk-forward optimization complete. Best sharpe={:.3f} cagr={:.2%} maxDD={:.2%} turnover={:.3f} params={}",
+                float(best_row.get("sharpe", 0.0)),
+                float(best_row.get("cagr", 0.0)),
+                float(best_row.get("max_drawdown", 0.0)),
+                float(best_row.get("avg_daily_turnover", 0.0)),
+                best_cand.__dict__,
+            )
+            return {
+                "best": best_row,
+                "oos": oos_metrics,
+                "output_dir": str(out.resolve()),
+                "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
+                "universe_size": len(symbols),
+                "candidates": len(rows) if 'rows' in locals() else 0,
+                "evaluated": len(candidates_list) if 'candidates_list' in locals() else 0,
+                "stage2_topk": int(stage2_topk) if stage2_topk is not None else _level_to_stage2_topk(level),
+                "write_config": bool(write_config),
+                "walkforward": {"enabled": True, "num_windows": len(all_window_results)},
+            }
+        
+        # Fallback: if walk-forward was enabled but no results, return error
+        if wf_enabled and len(all_window_results) == 0:
+            return {
+                "status": "no_feasible_candidate",
+                "output_dir": str(Path(output_dir).resolve()),
+                "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
+                "universe_size": len(symbols),
+                "candidates": 0,
+                "walkforward": {"enabled": True, "num_windows": 0},
+            }
     finally:
         client.close()
 
