@@ -1394,121 +1394,122 @@ def optimize_config(
             oos_metrics: dict[str, Any] | None = None
             m_oos: Any | None = None
             if len(cal_test) >= 2:
-            try:
-                trial = cfg.model_copy(deep=True)
-                trial.signal.lookback_days = int(best_cand.lookback_days)  # type: ignore[assignment]
-                trial.signal.long_quantile = float(best_cand.long_quantile)
-                trial.signal.short_quantile = float(best_cand.short_quantile)
-                trial.sizing.target_gross_leverage = float(best_cand.target_gross_leverage)
-                trial.sizing.vol_lookback_days = int(best_cand.vol_lookback_days)
-                trial.rebalance.time_utc = str(best_cand.rebalance_time_utc)
-                trial.rebalance.interval_days = int(best_cand.interval_days)
-                trial.rebalance.rebalance_fraction = float(best_cand.rebalance_fraction)
-                trial.rebalance.min_weight_change_bps = float(best_cand.min_weight_change_bps)
-                trial.filters.regime_filter.action = str(best_cand.regime_action)  # type: ignore[assignment]
-                trial.funding.filter.enabled = bool(best_cand.funding_filter_enabled)
-                trial.funding.filter.max_abs_daily_funding_rate = float(best_cand.funding_max_abs_daily_rate)
+                try:
+                    trial = cfg.model_copy(deep=True)
+                    trial.signal.lookback_days = int(best_cand.lookback_days)  # type: ignore[assignment]
+                    trial.signal.long_quantile = float(best_cand.long_quantile)
+                    trial.signal.short_quantile = float(best_cand.short_quantile)
+                    trial.sizing.target_gross_leverage = float(best_cand.target_gross_leverage)
+                    trial.sizing.vol_lookback_days = int(best_cand.vol_lookback_days)
+                    trial.rebalance.time_utc = str(best_cand.rebalance_time_utc)
+                    trial.rebalance.interval_days = int(best_cand.interval_days)
+                    trial.rebalance.rebalance_fraction = float(best_cand.rebalance_fraction)
+                    trial.rebalance.min_weight_change_bps = float(best_cand.min_weight_change_bps)
+                    trial.filters.regime_filter.action = str(best_cand.regime_action)  # type: ignore[assignment]
+                    trial.funding.filter.enabled = bool(best_cand.funding_filter_enabled)
+                    trial.funding.filter.max_abs_daily_funding_rate = float(best_cand.funding_max_abs_daily_rate)
 
-                # IMPORTANT: evaluate OOS in a *stateful* way by running a single contiguous simulation
-                # across train+test, then slicing metrics to the test window. This avoids resetting
-                # weights/equity at the test boundary (which can distort OOS significantly).
-                cal_full = cal_train.append(cal_test)
-                eq_full, dr_full, to_full = _simulate_candidate_full(
-                    cfg=trial,
-                    candles=candles_stage2,
-                    market_df=market_df,
-                    calendar=cal_full,
-                    funding_daily=funding_daily,
-                )
+                    # IMPORTANT: evaluate OOS in a *stateful* way by running a single contiguous simulation
+                    # across train+test, then slicing metrics to the test window. This avoids resetting
+                    # weights/equity at the test boundary (which can distort OOS significantly).
+                    cal_full = cal_train.append(cal_test)
+                    eq_full, dr_full, to_full = _simulate_candidate_full(
+                        cfg=trial,
+                        candles=candles_stage2,
+                        market_df=market_df,
+                        calendar=cal_full,
+                        funding_daily=funding_daily,
+                    )
 
-                test_start_dt = cal_test[0].to_pydatetime()
-                eq_oos = eq_full.loc[eq_full.index >= test_start_dt]
-                dr_oos = dr_full.loc[dr_full.index >= test_start_dt]
-                to_oos = to_full.loc[to_full.index >= test_start_dt]
+                    test_start_dt = cal_test[0].to_pydatetime()
+                    eq_oos = eq_full.loc[eq_full.index >= test_start_dt]
+                    dr_oos = dr_full.loc[dr_full.index >= test_start_dt]
+                    to_oos = to_full.loc[to_full.index >= test_start_dt]
 
-                m_oos = compute_metrics(eq_oos, dr_oos, to_oos)
-                oos_metrics = {
-                    "sharpe": float(m_oos.sharpe),
-                    "cagr": float(m_oos.cagr),
-                    "max_drawdown": float(m_oos.max_drawdown),
-                    "calmar": float(m_oos.calmar),
-                    "sortino": float(m_oos.sortino),
-                    "profit_factor": float(m_oos.profit_factor),
-                    "win_rate": float(m_oos.win_rate),
-                    "avg_daily_turnover": float(m_oos.avg_daily_turnover),
-                    "test_days": int(len(eq_oos)),
-                    "test_start": cal_test[0].date().isoformat(),
-                    "test_end": cal_test[-1].date().isoformat(),
-                }
-                
-                # Overfitting detection: compare train vs test metrics
-                train_sharpe = float(best_row.get("sharpe", 0.0))
-                train_cagr = float(best_row.get("cagr", 0.0))
-                train_calmar = float(best_row.get("calmar", 0.0))
-                test_sharpe = float(m_oos.sharpe)
-                test_cagr = float(m_oos.cagr)
-                test_calmar = float(m_oos.calmar)
-                
-                overfitting_flags = []
-                if np.isfinite(train_sharpe) and np.isfinite(test_sharpe) and train_sharpe > 0:
-                    sharpe_degradation = (train_sharpe - test_sharpe) / train_sharpe
-                    if sharpe_degradation > 0.5:  # Test Sharpe is < 50% of train Sharpe
-                        overfitting_flags.append(f"Sharpe degradation: {sharpe_degradation:.1%} (train={train_sharpe:.3f} test={test_sharpe:.3f})")
-                
-                if np.isfinite(train_cagr) and np.isfinite(test_cagr) and train_cagr > 0:
-                    cagr_degradation = (train_cagr - test_cagr) / train_cagr
-                    if cagr_degradation > 0.5:  # Test CAGR is < 50% of train CAGR
-                        overfitting_flags.append(f"CAGR degradation: {cagr_degradation:.1%} (train={train_cagr:.2%} test={test_cagr:.2%})")
-                
-                if np.isfinite(train_calmar) and np.isfinite(test_calmar) and train_calmar > 0:
-                    calmar_degradation = (train_calmar - test_calmar) / train_calmar
-                    if calmar_degradation > 0.5:  # Test Calmar is < 50% of train Calmar
-                        overfitting_flags.append(f"Calmar degradation: {calmar_degradation:.1%} (train={train_calmar:.3f} test={test_calmar:.3f})")
-                
-                overfitting_warning = None
-                if overfitting_flags:
-                    overfitting_warning = " | ".join(overfitting_flags)
-                    logger.warning("Potential overfitting detected: {}", overfitting_warning)
-                
-                oos_metrics["overfitting_warning"] = overfitting_warning
-                oos_metrics["train_vs_test"] = {
-                    "sharpe": {"train": train_sharpe, "test": test_sharpe, "degradation_pct": float((train_sharpe - test_sharpe) / train_sharpe * 100) if train_sharpe > 0 and np.isfinite(train_sharpe) and np.isfinite(test_sharpe) else None},
-                    "cagr": {"train": train_cagr, "test": test_cagr, "degradation_pct": float((train_cagr - test_cagr) / train_cagr * 100) if train_cagr > 0 and np.isfinite(train_cagr) and np.isfinite(test_cagr) else None},
-                    "calmar": {"train": train_calmar, "test": test_calmar, "degradation_pct": float((train_calmar - test_calmar) / train_calmar * 100) if train_calmar > 0 and np.isfinite(train_calmar) and np.isfinite(test_calmar) else None},
-                }
-                
-                (out / "oos_best.json").write_text(
-                    json.dumps(
-                        {
-                            "split": {
-                                "train_days": int(len(cal_train)),
-                                "train_start": cal_train[0].date().isoformat(),
-                                "train_end": cal_train[-1].date().isoformat(),
-                                "test_days": int(len(cal_test)),
-                                "test_start": cal_test[0].date().isoformat(),
-                                "test_end": cal_test[-1].date().isoformat(),
+                    m_oos = compute_metrics(eq_oos, dr_oos, to_oos)
+                    oos_metrics = {
+                        "sharpe": float(m_oos.sharpe),
+                        "cagr": float(m_oos.cagr),
+                        "max_drawdown": float(m_oos.max_drawdown),
+                        "calmar": float(m_oos.calmar),
+                        "sortino": float(m_oos.sortino),
+                        "profit_factor": float(m_oos.profit_factor),
+                        "win_rate": float(m_oos.win_rate),
+                        "avg_daily_turnover": float(m_oos.avg_daily_turnover),
+                        "test_days": int(len(eq_oos)),
+                        "test_start": cal_test[0].date().isoformat(),
+                        "test_end": cal_test[-1].date().isoformat(),
+                    }
+                    
+                    # Overfitting detection: compare train vs test metrics
+                    train_sharpe = float(best_row.get("sharpe", 0.0))
+                    train_cagr = float(best_row.get("cagr", 0.0))
+                    train_calmar = float(best_row.get("calmar", 0.0))
+                    test_sharpe = float(m_oos.sharpe)
+                    test_cagr = float(m_oos.cagr)
+                    test_calmar = float(m_oos.calmar)
+                    
+                    overfitting_flags = []
+                    if np.isfinite(train_sharpe) and np.isfinite(test_sharpe) and train_sharpe > 0:
+                        sharpe_degradation = (train_sharpe - test_sharpe) / train_sharpe
+                        if sharpe_degradation > 0.5:  # Test Sharpe is < 50% of train Sharpe
+                            overfitting_flags.append(f"Sharpe degradation: {sharpe_degradation:.1%} (train={train_sharpe:.3f} test={test_sharpe:.3f})")
+                    
+                    if np.isfinite(train_cagr) and np.isfinite(test_cagr) and train_cagr > 0:
+                        cagr_degradation = (train_cagr - test_cagr) / train_cagr
+                        if cagr_degradation > 0.5:  # Test CAGR is < 50% of train CAGR
+                            overfitting_flags.append(f"CAGR degradation: {cagr_degradation:.1%} (train={train_cagr:.2%} test={test_cagr:.2%})")
+                    
+                    if np.isfinite(train_calmar) and np.isfinite(test_calmar) and train_calmar > 0:
+                        calmar_degradation = (train_calmar - test_calmar) / train_calmar
+                        if calmar_degradation > 0.5:  # Test Calmar is < 50% of train Calmar
+                            overfitting_flags.append(f"Calmar degradation: {calmar_degradation:.1%} (train={train_calmar:.3f} test={test_calmar:.3f})")
+                    
+                    overfitting_warning = None
+                    if overfitting_flags:
+                        overfitting_warning = " | ".join(overfitting_flags)
+                        logger.warning("{}Potential overfitting detected: {}", window_prefix, overfitting_warning)
+                    
+                    oos_metrics["overfitting_warning"] = overfitting_warning
+                    oos_metrics["train_vs_test"] = {
+                        "sharpe": {"train": train_sharpe, "test": test_sharpe, "degradation_pct": float((train_sharpe - test_sharpe) / train_sharpe * 100) if train_sharpe > 0 and np.isfinite(train_sharpe) and np.isfinite(test_sharpe) else None},
+                        "cagr": {"train": train_cagr, "test": test_cagr, "degradation_pct": float((train_cagr - test_cagr) / train_cagr * 100) if train_cagr > 0 and np.isfinite(train_cagr) and np.isfinite(test_cagr) else None},
+                        "calmar": {"train": train_calmar, "test": test_calmar, "degradation_pct": float((train_calmar - test_calmar) / train_calmar * 100) if train_calmar > 0 and np.isfinite(train_calmar) and np.isfinite(test_calmar) else None},
+                    }
+                    
+                    (out / "oos_best.json").write_text(
+                        json.dumps(
+                            {
+                                "split": {
+                                    "train_days": int(len(cal_train)),
+                                    "train_start": cal_train[0].date().isoformat(),
+                                    "train_end": cal_train[-1].date().isoformat(),
+                                    "test_days": int(len(cal_test)),
+                                    "test_start": cal_test[0].date().isoformat(),
+                                    "test_end": cal_test[-1].date().isoformat(),
+                                },
+                                "best_candidate": best_cand.__dict__,
+                                "train": best_row,
+                                "test": oos_metrics,
                             },
-                            "best_candidate": best_cand.__dict__,
-                            "train": best_row,
-                            "test": oos_metrics,
-                        },
-                        indent=2,
-                        sort_keys=True,
+                            indent=2,
+                            sort_keys=True,
                     ),
                     encoding="utf-8",
                 )
-                logger.info(
-                    "OOS (test) metrics for selected params: Sharpe={:.3f} CAGR={:.2%} MaxDD={:.2%} Calmar={:.3f} Turnover={:.3f} Days={}",
-                    float(m_oos.sharpe),
-                    float(m_oos.cagr),
-                    float(m_oos.max_drawdown),
-                    float(m_oos.calmar),
-                    float(m_oos.avg_daily_turnover),
-                    int(len(eq_oos)),
-                )
-            except Exception as e:
-                logger.warning("{}OOS evaluation failed; continuing without OOS metrics: {}", window_prefix, e)
-                m_oos = None
+                    logger.info(
+                        "{}OOS (test) metrics for selected params: Sharpe={:.3f} CAGR={:.2%} MaxDD={:.2%} Calmar={:.3f} Turnover={:.3f} Days={}",
+                        window_prefix,
+                        float(m_oos.sharpe),
+                        float(m_oos.cagr),
+                        float(m_oos.max_drawdown),
+                        float(m_oos.calmar),
+                        float(m_oos.avg_daily_turnover),
+                        int(len(eq_oos)),
+                    )
+                except Exception as e:
+                    logger.warning("{}OOS evaluation failed; continuing without OOS metrics: {}", window_prefix, e)
+                    m_oos = None
 
             # Debug: summarize stage2 outcomes (why did we get no results?)
             try:
