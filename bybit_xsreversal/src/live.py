@@ -287,20 +287,12 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                 logger.info("Saved rebalance snapshot: {}", snap_path.resolve())
 
                 if not targets.notionals_usd:
-                    if bool(getattr(cfg.rebalance, "flatten_on_empty_targets", False)):
-                        logger.warning(
-                            "Empty target book and flatten_on_empty_targets=true: flattening all positions. See snapshot: {}",
-                            snap_path.resolve(),
-                        )
-                        res0 = run_rebalance(cfg=cfg, client=client, md=md, target_notionals={}, dry_run=dry_run)
-                        (out_dir / "execution_result.json").write_bytes(orjson.dumps(res0, option=orjson.OPT_INDENT_2))
-                        logger.info("Flatten done. Result saved to {}", (out_dir / "execution_result.json").resolve())
-                    else:
-                        logger.warning(
-                            "No target notionals produced (empty target book). Skipping execution. See snapshot: {}",
-                            snap_path.resolve(),
-                        )
-                    return
+                    logger.warning(
+                        "No target notionals produced (empty target book). Will still reconcile existing positions. See snapshot: {}",
+                        snap_path.resolve(),
+                    )
+                    # Always reconcile positions even when target book is empty (close positions not in targets)
+                    # This ensures the portfolio matches the strategy's intent (flat when no signals)
 
                 try:
                     res = run_rebalance(cfg=cfg, client=client, md=md, target_notionals=targets.notionals_usd, dry_run=dry_run)

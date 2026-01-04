@@ -199,7 +199,10 @@ def plan_rebalance_orders(
 
         # Delta in base qty
         delta = tgt_size - cur_size
-        if abs(delta * px) < float(cfg.sizing.min_notional_per_symbol):
+        
+        # Filter small deltas, BUT always allow closing positions (even if small) to ensure reconciliation
+        is_closing_position = (cur_size != 0.0 and tgt_size == 0.0)
+        if not is_closing_position and abs(delta * px) < float(cfg.sizing.min_notional_per_symbol):
             continue
 
         # If this is a reduce-only trim and the delta is below minQty, we can't execute it without over-closing.
