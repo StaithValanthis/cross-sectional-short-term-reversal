@@ -21,7 +21,6 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
-from rich.console import Console
 
 from src.backtest.metrics import compute_metrics
 from src.config import BotConfig, load_config, load_yaml_config
@@ -852,31 +851,29 @@ def optimize_config(
         # If random produced fewer uniques than budget, that's OK.
         candidates_list = cand_list
 
-        # Progress bar + ETA
-        # Rich Progress bars may not render in non-interactive terminals or when output is redirected.
-        # We'll create the progress context, but if it doesn't render, the heartbeat logs will still show progress.
-        console = Console(force_terminal=True, force_interactive=False)
-        progress_ctx = (
-            Progress(
-                SpinnerColumn(),
-                TextColumn("[bold]optimize[/bold]"),
-                BarColumn(),
-                MofNCompleteColumn(),
-                TimeElapsedColumn(),
-                TimeRemainingColumn(),
-                TextColumn("best_sharpe={task.fields[best_sharpe]}"),
-                TextColumn("best_dd={task.fields[best_dd]}"),
-                TextColumn("best_cagr={task.fields[best_cagr]}"),
-                transient=False,
-                console=console,
-            )
+            # Progress bar + ETA
+            # Rich Progress bars may not render in non-interactive terminals or when output is redirected.
+            # We'll create the progress context, but if it doesn't render, the heartbeat logs will still show progress.
+            progress_ctx = (
+                Progress(
+                    SpinnerColumn(),
+                    TextColumn("[bold]optimize[/bold]"),
+                    BarColumn(),
+                    MofNCompleteColumn(),
+                    TimeElapsedColumn(),
+                    TimeRemainingColumn(),
+                    TextColumn("best_sharpe={task.fields[best_sharpe]}"),
+                    TextColumn("best_dd={task.fields[best_dd]}"),
+                    TextColumn("best_cagr={task.fields[best_cagr]}"),
+                    transient=False,
+                )
                 if show_progress
                 else None
             )
 
             def fmt_or_na(x: float | None, fmt: str) -> str:
-            if x is None or not np.isfinite(x):
-                return "n/a"
+                if x is None or not np.isfinite(x):
+                    return "n/a"
                 return format(float(x), fmt)
 
             if progress_ctx is None:
