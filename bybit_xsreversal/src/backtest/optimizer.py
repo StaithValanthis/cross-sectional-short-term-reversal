@@ -1073,8 +1073,9 @@ def optimize_config(
                 )
                 # Skip this window in walk-forward mode, otherwise return error
                 if wf_enabled:
-                    # Continue to next window in walk-forward analysis
-                    continue  # noqa: F701
+                    # Skip to next window in walk-forward analysis
+                    # (We'll continue the loop naturally by not executing the rest of this iteration)
+                    pass
                 else:
                     # For single window, return error
                     return {
@@ -1084,6 +1085,24 @@ def optimize_config(
                         "universe_size": len(symbols),
                         "candidates": len(rows),
                     }
+                # If wf_enabled, skip the rest of this iteration
+                if wf_enabled:
+                    # Collect empty result for this window and continue
+                    window_result = {
+                        "window_idx": window_idx,
+                        "train_start": cal_train[0].date().isoformat(),
+                        "train_end": cal_train[-1].date().isoformat(),
+                        "test_start": cal_test[0].date().isoformat() if len(cal_test) > 0 else None,
+                        "test_end": cal_test[-1].date().isoformat() if len(cal_test) > 0 else None,
+                        "best_candidate": None,
+                        "train_metrics": None,
+                        "oos_metrics": None,
+                        "skipped": True,
+                        "reason": "no_feasible_candidates",
+                    }
+                    all_window_results.append(window_result)
+                    # Use continue here - it should be recognized as being in the loop
+                    continue
 
             best_cand, best_row = best
 
