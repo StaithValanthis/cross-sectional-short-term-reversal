@@ -1073,21 +1073,7 @@ def optimize_config(
                 )
                 # Skip this window in walk-forward mode, otherwise return error
                 if wf_enabled:
-                    # Skip to next window in walk-forward analysis
-                    # (We'll continue the loop naturally by not executing the rest of this iteration)
-                    pass
-                else:
-                    # For single window, return error
-                    return {
-                        "status": "no_feasible_candidate",
-                        "output_dir": str(out.resolve()),
-                        "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
-                        "universe_size": len(symbols),
-                        "candidates": len(rows),
-                    }
-                # If wf_enabled, skip the rest of this iteration
-                if wf_enabled:
-                    # Collect empty result for this window and continue
+                    # Collect empty result for this window and continue to next window
                     window_result = {
                         "window_idx": window_idx,
                         "train_start": cal_train[0].date().isoformat(),
@@ -1101,8 +1087,18 @@ def optimize_config(
                         "reason": "no_feasible_candidates",
                     }
                     all_window_results.append(window_result)
-                    # Use continue here - it should be recognized as being in the loop
+                    # Continue to next window in walk-forward analysis
+                    # This continue is inside the for window_idx loop
                     continue
+                else:
+                    # For single window, return error
+                    return {
+                        "status": "no_feasible_candidate",
+                        "output_dir": str(out.resolve()),
+                        "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
+                        "universe_size": len(symbols),
+                        "candidates": len(rows),
+                    }
 
             best_cand, best_row = best
 
@@ -1119,11 +1115,25 @@ def optimize_config(
             if not feasible:
                 logger.warning("{}Stage1 found {} feasible candidates, but all were rejected. Skipping Stage2.", window_prefix, len(rows))
                 if wf_enabled:
+                    # Collect empty result and continue to next window
+                    window_result = {
+                        "window_idx": window_idx,
+                        "train_start": cal_train[0].date().isoformat(),
+                        "train_end": cal_train[-1].date().isoformat(),
+                        "test_start": cal_test[0].date().isoformat() if len(cal_test) > 0 else None,
+                        "test_end": cal_test[-1].date().isoformat() if len(cal_test) > 0 else None,
+                        "best_candidate": None,
+                        "train_metrics": None,
+                        "oos_metrics": None,
+                        "skipped": True,
+                        "reason": "no_feasible_candidates_after_stage1",
+                    }
+                    all_window_results.append(window_result)
                     continue
                 return {
                     "status": "no_feasible_candidate",
                     "output_dir": str(out.resolve()),
-                    "window": {"start": window_start.date().isoformat(), "end": window_end.date().isoformat()},
+                    "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
                     "universe_size": len(symbols),
                     "candidates": len(rows),
                     "feasible": 0,
@@ -1134,11 +1144,25 @@ def optimize_config(
             if k2 == 0:
                 logger.warning("{}No feasible candidates available for Stage2 (feasible={} total={}).", window_prefix, len(feasible), len(rows))
                 if wf_enabled:
+                    # Collect empty result and continue to next window
+                    window_result = {
+                        "window_idx": window_idx,
+                        "train_start": cal_train[0].date().isoformat(),
+                        "train_end": cal_train[-1].date().isoformat(),
+                        "test_start": cal_test[0].date().isoformat() if len(cal_test) > 0 else None,
+                        "test_end": cal_test[-1].date().isoformat() if len(cal_test) > 0 else None,
+                        "best_candidate": None,
+                        "train_metrics": None,
+                        "oos_metrics": None,
+                        "skipped": True,
+                        "reason": "k2_zero",
+                    }
+                    all_window_results.append(window_result)
                     continue
                 return {
                     "status": "no_feasible_candidate",
                     "output_dir": str(out.resolve()),
-                    "window": {"start": window_start.date().isoformat(), "end": window_end.date().isoformat()},
+                    "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
                     "universe_size": len(symbols),
                     "candidates": len(rows),
                     "feasible": len(feasible),
@@ -1587,13 +1611,27 @@ def optimize_config(
                     min_sharpe,
                 )
                 if wf_enabled:
+                    # Collect result and continue to next window
+                    window_result = {
+                        "window_idx": window_idx,
+                        "train_start": cal_train[0].date().isoformat(),
+                        "train_end": cal_train[-1].date().isoformat(),
+                        "test_start": cal_test[0].date().isoformat() if len(cal_test) > 0 else None,
+                        "test_end": cal_test[-1].date().isoformat() if len(cal_test) > 0 else None,
+                        "best_candidate": None,
+                        "train_metrics": None,
+                        "oos_metrics": None,
+                        "skipped": True,
+                        "reason": "rejected_by_threshold",
+                    }
+                    all_window_results.append(window_result)
                     continue
                 return {
                     "status": "rejected_by_threshold",
                     "min_sharpe": min_sharpe,
                     "best": best_row,
                     "output_dir": str(out.resolve()),
-                    "window": {"start": window_start.date().isoformat(), "end": window_end.date().isoformat()},
+                    "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
                     "universe_size": len(symbols),
                     "candidates": len(rows),
                 }
@@ -1621,6 +1659,20 @@ def optimize_config(
             if require_oos and m_oos is None:
                 logger.warning("{}Optimizer rejected: OOS metrics required (BYBIT_OPT_REQUIRE_OOS=1) but were unavailable.", window_prefix)
                 if wf_enabled:
+                    # Collect result and continue to next window
+                    window_result = {
+                        "window_idx": window_idx,
+                        "train_start": cal_train[0].date().isoformat(),
+                        "train_end": cal_train[-1].date().isoformat(),
+                        "test_start": cal_test[0].date().isoformat() if len(cal_test) > 0 else None,
+                        "test_end": cal_test[-1].date().isoformat() if len(cal_test) > 0 else None,
+                        "best_candidate": None,
+                        "train_metrics": None,
+                        "oos_metrics": None,
+                        "skipped": True,
+                        "reason": "rejected_by_threshold",
+                    }
+                    all_window_results.append(window_result)
                     continue
                 return {
                     "status": "rejected_by_oos_threshold",
@@ -1628,7 +1680,7 @@ def optimize_config(
                     "min_oos_sharpe": min_oos_sharpe,
                     "min_oos_cagr": min_oos_cagr,
                     "output_dir": str(out.resolve()),
-                    "window": {"start": window_start.date().isoformat(), "end": window_end.date().isoformat()},
+                    "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
                     "universe_size": len(symbols),
                     "candidates": len(rows),
                 }
@@ -1654,7 +1706,7 @@ def optimize_config(
                         "oos_sharpe": oos_sh,
                         "oos_cagr": oos_cg,
                         "output_dir": str(out.resolve()),
-                        "window": {"start": window_start.date().isoformat(), "end": window_end.date().isoformat()},
+                        "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
                         "universe_size": len(symbols),
                         "candidates": len(rows),
                     }
@@ -1716,7 +1768,7 @@ def optimize_config(
                     "best": best_row,
                     "oos": oos_metrics,
                     "output_dir": str(out.resolve()),
-                    "window": {"start": window_start.date().isoformat(), "end": window_end.date().isoformat()},
+                    "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
                     "universe_size": len(symbols),
                     "candidates": len(rows),
                     "evaluated": len(candidates_list),
