@@ -804,19 +804,19 @@ def optimize_config(
                 close_train = close
 
             # Stage1 feasibility gates (used only for the fast screening model).
-        # These can be overridden via env vars to avoid rejecting every candidate due to overly strict constraints.
-        # - BYBIT_OPT_STAGE1_MAX_DD_PCT: e.g. "50" means allow up to 50% drawdown in stage1 screen
-        # - BYBIT_OPT_STAGE1_MAX_TURNOVER: e.g. "10" means allow avg daily turnover up to 10 (weight-space)
-        dd_env = os.getenv("BYBIT_OPT_STAGE1_MAX_DD_PCT", "").strip()
-        to_env = os.getenv("BYBIT_OPT_STAGE1_MAX_TURNOVER", "").strip()
-        try:
-            stage1_max_dd = float(dd_env) / 100.0 if dd_env else float(cfg.risk.max_drawdown_pct) / 100.0
-        except Exception:
-            stage1_max_dd = float(cfg.risk.max_drawdown_pct) / 100.0
-        try:
-            stage1_max_turnover = float(to_env) if to_env else float(cfg.risk.max_turnover)
-        except Exception:
-            stage1_max_turnover = float(cfg.risk.max_turnover)
+            # These can be overridden via env vars to avoid rejecting every candidate due to overly strict constraints.
+            # - BYBIT_OPT_STAGE1_MAX_DD_PCT: e.g. "50" means allow up to 50% drawdown in stage1 screen
+            # - BYBIT_OPT_STAGE1_MAX_TURNOVER: e.g. "10" means allow avg daily turnover up to 10 (weight-space)
+            dd_env = os.getenv("BYBIT_OPT_STAGE1_MAX_DD_PCT", "").strip()
+            to_env = os.getenv("BYBIT_OPT_STAGE1_MAX_TURNOVER", "").strip()
+            try:
+                stage1_max_dd = float(dd_env) / 100.0 if dd_env else float(cfg.risk.max_drawdown_pct) / 100.0
+            except Exception:
+                stage1_max_dd = float(cfg.risk.max_drawdown_pct) / 100.0
+            try:
+                stage1_max_turnover = float(to_env) if to_env else float(cfg.risk.max_turnover)
+            except Exception:
+                stage1_max_turnover = float(cfg.risk.max_turnover)
             logger.info(
                 "{}Stage1 feasibility gates: max_dd_limit={:.2%} max_turnover={:.3f} (env overrides: BYBIT_OPT_STAGE1_MAX_DD_PCT={}, BYBIT_OPT_STAGE1_MAX_TURNOVER={})",
                 window_prefix,
@@ -1053,6 +1053,9 @@ def optimize_config(
             out.mkdir(parents=True, exist_ok=True)
             (out / "stage1_results.json").write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
 
+            # Flag to skip rest of iteration if we need to continue to next window
+            skip_window = False
+            
             if best is None:
                 # Helpful diagnostics
                 if close_train is None or getattr(close_train, "empty", False):
@@ -1087,9 +1090,7 @@ def optimize_config(
                         "reason": "no_feasible_candidates",
                     }
                     all_window_results.append(window_result)
-                    # Continue to next window in walk-forward analysis
-                    # This continue is inside the for window_idx loop
-                    continue
+                    skip_window = True
                 else:
                     # For single window, return error
                     return {
@@ -1099,6 +1100,9 @@ def optimize_config(
                         "universe_size": len(symbols),
                         "candidates": len(rows),
                     }
+            
+            if skip_window:
+                continue
 
             best_cand, best_row = best
 
@@ -1129,15 +1133,19 @@ def optimize_config(
                         "reason": "no_feasible_candidates_after_stage1",
                     }
                     all_window_results.append(window_result)
-                    continue
-                return {
-                    "status": "no_feasible_candidate",
-                    "output_dir": str(out.resolve()),
-                    "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
-                    "universe_size": len(symbols),
-                    "candidates": len(rows),
-                    "feasible": 0,
-                }
+                    skip_window = True
+                else:
+                    return {
+                        "status": "no_feasible_candidate",
+                        "output_dir": str(out.resolve()),
+                        "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
+                        "universe_size": len(symbols),
+                        "candidates": len(rows),
+                        "feasible": 0,
+                    }
+            
+            if skip_window:
+                continue
 
             k2 = int(stage2_topk) if stage2_topk is not None else _level_to_stage2_topk(level)
             k2 = min(k2, len(feasible))  # Don't exceed available feasible candidates
@@ -1158,15 +1166,19 @@ def optimize_config(
                         "reason": "k2_zero",
                     }
                     all_window_results.append(window_result)
-                    continue
-                return {
-                    "status": "no_feasible_candidate",
-                    "output_dir": str(out.resolve()),
-                    "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
-                    "universe_size": len(symbols),
-                    "candidates": len(rows),
-                    "feasible": len(feasible),
-                }
+                    skip_window = True
+                else:
+                    return {
+                        "status": "no_feasible_candidate",
+                        "output_dir": str(out.resolve()),
+                        "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
+                        "universe_size": len(symbols),
+                        "candidates": len(rows),
+                        "feasible": len(feasible),
+                    }
+            
+            if skip_window:
+                continue
             stage2_candidates = [Candidate(**feasible[i]["candidate"]) for i in range(k2)]
 
             stage2_rows: list[dict[str, Any]] = []
@@ -1625,16 +1637,20 @@ def optimize_config(
                         "reason": "rejected_by_threshold",
                     }
                     all_window_results.append(window_result)
-                    continue
-                return {
-                    "status": "rejected_by_threshold",
-                    "min_sharpe": min_sharpe,
-                    "best": best_row,
-                    "output_dir": str(out.resolve()),
-                    "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
-                    "universe_size": len(symbols),
-                    "candidates": len(rows),
-                }
+                    skip_window = True
+                else:
+                    return {
+                        "status": "rejected_by_threshold",
+                        "min_sharpe": min_sharpe,
+                        "best": best_row,
+                        "output_dir": str(out.resolve()),
+                        "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
+                        "universe_size": len(symbols),
+                        "candidates": len(rows),
+                    }
+            
+            if skip_window:
+                continue
 
             # Optional: OOS profitability gate (recommended when you want the optimizer to only "accept" configs
             # that are profitable out-of-sample).
@@ -1673,17 +1689,21 @@ def optimize_config(
                         "reason": "rejected_by_threshold",
                     }
                     all_window_results.append(window_result)
-                    continue
-                return {
-                    "status": "rejected_by_oos_threshold",
-                    "reason": "oos_metrics_unavailable",
-                    "min_oos_sharpe": min_oos_sharpe,
-                    "min_oos_cagr": min_oos_cagr,
-                    "output_dir": str(out.resolve()),
-                    "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
-                    "universe_size": len(symbols),
-                    "candidates": len(rows),
-                }
+                    skip_window = True
+                else:
+                    return {
+                        "status": "rejected_by_oos_threshold",
+                        "reason": "oos_metrics_unavailable",
+                        "min_oos_sharpe": min_oos_sharpe,
+                        "min_oos_cagr": min_oos_cagr,
+                        "output_dir": str(out.resolve()),
+                        "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
+                        "universe_size": len(symbols),
+                        "candidates": len(rows),
+                    }
+            
+            if skip_window:
+                continue
 
             if require_oos and m_oos is not None:
                 oos_sh = float(m_oos.sharpe)
@@ -1698,18 +1718,35 @@ def optimize_config(
                         min_oos_cagr,
                     )
                     if wf_enabled:
-                        continue
-                    return {
-                        "status": "rejected_by_oos_threshold",
-                        "min_oos_sharpe": min_oos_sharpe,
-                        "min_oos_cagr": min_oos_cagr,
-                        "oos_sharpe": oos_sh,
-                        "oos_cagr": oos_cg,
-                        "output_dir": str(out.resolve()),
-                        "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
-                        "universe_size": len(symbols),
-                        "candidates": len(rows),
-                    }
+                        window_result = {
+                            "window_idx": window_idx,
+                            "train_start": cal_train[0].date().isoformat(),
+                            "train_end": cal_train[-1].date().isoformat(),
+                            "test_start": cal_test[0].date().isoformat() if len(cal_test) > 0 else None,
+                            "test_end": cal_test[-1].date().isoformat() if len(cal_test) > 0 else None,
+                            "best_candidate": None,
+                            "train_metrics": None,
+                            "oos_metrics": None,
+                            "skipped": True,
+                            "reason": "rejected_by_oos_threshold",
+                        }
+                        all_window_results.append(window_result)
+                        skip_window = True
+                    else:
+                        return {
+                            "status": "rejected_by_oos_threshold",
+                            "min_oos_sharpe": min_oos_sharpe,
+                            "min_oos_cagr": min_oos_cagr,
+                            "oos_sharpe": oos_sh,
+                            "oos_cagr": oos_cg,
+                            "output_dir": str(out.resolve()),
+                            "window": {"start": start.date().isoformat(), "end": end.date().isoformat()},
+                            "universe_size": len(symbols),
+                            "candidates": len(rows),
+                        }
+            
+            if skip_window:
+                continue
 
             # Collect window result for walk-forward aggregation
             window_result = {
