@@ -62,7 +62,7 @@ execution:
   price_offset_bps: 2.0
   ioc_fallback: true
   bump_to_min_qty: false
-  cancel_open_orders: symbols
+  cancel_open_orders: "symbols"
 risk:
   daily_loss_limit_pct: 2.5
   max_drawdown_pct: 20.0
