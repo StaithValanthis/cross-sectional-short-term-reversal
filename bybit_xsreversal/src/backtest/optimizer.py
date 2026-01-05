@@ -1755,7 +1755,7 @@ def optimize_config(
                 "train_end": cal_train[-1].date().isoformat(),
                 "test_start": cal_test[0].date().isoformat() if len(cal_test) > 0 else None,
                 "test_end": cal_test[-1].date().isoformat() if len(cal_test) > 0 else None,
-                "best_candidate": best_cand.__dict__,
+                "best_candidate": best_cand.__dict__ if best_cand is not None else None,
                 "train_metrics": best_row,
                 "oos_metrics": oos_metrics,
             }
@@ -1820,7 +1820,10 @@ def optimize_config(
             # Count how many times each candidate appears (robustness metric)
             candidate_counts: dict[tuple, list[dict[str, Any]]] = {}
             for wr in all_window_results:
-                cand_dict = wr["best_candidate"]
+                cand_dict = wr.get("best_candidate")
+                # Skip windows that were skipped or had no best candidate
+                if cand_dict is None:
+                    continue
                 # Create a hashable key from candidate params
                 cand_key = (
                     cand_dict.get("lookback_days"),
@@ -1927,11 +1930,22 @@ def optimize_config(
                 }
                 (out / "walkforward_summary.json").write_text(json.dumps(wf_summary, indent=2, sort_keys=True), encoding="utf-8")
             else:
-                logger.warning("Walk-forward: No valid candidates with OOS metrics across windows. Using last window result.")
-                best_window_result = all_window_results[-1]
-                best_cand = Candidate(**best_window_result["best_candidate"])
-                best_row = best_window_result["train_metrics"]
-                oos_metrics = best_window_result["oos_metrics"]
+                logger.warning("Walk-forward: No valid candidates with OOS metrics across windows.")
+                # Find the last window with a valid candidate
+                best_window_result = None
+                for wr in reversed(all_window_results):
+                    if wr.get("best_candidate") is not None:
+                        best_window_result = wr
+                        break
+                
+                if best_window_result is not None:
+                    best_cand = Candidate(**best_window_result["best_candidate"])
+                    best_row = best_window_result.get("train_metrics")
+                    oos_metrics = best_window_result.get("oos_metrics")
+                else:
+                    logger.error("Walk-forward: No windows produced valid candidates. Cannot select best candidate.")
+                    # Fall back to single-window behavior (will use best_cand from last window loop iteration)
+                    pass
             
             # Write final config
             if write_config:
