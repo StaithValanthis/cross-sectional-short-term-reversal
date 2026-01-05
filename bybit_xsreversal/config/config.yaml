@@ -16,21 +16,21 @@ universe:
     min_rank: 1
     max_rank: 9999
 signal:
-  lookback_days: 3
-  long_quantile: 0.24
-  short_quantile: 0.24
+  lookback_days: 1
+  long_quantile: 0.2
+  short_quantile: 0.2
   long_only: false
 rebalance:
   frequency: daily
   time_utc: 00:05
   candle_close_delay_seconds: 30
   startup_grace_seconds: 300
-  interval_days: 1
-  rebalance_fraction: 1.0
-  min_weight_change_bps: 5.0
+  interval_days: 3
+  rebalance_fraction: 0.36
+  min_weight_change_bps: 0.0
 sizing:
-  target_gross_leverage: 1.21
-  vol_lookback_days: 21
+  target_gross_leverage: 0.92
+  vol_lookback_days: 14
   max_leverage_per_symbol: 0.2
   max_notional_per_symbol: 25000.0
   min_notional_per_symbol: 5.0
@@ -46,13 +46,13 @@ filters:
     symbol_adx_threshold: 30.0
     ema_fast: 20
     ema_slow: 50
-    action: scale_down
+    action: switch_to_momentum
     scale_factor: 0.35
 funding:
   model_in_backtest: true
   filter:
     enabled: false
-    max_abs_daily_funding_rate: 0.003
+    max_abs_daily_funding_rate: 0.002
     use_mainnet_data_even_on_testnet: true
 execution:
   order_type: limit
