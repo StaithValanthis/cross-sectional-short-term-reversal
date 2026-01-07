@@ -275,16 +275,56 @@ def plan_rebalance_orders(
         # Skip to avoid churn (flatten now, reopen next rebalance).
         if min_qty > 0:
             reduce_only_candidate = (cur_size > 0 and delta < 0) or (cur_size < 0 and delta > 0)
-            if reduce_only_candidate and abs(delta) < min_qty:
-                logger.info(
-                    "Skipping {}: reduce-only trim below minQty (delta_qty={:.6g} < minQty={:.6g}). cur_qty={:.6g} tgt_qty={:.6g}",
-                    sym,
-                    float(delta),
-                    float(min_qty),
-                    float(cur_size),
-                    float(tgt_size),
-                )
-                continue
+            if reduce_only_candidate:
+                if abs(delta) < min_qty:
+                    logger.info(
+                        "Skipping {}: reduce-only trim below minQty (delta_qty={:.6g} < minQty={:.6g}). cur_qty={:.6g} tgt_qty={:.6g}",
+                        sym,
+                        float(delta),
+                        float(min_qty),
+                        float(cur_size),
+                        float(tgt_size),
+                    )
+                    continue
+                
+                # CRITICAL: Check if remaining position size after reduction meets minimum requirements
+                # If reducing would leave a position that's > 0 but < minQty, we need to either:
+                # 1. Close the entire position (reduce to zero), OR
+                # 2. Skip the reduction
+                remaining_size = abs(tgt_size)
+                if remaining_size > 0 and remaining_size < min_qty:
+                    # Remaining position would be below minimum - close entire position instead
+                    logger.info(
+                        "Adjusting {}: reduction would leave position below minQty (remaining={:.6g} < minQty={:.6g}). Closing entire position instead. cur_qty={:.6g}",
+                        sym,
+                        remaining_size,
+                        float(min_qty),
+                        float(cur_size),
+                    )
+                    # Set target to zero to close the entire position
+                    tgt_size = 0.0
+                    delta = tgt_size - cur_size
+                    # Recalculate abs_delta_notional for the new delta
+                    abs_delta_notional = abs(delta * px)
+                
+                # Also check if target position meets minimum notional requirement
+                # If target is non-zero but below min_notional, we should close the position
+                if abs(tgt_size) > 0:
+                    tgt_notional_check = abs(tgt_size * px)
+                    min_notional = float(cfg.sizing.min_notional_per_symbol)
+                    if tgt_notional_check < min_notional:
+                        logger.info(
+                            "Adjusting {}: target position would be below min_notional (${:.2f} < ${:.2f}). Closing entire position instead. cur_qty={:.6g} tgt_qty={:.6g}",
+                            sym,
+                            tgt_notional_check,
+                            min_notional,
+                            float(cur_size),
+                            float(tgt_size),
+                        )
+                        # Set target to zero to close the entire position
+                        tgt_size = 0.0
+                        delta = tgt_size - cur_size
+                        abs_delta_notional = abs(delta * px)
 
         # Determine if sign flip needed.
         # In ONE-WAY mode (required by this bot), the cleanest approach is to place a single "cross" order
