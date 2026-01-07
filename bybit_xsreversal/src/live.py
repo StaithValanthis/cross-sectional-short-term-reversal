@@ -87,8 +87,8 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                 logger.warning("Rebalance lock is held by another process; skipping this run to avoid duplicate orders.")
                 return
             try:
-            # small delay to ensure daily candle is finalized
-            time.sleep(max(0, int(cfg.rebalance.candle_close_delay_seconds)))
+                # small delay to ensure daily candle is finalized
+                time.sleep(max(0, int(cfg.rebalance.candle_close_delay_seconds)))
 
             rb_now = now_utc()  # use current wall time after delay
             close_ts = last_complete_daily_close(rb_now, cfg.rebalance.candle_close_delay_seconds)
@@ -104,11 +104,11 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                     if last:
                         last_dt = datetime.fromisoformat(last).replace(tzinfo=UTC)
                         if (asof_bar.date() - last_dt.date()).days < interval_days:
-                                logger.info(
-                                    "Skipping rebalance due to interval_days={} (last={})",
-                                    interval_days,
-                                    last_dt.date().isoformat(),
-                                )
+                            logger.info(
+                                "Skipping rebalance due to interval_days={} (last={})",
+                                interval_days,
+                                last_dt.date().isoformat(),
+                            )
                             return
                 except Exception as e:
                     logger.warning("Failed to parse rebalance_state.json: {}", e)
@@ -119,9 +119,9 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
             micro_meta: dict[str, Any] = {}
             for s in symbols:
                 try:
-                        ok_ms, info = md.passes_microstructure_filters(s)
+                    ok_ms, info = md.passes_microstructure_filters(s)
                     micro_meta[s] = info
-                        if ok_ms:
+                    if ok_ms:
                         passed.append(s)
                 except Exception as e:
                     micro_meta[s] = {"error": str(e)}
@@ -167,8 +167,8 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
             if float(equity) <= 0.0:
                 logger.error("Equity is <= 0 USDT; cannot size trades. Skipping rebalance.")
                 return
-                ok_risk, risk_info = risk.check(equity)
-                if not ok_risk:
+            ok_risk, risk_info = risk.check(equity)
+            if not ok_risk:
                 logger.error("Risk kill-switch active; skipping trades: {}", risk_info)
                 return
 
@@ -288,26 +288,26 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
 
             if not targets.notionals_usd:
                 logger.warning(
-                        "No target notionals produced (empty target book). Will still reconcile existing positions. See snapshot: {}",
+                    "No target notionals produced (empty target book). Will still reconcile existing positions. See snapshot: {}",
                     snap_path.resolve(),
                 )
-                    # Always reconcile positions even when target book is empty (close positions not in targets)
-                    # This ensures the portfolio matches the strategy's intent (flat when no signals)
+                # Always reconcile positions even when target book is empty (close positions not in targets)
+                # This ensures the portfolio matches the strategy's intent (flat when no signals)
 
-                try:
-            res = run_rebalance(cfg=cfg, client=client, md=md, target_notionals=targets.notionals_usd, dry_run=dry_run)
-            (out_dir / "execution_result.json").write_bytes(orjson.dumps(res, option=orjson.OPT_INDENT_2))
-            logger.info("Rebalance done. Result saved to {}", (out_dir / "execution_result.json").resolve())
-                except Exception as e:
-                    logger.exception("Rebalance execution failed (continuing scheduler): {}", e)
-                    return
+            try:
+                res = run_rebalance(cfg=cfg, client=client, md=md, target_notionals=targets.notionals_usd, dry_run=dry_run)
+                (out_dir / "execution_result.json").write_bytes(orjson.dumps(res, option=orjson.OPT_INDENT_2))
+                logger.info("Rebalance done. Result saved to {}", (out_dir / "execution_result.json").resolve())
+            except Exception as e:
+                logger.exception("Rebalance execution failed (continuing scheduler): {}", e)
+                return
 
             # Update rebalance state
             try:
                 state_path.parent.mkdir(parents=True, exist_ok=True)
-                    state_path.write_bytes(
-                        orjson.dumps({"last_rebalance_day": asof_bar.date().isoformat()}, option=orjson.OPT_INDENT_2)
-                    )
+                state_path.write_bytes(
+                    orjson.dumps({"last_rebalance_day": asof_bar.date().isoformat()}, option=orjson.OPT_INDENT_2)
+                )
             except Exception as e:
                 logger.warning("Failed to write rebalance_state.json: {}", e)
             finally:
