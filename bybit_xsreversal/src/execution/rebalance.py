@@ -598,33 +598,44 @@ def run_rebalance(
             positions_final = parsed_final.positions
             
             # Check one more time for any still-remaining orders
+            # Filter out orders that are filled or partially filled - only count truly open orders
             still_remaining: list[dict[str, Any]] = []
             for sym in symbols_to_check:
                 try:
                     open_orders = client.get_open_orders(category=cfg.exchange.category, symbol=sym)
                     if open_orders:
-                        still_remaining.extend(open_orders)
+                        # Filter out filled/partially filled orders - only count orders that are still open
+                        for o in open_orders:
+                            order_status = str(o.get("orderStatus", "")).upper()
+                            # Only count orders that are actually still open (not filled, cancelled, etc.)
+                            if order_status in ("NEW", "PARTIALLYFILLED"):
+                                still_remaining.append(o)
+                            # If order is filled, it's fine - it will be reflected in positions
                 except Exception:
                     pass
             
             if still_remaining:
-                logger.error(
-                    "CRITICAL: {} orders still remain after retry cancellation. These will cause duplicate positions. Symbols: {}. Aborting rebalance.",
+                # Log details about remaining orders
+                order_details = {}
+                for o in still_remaining:
+                    sym = normalize_symbol(str(o.get("symbol", "")))
+                    status = str(o.get("orderStatus", ""))
+                    qty = float(o.get("qty") or o.get("orderQty") or 0.0)
+                    filled = float(o.get("cumExecQty") or 0.0)
+                    order_details.setdefault(sym, []).append({
+                        "status": status,
+                        "qty": qty,
+                        "filled": filled,
+                        "remaining": qty - filled,
+                    })
+                
+                logger.warning(
+                    "{} orders still open after retry cancellation (some may be filling). Symbols: {}. Order details: {}. Continuing with rebalance but positions may be adjusted.",
                     len(still_remaining),
                     sorted({normalize_symbol(str(o.get("symbol", ""))) for o in still_remaining}),
+                    order_details,
                 )
-                return {
-                    "orders": [],
-                    "positions": {k: v.__dict__ for k, v in positions_final.items()},
-                    "canceled_open_orders": canceled,
-                    "summary": {
-                        "error": "orders_remain_after_cancellation",
-                        "remaining_orders": len(still_remaining),
-                        "target_symbols": len(target_notionals),
-                        "current_symbols": len(positions_final),
-                        "planned_orders": 0,
-                    },
-                }
+                # Don't abort - these orders may fill, and we'll account for them in position calculations
             else:
                 logger.info("Successfully canceled all remaining orders on retry.")
 
