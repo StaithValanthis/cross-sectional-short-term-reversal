@@ -144,13 +144,13 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                     max_abs = float(cfg.funding.filter.max_abs_daily_funding_rate)
                     kept: list[str] = []
                     for s in passed:
-                    try:
-                        fr = md.get_latest_daily_funding_rate(s, force_mainnet=force_mainnet)
-                        funding_meta[s] = {"daily_funding_rate": fr}
-                        if fr is None or abs(float(fr)) <= max_abs:
-                            kept.append(s)
-                    except Exception as e:
-                        funding_meta[s] = {"error": str(e)}
+                        try:
+                            fr = md.get_latest_daily_funding_rate(s, force_mainnet=force_mainnet)
+                            funding_meta[s] = {"daily_funding_rate": fr}
+                            if fr is None or abs(float(fr)) <= max_abs:
+                                kept.append(s)
+                        except Exception as e:
+                            funding_meta[s] = {"error": str(e)}
                     passed = kept
 
                 if len(passed) < 5:
