@@ -200,9 +200,38 @@ def plan_rebalance_orders(
         # Delta in base qty
         delta = tgt_size - cur_size
         
-        # Filter small deltas, BUT always allow closing positions (even if small) to ensure reconciliation
-        is_closing_position = (cur_size != 0.0 and tgt_size == 0.0)
-        if not is_closing_position and abs(delta * px) < float(cfg.sizing.min_notional_per_symbol):
+        # Skip if position is already at target (within tolerance)
+        # This prevents unnecessary orders when the position is already correct
+        abs_delta_notional = abs(delta * px)
+        
+        # Calculate relative delta (percentage of target)
+        if abs(tgt_size) > 1e-8:
+            rel_delta_pct = abs(delta / tgt_size)
+        elif abs(cur_size) < 1e-8:
+            # Both current and target are zero - already at target
+            rel_delta_pct = 0.0
+        else:
+            # Target is zero but current is not - this is a closing position
+            rel_delta_pct = 1.0
+        
+        # Skip if already at target: either absolute delta is tiny OR relative delta is tiny (< 0.1%)
+        # BUT always allow closing positions (even if small) to ensure reconciliation
+        is_closing_position = (abs(cur_size) > 1e-8 and abs(tgt_size) < 1e-8)
+        is_already_at_target = (
+            abs_delta_notional < float(cfg.sizing.min_notional_per_symbol) or 
+            (abs(tgt_size) > 1e-8 and rel_delta_pct < 0.001)  # 0.1% tolerance for non-zero targets
+        )
+        
+        if not is_closing_position and is_already_at_target:
+            logger.debug(
+                "Skipping {}: already at target (cur={:.6g}, tgt={:.6g}, delta={:.6g}, delta_notional=${:.2f}, rel_delta={:.2%})",
+                sym,
+                cur_size,
+                tgt_size,
+                delta,
+                abs_delta_notional,
+                rel_delta_pct,
+            )
             continue
 
         # If this is a reduce-only trim and the delta is below minQty, we can't execute it without over-closing.
@@ -367,11 +396,67 @@ def run_rebalance(
 
     if canceled:
         logger.info("Canceled {} open orders (mode={}).", len(canceled), mode)
+        # Brief pause to allow exchange to reflect cancellations before re-fetching positions
+        time.sleep(0.2)
 
-    raw_pos = raw_pos0
+    # Re-fetch positions after canceling orders to get current state (in case any pending orders filled)
+    raw_pos = client.get_positions(category=cfg.exchange.category, settle_coin="USDT")
     parsed = _parse_positions(raw_pos)
     positions = parsed.positions
 
+    # Adjust positions to account for any remaining open orders (pending fills)
+    # This prevents over-sizing when orders from previous rebalances are still pending
+    symbols_in_play_adjusted = {normalize_symbol(s) for s in (set(positions) | set(target_notionals))}
+    pending_order_adjustments: dict[str, float] = {}
+    for sym in symbols_in_play_adjusted:
+        try:
+            open_orders = client.get_open_orders(category=cfg.exchange.category, symbol=sym)
+            if not open_orders:
+                continue
+            # Sum pending order quantities (positive for buys, negative for sells)
+            pending_qty = 0.0
+            for o in open_orders:
+                side = str(o.get("side", "")).upper()
+                qty = float(o.get("qty") or o.get("orderQty") or 0.0)
+                if side == "BUY":
+                    pending_qty += qty
+                elif side == "SELL":
+                    pending_qty -= qty
+            if abs(pending_qty) > 1e-8:
+                pending_order_adjustments[sym] = pending_qty
+                logger.debug(
+                    "{} has pending orders: {:.6g} qty (will adjust position from {:.6g})",
+                    sym,
+                    pending_qty,
+                    float(positions.get(sym).size) if sym in positions else 0.0,
+                )
+        except Exception as e:
+            logger.warning("Failed to check open orders for {}: {}", sym, e)
+
+    # Apply pending order adjustments to positions
+    if pending_order_adjustments:
+        adjusted_positions: dict[str, Position] = {}
+        for sym, pos in positions.items():
+            adj = pending_order_adjustments.get(sym, 0.0)
+            adjusted_positions[sym] = Position(symbol=sym, size=float(pos.size) + adj, mark_price=pos.mark_price)
+        # Also create entries for symbols with pending orders but no current position
+        for sym, adj in pending_order_adjustments.items():
+            if sym not in adjusted_positions:
+                # Need mark price for new position - use orderbook or 0
+                try:
+                    ob = md.get_orderbook_stats(sym)
+                    mark = float(ob.mid)
+                except Exception:
+                    mark = 0.0
+                adjusted_positions[sym] = Position(symbol=sym, size=adj, mark_price=mark)
+        positions = adjusted_positions
+        logger.info(
+            "Adjusted positions for {} symbols with pending orders: {}",
+            len(pending_order_adjustments),
+            sorted(pending_order_adjustments.keys()),
+        )
+
+    # Check for hedge mode (check initial parse, will check final parse later)
     if parsed.hedge_mode_symbols:
         logger.error(
             "Detected hedge-mode positions (positionIdx=1/2). This bot currently requires ONE-WAY mode. "
@@ -386,7 +471,7 @@ def run_rebalance(
             "summary": {
                 "error": "hedge_mode_not_supported",
                 "target_symbols": len(target_notionals),
-                "current_symbols": len(positions),
+                "current_symbols": len(positions_final),
                 "planned_orders": 0,
             },
         }
@@ -397,8 +482,66 @@ def run_rebalance(
     except Exception:
         equity_exec = None
     ex = Executor(client=client, md=md, cfg=cfg, dry_run=dry_run, equity_usdt=equity_exec)
-    orders = plan_rebalance_orders(cfg=cfg, md=md, current_positions=positions, target_notionals=target_notionals)
-    reconcile_top = _summarize_reconcile(positions=positions, target_notionals=target_notionals, md=md, limit=12)
+    # Final position re-fetch right before planning to catch any fills that happened during cancellation/adjustment
+    # This ensures we're using the absolute latest position data
+    raw_pos_final = client.get_positions(category=cfg.exchange.category, settle_coin="USDT")
+    parsed_final = _parse_positions(raw_pos_final)
+    positions_final = parsed_final.positions
+    
+    # Check for hedge mode in final fetch as well
+    if parsed_final.hedge_mode_symbols:
+        logger.error(
+            "Detected hedge-mode positions (positionIdx=1/2) in final position fetch. This bot currently requires ONE-WAY mode. "
+            "Hedge symbols: {}",
+            sorted(parsed_final.hedge_mode_symbols.keys()),
+        )
+        return {
+            "orders": [],
+            "positions": {k: v.__dict__ for k, v in positions_final.items()},
+            "hedge_mode_symbols": parsed_final.hedge_mode_symbols,
+            "canceled_open_orders": canceled,
+            "summary": {
+                "error": "hedge_mode_not_supported",
+                "target_symbols": len(target_notionals),
+                "current_symbols": len(positions_final),
+                "planned_orders": 0,
+            },
+        }
+    
+    # Log if positions changed between adjustment and final fetch (indicates rapid fills)
+    if pending_order_adjustments:
+        for sym in set(positions) | set(positions_final):
+            old_size = float(positions.get(sym).size) if sym in positions else 0.0
+            new_size = float(positions_final.get(sym).size) if sym in positions_final else 0.0
+            if abs(new_size - old_size) > 1e-6:
+                logger.info(
+                    "Position changed for {}: {:.6g} -> {:.6g} (likely filled during cancellation/adjustment)",
+                    sym,
+                    old_size,
+                    new_size,
+                )
+    
+    # Verify no open orders remain for symbols we're about to trade (safety check)
+    if mode in ("symbols", "all"):
+        symbols_to_check = {normalize_symbol(s) for s in (set(positions_final) | set(target_notionals))}
+        remaining_orders: list[dict[str, Any]] = []
+        for sym in symbols_to_check:
+            try:
+                open_orders = client.get_open_orders(category=cfg.exchange.category, symbol=sym)
+                if open_orders:
+                    remaining_orders.extend(open_orders)
+            except Exception:
+                pass
+        if remaining_orders:
+            logger.warning(
+                "Found {} remaining open orders after cancellation (mode={}). This may cause duplicate orders. Symbols: {}",
+                len(remaining_orders),
+                mode,
+                sorted({normalize_symbol(str(o.get("symbol", ""))) for o in remaining_orders}),
+            )
+
+    orders = plan_rebalance_orders(cfg=cfg, md=md, current_positions=positions_final, target_notionals=target_notionals)
+    reconcile_top = _summarize_reconcile(positions=positions_final, target_notionals=target_notionals, md=md, limit=12)
     if reconcile_top:
         logger.info("Reconcile (top diffs): {}", reconcile_top)
 
@@ -410,10 +553,10 @@ def run_rebalance(
         )
         return {
             "orders": [],
-            "positions": {k: v.__dict__ for k, v in positions.items()},
+            "positions": {k: v.__dict__ for k, v in positions_final.items()},
             "reconcile_top": reconcile_top,
             "canceled_open_orders": canceled,
-            "summary": {"target_symbols": len(target_notionals), "current_symbols": len(positions), "planned_orders": 0},
+            "summary": {"target_symbols": len(target_notionals), "current_symbols": len(positions_final), "planned_orders": 0},
         }
 
     logger.info("Planned {} orders", len(orders))
@@ -422,10 +565,10 @@ def run_rebalance(
 
     return {
         "orders": [o.__dict__ for o in orders],
-        "positions": {k: v.__dict__ for k, v in positions.items()},
+        "positions": {k: v.__dict__ for k, v in positions_final.items()},
         "reconcile_top": reconcile_top,
         "canceled_open_orders": canceled,
-        "summary": {"target_symbols": len(target_notionals), "current_symbols": len(positions), "planned_orders": len(orders)},
+        "summary": {"target_symbols": len(target_notionals), "current_symbols": len(positions_final), "planned_orders": len(orders)},
     }
 
 
