@@ -98,20 +98,20 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                 # Rebalance interval control (stateful)
                 interval_days = max(1, int(cfg.rebalance.interval_days))
                 if not force and interval_days > 1 and state_path.exists():
-                try:
-                    st = orjson.loads(state_path.read_bytes())
-                    last = st.get("last_rebalance_day")
-                    if last:
-                        last_dt = datetime.fromisoformat(last).replace(tzinfo=UTC)
-                        if (asof_bar.date() - last_dt.date()).days < interval_days:
-                            logger.info(
-                                "Skipping rebalance due to interval_days={} (last={})",
-                                interval_days,
-                                last_dt.date().isoformat(),
-                            )
-                            return
-                except Exception as e:
-                    logger.warning("Failed to parse rebalance_state.json: {}", e)
+                    try:
+                        st = orjson.loads(state_path.read_bytes())
+                        last = st.get("last_rebalance_day")
+                        if last:
+                            last_dt = datetime.fromisoformat(last).replace(tzinfo=UTC)
+                            if (asof_bar.date() - last_dt.date()).days < interval_days:
+                                logger.info(
+                                    "Skipping rebalance due to interval_days={} (last={})",
+                                    interval_days,
+                                    last_dt.date().isoformat(),
+                                )
+                                return
+                    except Exception as e:
+                        logger.warning("Failed to parse rebalance_state.json: {}", e)
 
                 # Universe + microstructure filtering
                 symbols = [normalize_symbol(s) for s in md.get_liquidity_ranked_symbols()]
