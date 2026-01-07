@@ -200,6 +200,43 @@ def plan_rebalance_orders(
         # Delta in base qty
         delta = tgt_size - cur_size
         
+        # CRITICAL: If there's an existing position in the same direction, check if we should skip
+        # This prevents adding to existing positions unless there's a meaningful size change needed
+        same_direction = (cur_size > 0 and tgt_size > 0) or (cur_size < 0 and tgt_size < 0)
+        has_existing_position = abs(cur_size) > 1e-8
+        
+        if has_existing_position and same_direction:
+            # There's an existing position in the same direction - be more conservative
+            abs_delta_notional = abs(delta * px)
+            
+            # Calculate relative delta (percentage of current position size)
+            if abs(cur_size) > 1e-8:
+                rel_delta_pct = abs(delta / cur_size)
+            else:
+                rel_delta_pct = 1.0
+            
+            # Skip if the adjustment is too small (either absolute or relative)
+            # Use a larger tolerance (5%) when there's already a position in the same direction
+            min_meaningful_delta_notional = float(cfg.sizing.min_notional_per_symbol)
+            min_meaningful_rel_delta = 0.05  # 5% - only adjust if size change is > 5%
+            
+            is_meaningful_adjustment = (
+                abs_delta_notional >= min_meaningful_delta_notional and
+                rel_delta_pct >= min_meaningful_rel_delta
+            )
+            
+            if not is_meaningful_adjustment:
+                logger.info(
+                    "Skipping {}: existing position in same direction (cur={:.6g}, tgt={:.6g}, delta={:.6g}, delta_notional=${:.2f}, rel_delta={:.2%}). Adjustment too small.",
+                    sym,
+                    cur_size,
+                    tgt_size,
+                    delta,
+                    abs_delta_notional,
+                    rel_delta_pct,
+                )
+                continue
+        
         # Skip if position is already at target (within tolerance)
         # This prevents unnecessary orders when the position is already correct
         abs_delta_notional = abs(delta * px)
@@ -522,6 +559,7 @@ def run_rebalance(
                 )
     
     # Verify no open orders remain for symbols we're about to trade (safety check)
+    # If orders remain, retry cancellation and re-fetch positions to account for any fills
     if mode in ("symbols", "all"):
         symbols_to_check = {normalize_symbol(s) for s in (set(positions_final) | set(target_notionals))}
         remaining_orders: list[dict[str, Any]] = []
@@ -532,13 +570,107 @@ def run_rebalance(
                     remaining_orders.extend(open_orders)
             except Exception:
                 pass
+        
         if remaining_orders:
             logger.warning(
-                "Found {} remaining open orders after cancellation (mode={}). This may cause duplicate orders. Symbols: {}",
+                "Found {} remaining open orders after cancellation (mode={}). Retrying cancellation. Symbols: {}",
                 len(remaining_orders),
                 mode,
                 sorted({normalize_symbol(str(o.get("symbol", ""))) for o in remaining_orders}),
             )
+            # Retry cancellation for remaining orders
+            for o in remaining_orders:
+                try:
+                    sym = normalize_symbol(str(o.get("symbol", "")))
+                    oid = str(o.get("orderId") or "")
+                    if sym and oid:
+                        client.cancel_order(category=cfg.exchange.category, symbol=sym, order_id=oid)
+                        canceled.append({"symbol": sym, "orderId": oid, "orderLinkId": str(o.get("orderLinkId", ""))})
+                except Exception as e:
+                    logger.warning("Failed to cancel remaining order {}: {}", o.get("orderId"), e)
+            
+            # Wait a moment for cancellations to process
+            time.sleep(0.3)
+            
+            # Re-fetch positions again to account for any orders that filled during the retry
+            raw_pos_final = client.get_positions(category=cfg.exchange.category, settle_coin="USDT")
+            parsed_final = _parse_positions(raw_pos_final)
+            positions_final = parsed_final.positions
+            
+            # Check one more time for any still-remaining orders
+            still_remaining: list[dict[str, Any]] = []
+            for sym in symbols_to_check:
+                try:
+                    open_orders = client.get_open_orders(category=cfg.exchange.category, symbol=sym)
+                    if open_orders:
+                        still_remaining.extend(open_orders)
+                except Exception:
+                    pass
+            
+            if still_remaining:
+                logger.error(
+                    "CRITICAL: {} orders still remain after retry cancellation. These will cause duplicate positions. Symbols: {}. Aborting rebalance.",
+                    len(still_remaining),
+                    sorted({normalize_symbol(str(o.get("symbol", ""))) for o in still_remaining}),
+                )
+                return {
+                    "orders": [],
+                    "positions": {k: v.__dict__ for k, v in positions_final.items()},
+                    "canceled_open_orders": canceled,
+                    "summary": {
+                        "error": "orders_remain_after_cancellation",
+                        "remaining_orders": len(still_remaining),
+                        "target_symbols": len(target_notionals),
+                        "current_symbols": len(positions_final),
+                        "planned_orders": 0,
+                    },
+                }
+            else:
+                logger.info("Successfully canceled all remaining orders on retry.")
+
+    # Final check: account for any pending orders in position calculation (defensive)
+    # This ensures we don't over-size if orders are still pending
+    symbols_final_check = {normalize_symbol(s) for s in (set(positions_final) | set(target_notionals))}
+    pending_qty_by_symbol: dict[str, float] = {}
+    for sym in symbols_final_check:
+        try:
+            open_orders = client.get_open_orders(category=cfg.exchange.category, symbol=sym)
+            if not open_orders:
+                continue
+            pending_qty = 0.0
+            for o in open_orders:
+                side = str(o.get("side", "")).upper()
+                qty = float(o.get("qty") or o.get("orderQty") or 0.0)
+                if side == "BUY":
+                    pending_qty += qty
+                elif side == "SELL":
+                    pending_qty -= qty
+            if abs(pending_qty) > 1e-8:
+                pending_qty_by_symbol[sym] = pending_qty
+        except Exception:
+            pass
+    
+    # Adjust positions to account for pending orders
+    if pending_qty_by_symbol:
+        logger.warning(
+            "Found pending orders for {} symbols after final check. Adjusting position calculations. Symbols: {}",
+            len(pending_qty_by_symbol),
+            sorted(pending_qty_by_symbol.keys()),
+        )
+        adjusted_positions_final: dict[str, Position] = {}
+        for sym, pos in positions_final.items():
+            adj = pending_qty_by_symbol.get(sym, 0.0)
+            adjusted_positions_final[sym] = Position(symbol=sym, size=float(pos.size) + adj, mark_price=pos.mark_price)
+        # Also create entries for symbols with pending orders but no current position
+        for sym, adj in pending_qty_by_symbol.items():
+            if sym not in adjusted_positions_final:
+                try:
+                    ob = md.get_orderbook_stats(sym)
+                    mark = float(ob.mid)
+                except Exception:
+                    mark = 0.0
+                adjusted_positions_final[sym] = Position(symbol=sym, size=adj, mark_price=mark)
+        positions_final = adjusted_positions_final
 
     orders = plan_rebalance_orders(cfg=cfg, md=md, current_positions=positions_final, target_notionals=target_notionals)
     reconcile_top = _summarize_reconcile(positions=positions_final, target_notionals=target_notionals, md=md, limit=12)
