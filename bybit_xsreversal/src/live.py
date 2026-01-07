@@ -118,13 +118,13 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                 passed: list[str] = []
                 micro_meta: dict[str, Any] = {}
                 for s in symbols:
-                try:
-                    ok_ms, info = md.passes_microstructure_filters(s)
-                    micro_meta[s] = info
-                    if ok_ms:
-                        passed.append(s)
-                except Exception as e:
-                    micro_meta[s] = {"error": str(e)}
+                    try:
+                        ok_ms, info = md.passes_microstructure_filters(s)
+                        micro_meta[s] = info
+                        if ok_ms:
+                            passed.append(s)
+                    except Exception as e:
+                        micro_meta[s] = {"error": str(e)}
 
                 if len(passed) < 5:
                     logger.warning("Universe too small after spread/depth filters: {}", len(passed))
@@ -140,10 +140,10 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                 # Funding filter (optional)
                 funding_meta: dict[str, Any] = {}
                 if cfg.funding.filter.enabled:
-                force_mainnet = bool(cfg.funding.filter.use_mainnet_data_even_on_testnet and cfg.exchange.testnet)
-                max_abs = float(cfg.funding.filter.max_abs_daily_funding_rate)
-                kept: list[str] = []
-                for s in passed:
+                    force_mainnet = bool(cfg.funding.filter.use_mainnet_data_even_on_testnet and cfg.exchange.testnet)
+                    max_abs = float(cfg.funding.filter.max_abs_daily_funding_rate)
+                    kept: list[str] = []
+                    for s in passed:
                     try:
                         fr = md.get_latest_daily_funding_rate(s, force_mainnet=force_mainnet)
                         funding_meta[s] = {"daily_funding_rate": fr}
@@ -151,7 +151,7 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                             kept.append(s)
                     except Exception as e:
                         funding_meta[s] = {"error": str(e)}
-                passed = kept
+                    passed = kept
 
                 if len(passed) < 5:
                     logger.warning("Universe too small after funding filter: {}", len(passed))
@@ -175,17 +175,17 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                 # Current weights from positions (for turnover controls)
                 current_weights: dict[str, float] = {}
                 try:
-                positions = client.get_positions(category=cfg.exchange.category, settle_coin="USDT")
-                for p in positions:
-                    sym = normalize_symbol(str(p.get("symbol", "")))
-                    side = str(p.get("side", ""))
-                    size = float(p.get("size") or 0.0)
-                    mark = float(p.get("markPrice") or p.get("avgPrice") or 0.0)
-                    if mark <= 0 or size == 0:
-                        continue
-                    signed = size if side == "Buy" else -size
-                    notional = signed * mark
-                    current_weights[sym] = float(notional) / float(equity) if equity > 0 else 0.0
+                    positions = client.get_positions(category=cfg.exchange.category, settle_coin="USDT")
+                    for p in positions:
+                        sym = normalize_symbol(str(p.get("symbol", "")))
+                        side = str(p.get("side", ""))
+                        size = float(p.get("size") or 0.0)
+                        mark = float(p.get("markPrice") or p.get("avgPrice") or 0.0)
+                        if mark <= 0 or size == 0:
+                            continue
+                        signed = size if side == "Buy" else -size
+                        notional = signed * mark
+                        current_weights[sym] = float(notional) / float(equity) if equity > 0 else 0.0
                 except Exception as e:
                     logger.warning("Failed to compute current weights from positions: {}", e)
 
@@ -212,15 +212,15 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                 candles: dict[str, Any] = {}
                 candle_skip: dict[str, int] = {"load_error": 0, "missing_asof_bar": 0}
                 for s in passed:
-                try:
-                    df = md.get_daily_candles(s, start, end, use_cache=True, cache_write=True)
-                    if asof_bar in df.index:
-                        candles[s] = df
-                    else:
-                        candle_skip["missing_asof_bar"] += 1
-                except Exception as e:
-                    logger.warning("Skipping {}: candle load failed: {}", s, e)
-                    candle_skip["load_error"] += 1
+                    try:
+                        df = md.get_daily_candles(s, start, end, use_cache=True, cache_write=True)
+                        if asof_bar in df.index:
+                            candles[s] = df
+                        else:
+                            candle_skip["missing_asof_bar"] += 1
+                    except Exception as e:
+                        logger.warning("Skipping {}: candle load failed: {}", s, e)
+                        candle_skip["load_error"] += 1
 
                 logger.info(
                     "Candles loaded: {} / {} symbols have required asof_bar={}",
