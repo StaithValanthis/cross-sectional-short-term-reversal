@@ -272,10 +272,13 @@ def plan_rebalance_orders(
             continue
 
         # If this is a reduce-only trim and the delta is below minQty, we can't execute it without over-closing.
-        # Skip to avoid churn (flatten now, reopen next rebalance).
+        # BUT: Always allow full closes (target = 0) regardless of minQty to ensure reconciliation.
+        # Skip to avoid churn (flatten now, reopen next rebalance) only for partial reductions.
         if min_qty > 0:
             reduce_only_candidate = (cur_size > 0 and delta < 0) or (cur_size < 0 and delta > 0)
-            if reduce_only_candidate:
+            is_full_close = abs(tgt_size) < 1e-8  # Target is zero (full close)
+            if reduce_only_candidate and not is_full_close:
+                # This is a partial reduction (not a full close)
                 if abs(delta) < min_qty:
                     logger.info(
                         "Skipping {}: reduce-only trim below minQty (delta_qty={:.6g} < minQty={:.6g}). cur_qty={:.6g} tgt_qty={:.6g}",
