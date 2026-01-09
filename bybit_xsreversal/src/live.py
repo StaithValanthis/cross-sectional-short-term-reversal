@@ -96,6 +96,7 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                 logger.info("Rebalance now={} using last complete daily bar start={}", rb_now.isoformat(), asof_bar.isoformat())
 
                 # Rebalance interval control (stateful)
+                # Use current date (not asof_bar date) for interval check to ensure correct calendar day counting
                 interval_days = max(1, int(cfg.rebalance.interval_days))
                 if not force and interval_days > 1 and state_path.exists():
                     try:
@@ -103,11 +104,14 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                         last = st.get("last_rebalance_day")
                         if last:
                             last_dt = datetime.fromisoformat(last).replace(tzinfo=UTC)
-                            if (asof_bar.date() - last_dt.date()).days < interval_days:
+                            # Use current date (rb_now) for interval check, not asof_bar (which is yesterday's bar)
+                            days_since_last = (rb_now.date() - last_dt.date()).days
+                            if days_since_last < interval_days:
                                 logger.info(
-                                    "Skipping rebalance due to interval_days={} (last={})",
+                                    "Skipping rebalance due to interval_days={} (last={}, days_since={})",
                                     interval_days,
                                     last_dt.date().isoformat(),
+                                    days_since_last,
                                 )
                                 return
                     except Exception as e:

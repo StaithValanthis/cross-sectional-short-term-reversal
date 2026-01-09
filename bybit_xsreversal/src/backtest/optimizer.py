@@ -1896,18 +1896,72 @@ def optimize_config(
                 candidate_scores.sort(key=lambda x: (-x[1], -x[2]))
                 best_key, best_score, best_count, best_window_result = candidate_scores[0]
                 
+                # Calculate actual average OOS metrics across all windows for this candidate
+                best_candidate_windows = candidate_counts[best_key]
+                oos_sharpes = []
+                oos_calmars = []
+                oos_cagrs = []
+                oos_max_dds = []
+                oos_turnovers = []
+                for wr in best_candidate_windows:
+                    oos = wr.get("oos_metrics")
+                    if oos:
+                        if oos.get("sharpe") is not None:
+                            sh = float(oos.get("sharpe", 0.0))
+                            if np.isfinite(sh):
+                                oos_sharpes.append(sh)
+                        if oos.get("calmar") is not None:
+                            cm = float(oos.get("calmar", 0.0))
+                            if np.isfinite(cm):
+                                oos_calmars.append(cm)
+                        if oos.get("cagr") is not None:
+                            cg = float(oos.get("cagr", 0.0))
+                            if np.isfinite(cg):
+                                oos_cagrs.append(cg)
+                        if oos.get("max_drawdown") is not None:
+                            dd = float(oos.get("max_drawdown", 0.0))
+                            if np.isfinite(dd):
+                                oos_max_dds.append(dd)
+                        if oos.get("avg_daily_turnover") is not None:
+                            to = float(oos.get("avg_daily_turnover", 0.0))
+                            if np.isfinite(to):
+                                oos_turnovers.append(to)
+                
+                avg_oos_sharpe = float(np.mean(oos_sharpes)) if oos_sharpes else 0.0
+                avg_oos_calmar = float(np.mean(oos_calmars)) if oos_calmars else 0.0
+                avg_oos_cagr = float(np.mean(oos_cagrs)) if oos_cagrs else 0.0
+                avg_oos_max_dd = float(np.mean(oos_max_dds)) if oos_max_dds else 0.0
+                avg_oos_turnover = float(np.mean(oos_turnovers)) if oos_turnovers else 0.0
+                
                 logger.info(
-                    "Walk-forward best candidate: avg_OOS_Sharpe={:.3f} (appeared in {}/{} windows), params={}",
-                    best_score / (1.0 + 0.1 * (best_count - 1)) if best_count > 1 else best_score,
+                    "Walk-forward best candidate: avg_OOS_Sharpe={:.3f} avg_OOS_CAGR={:.2%} avg_OOS_MaxDD={:.2%} (appeared in {}/{} windows), params={}",
+                    avg_oos_sharpe,
+                    avg_oos_cagr,
+                    avg_oos_max_dd,
                     best_count,
                     len(all_window_results),
                     best_window_result["best_candidate"],
                 )
                 
                 # Update best_cand and best_row for final write
+                # Use OOS metrics for final summary (more representative of future performance)
                 best_cand = Candidate(**best_window_result["best_candidate"])
-                best_row = best_window_result["train_metrics"]
-                oos_metrics = best_window_result["oos_metrics"]
+                # Create a summary row with OOS metrics for final logging
+                best_row = {
+                    "sharpe": avg_oos_sharpe,
+                    "cagr": avg_oos_cagr,
+                    "max_drawdown": avg_oos_max_dd,
+                    "calmar": avg_oos_calmar,
+                    "avg_daily_turnover": avg_oos_turnover,
+                }
+                # Also keep train metrics for reference
+                oos_metrics = {
+                    "sharpe": avg_oos_sharpe,
+                    "cagr": avg_oos_cagr,
+                    "max_drawdown": avg_oos_max_dd,
+                    "calmar": avg_oos_calmar,
+                    "avg_daily_turnover": avg_oos_turnover,
+                }
                 
                 # Save walk-forward summary
                 out = Path(output_dir)
@@ -1931,17 +1985,33 @@ def optimize_config(
                 (out / "walkforward_summary.json").write_text(json.dumps(wf_summary, indent=2, sort_keys=True), encoding="utf-8")
             else:
                 logger.warning("Walk-forward: No valid candidates with OOS metrics across windows.")
-                # Find the last window with a valid candidate
+                # Find the last window with a valid candidate (even if rejected)
                 best_window_result = None
                 for wr in reversed(all_window_results):
-                    if wr.get("best_candidate") is not None:
+                    if wr.get("best_candidate") is not None and wr.get("oos_metrics") is not None:
                         best_window_result = wr
                         break
                 
                 if best_window_result is not None:
                     best_cand = Candidate(**best_window_result["best_candidate"])
-                    best_row = best_window_result.get("train_metrics")
+                    # Use OOS metrics (even if they failed thresholds) - more honest than train metrics
                     oos_metrics = best_window_result.get("oos_metrics")
+                    if oos_metrics:
+                        best_row = {
+                            "sharpe": float(oos_metrics.get("sharpe", 0.0)),
+                            "cagr": float(oos_metrics.get("cagr", 0.0)),
+                            "max_drawdown": float(oos_metrics.get("max_drawdown", 0.0)),
+                            "calmar": float(oos_metrics.get("calmar", 0.0)),
+                            "avg_daily_turnover": float(oos_metrics.get("avg_daily_turnover", 0.0)),
+                        }
+                        logger.warning(
+                            "Using rejected candidate from last window (OOS Sharpe={:.3f}, OOS CAGR={:.2%}). This candidate FAILED OOS validation thresholds and should NOT be used for live trading.",
+                            float(oos_metrics.get("sharpe", 0.0)),
+                            float(oos_metrics.get("cagr", 0.0)),
+                        )
+                    else:
+                        best_row = best_window_result.get("train_metrics")
+                        logger.warning("Using train metrics from last window (OOS metrics unavailable).")
                 else:
                     logger.error("Walk-forward: No windows produced valid candidates. Cannot select best candidate.")
                     # Fall back to single-window behavior (will use best_cand from last window loop iteration)
