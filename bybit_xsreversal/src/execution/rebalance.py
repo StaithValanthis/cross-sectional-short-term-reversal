@@ -164,6 +164,10 @@ def plan_rebalance_orders(
         # Check if this symbol is in target universe
         tgt_notional = float(target_notionals.get(sym, 0.0))
         is_outside_universe = (tgt_notional == 0.0 and abs(cur_size) > 1e-8)
+        
+        # Debug logging for positions outside universe
+        if is_outside_universe:
+            logger.info("DEBUG: Processing position outside universe: {} (cur_size={:.6g}, tgt_notional={:.2f})", sym, cur_size, tgt_notional)
 
         # Price for qty conversion (use orderbook mid)
         # For symbols outside universe, try to use mark price from position as fallback
@@ -294,6 +298,13 @@ def plan_rebalance_orders(
             abs_delta_notional < float(cfg.sizing.min_notional_per_symbol) or 
             (abs(tgt_size) > 1e-8 and rel_delta_pct < 0.001)  # 0.1% tolerance for non-zero targets
         )
+        
+        # Debug logging for closing positions
+        if is_closing_position:
+            logger.info(
+                "DEBUG: Closing position check for {}: cur={:.6g}, tgt={:.6g}, delta={:.6g}, delta_notional=${:.2f}, min_notional=${:.2f}, is_already_at_target={}",
+                sym, cur_size, tgt_size, delta, abs_delta_notional, float(cfg.sizing.min_notional_per_symbol), is_already_at_target
+            )
         
         if not is_closing_position and is_already_at_target:
             logger.debug(
@@ -927,6 +938,9 @@ def run_rebalance(
         except Exception:
             pass
     
+    # Store actual positions BEFORE adjustment (needed for closing positions outside universe)
+    positions_actual = positions_final.copy()
+    
     # Adjust positions to account for pending orders
     if pending_qty_by_symbol:
         logger.warning(
@@ -950,8 +964,10 @@ def run_rebalance(
         positions_final = adjusted_positions_final
 
     # Identify positions outside the target universe (should be closed)
+    # CRITICAL: Use ACTUAL positions (before adjustment) to identify positions that need closing
+    # The adjustment is only for calculating deltas, not for determining if a position exists
     positions_outside_universe: list[tuple[str, float]] = []
-    for sym, pos in positions_final.items():
+    for sym, pos in positions_actual.items():
         tgt_notional = target_notionals.get(sym, 0.0)
         if abs(tgt_notional) < 1e-8 and abs(pos.size) > 1e-8:
             # Position exists but target is zero (outside universe)
@@ -982,7 +998,11 @@ def run_rebalance(
     else:
         logger.info("All open positions match the target universe ({} symbols)", len(positions_final))
 
-    orders = plan_rebalance_orders(cfg=cfg, md=md, current_positions=positions_final, target_notionals=target_notionals)
+    # CRITICAL: For plan_rebalance_orders, use ACTUAL positions (before adjustment) to ensure
+    # positions outside the universe are always identified and closed, regardless of pending orders.
+    # The adjustment is only used for calculating deltas to avoid over-trading, but we need to
+    # use actual positions to determine which positions exist and need to be closed.
+    orders = plan_rebalance_orders(cfg=cfg, md=md, current_positions=positions_actual, target_notionals=target_notionals)
     reconcile_top = _summarize_reconcile(positions=positions_final, target_notionals=target_notionals, md=md, limit=12)
     if reconcile_top:
         logger.info("Reconcile (top diffs): {}", reconcile_top)
