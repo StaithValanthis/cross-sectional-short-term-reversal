@@ -304,6 +304,50 @@ class Executor:
             )
             return res
         except BybitAPIError as e:
+            # If limit order fails due to minimum order value (110094) and this is a reduce-only order (closing position),
+            # automatically retry with market order to ensure the position is closed
+            # This is critical for positions outside the universe that must be closed
+            is_min_order_value_error = (str(e.ret_code) == "110094" and "minimum order value" in str(e.ret_msg).lower())
+            is_closing_position = bool(order.reduce_only)  # reduce_only means we're closing/reducing a position
+            
+            if is_min_order_value_error and is_closing_position and order.order_type == "limit":
+                logger.warning(
+                    "Limit order rejected due to minimum order value for {} {} (closing position). Retrying with market order to ensure position is closed.",
+                    order.symbol,
+                    order.side,
+                )
+                # Retry with market order - for closing positions, we prioritize execution over maker fees
+                market_payload = {
+                    "symbol": order.symbol,
+                    "side": order.side,
+                    "orderType": "Market",
+                    "qty": qty_str,
+                    "timeInForce": "IOC",
+                    "reduceOnly": bool(order.reduce_only),
+                    "orderLinkId": f"xsrev-{uuid.uuid4().hex[:16]}",
+                }
+                try:
+                    res = self.client.create_order(category=self.cfg.exchange.category, order=market_payload)
+                    logger.info(
+                        "Market order placed (fallback for min value): {} {} qty={} reduceOnly={} reason={} id={}",
+                        order.symbol,
+                        order.side,
+                        qty_str,
+                        bool(order.reduce_only),
+                        f"{order.reason}|market_fallback",
+                        res.get("orderId"),
+                    )
+                    return res
+                except BybitAPIError as e2:
+                    logger.error(
+                        "Market order also rejected for {} {}: retCode={} retMsg={}",
+                        order.symbol,
+                        order.side,
+                        e2.ret_code,
+                        e2.ret_msg,
+                    )
+                    return None
+            
             logger.error(
                 "Order rejected by Bybit: {} {} qty={} type={} reduceOnly={} reason={} retCode={} retMsg={}",
                 order.symbol,
