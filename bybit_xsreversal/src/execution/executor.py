@@ -120,10 +120,45 @@ class Executor:
     def place(self, order: PlannedOrder) -> dict[str, Any] | None:
         meta = self.md.get_instrument_meta(order.symbol)
         qty_str = self._format_qty_str(order.qty, meta)
+        is_closing_outside_universe = bool(order.reduce_only) and "close_outside_universe" in str(order.reason)
+        
         if not qty_str:
+            # For positions outside the universe that must be closed, try market order even if below minQty
+            # The exchange may accept market orders for very small positions even if limit orders are rejected
+            if is_closing_outside_universe:
+                logger.warning(
+                    "Order qty below minQty for {} {} (closing position outside universe). Attempting market order with minQty.",
+                    order.symbol,
+                    order.side,
+                )
+                # Use minQty to ensure we can close the position
+                if float(meta.min_qty) > 0:
+                    qty_str = self._ceil_qty_str(float(meta.min_qty), meta)
+                    if qty_str:
+                        # Force market order for closing positions outside universe when qty is too small
+                        logger.info("Using market order with minQty={} for {} {} (closing position outside universe)", qty_str, order.symbol, order.side)
+                        # Create a new order with market type
+                        market_order = PlannedOrder(
+                            symbol=order.symbol,
+                            side=order.side,
+                            qty=float(qty_str),
+                            reduce_only=order.reduce_only,
+                            order_type="market",
+                            limit_price=None,
+                            reason=f"{order.reason}|forced_market",
+                        )
+                        # Recursively call place with the market order
+                        return self.place(market_order)
+                    else:
+                        logger.error("Cannot format minQty for {} {} - cannot close position outside universe", order.symbol, order.side)
+                        return None
+                else:
+                    logger.error("No minQty available for {} {} - cannot close position outside universe", order.symbol, order.side)
+                    return None
+            
             # Optional: bump tiny orders up to minQty when possible.
             # This is only safe-ish when we can ensure it doesn't exceed per-symbol notional caps.
-            if (
+            if not qty_str and (
                 bool(getattr(self.cfg.execution, "bump_to_min_qty", False))
                 and float(meta.min_qty) > 0
             ):

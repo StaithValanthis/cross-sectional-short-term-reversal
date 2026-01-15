@@ -384,6 +384,19 @@ def plan_rebalance_orders(
         side: Any = "Buy" if delta > 0 else "Sell"
         # reduce-only if this trade reduces absolute exposure in same direction
         reduce_only = (cur_size > 0 and delta < 0) or (cur_size < 0 and delta > 0)
+        
+        # Log if this is closing a position outside the universe
+        if is_closing_position:
+            logger.info(
+                "Planning order to close position outside universe: {} {} qty={:.6g} (cur={:.6g}, tgt=0, delta_notional=${:.2f}, reduceOnly={})",
+                sym,
+                side,
+                abs(delta),
+                cur_size,
+                abs_delta_notional,
+                bool(reduce_only),
+            )
+        
         orders.append(
             PlannedOrder(
                 symbol=sym,
@@ -392,7 +405,7 @@ def plan_rebalance_orders(
                 reduce_only=bool(reduce_only),
                 order_type=cfg.execution.order_type,
                 limit_price=None,
-                reason="rebalance_delta",
+                reason="close_outside_universe" if is_closing_position else "rebalance_delta",
             )
         )
 
@@ -759,6 +772,39 @@ def run_rebalance(
                 adjusted_positions_final[sym] = Position(symbol=sym, size=adj, mark_price=mark)
         positions_final = adjusted_positions_final
 
+    # Identify positions outside the target universe (should be closed)
+    positions_outside_universe: list[tuple[str, float]] = []
+    for sym, pos in positions_final.items():
+        tgt_notional = target_notionals.get(sym, 0.0)
+        if abs(tgt_notional) < 1e-8 and abs(pos.size) > 1e-8:
+            # Position exists but target is zero (outside universe)
+            positions_outside_universe.append((sym, pos.size))
+    
+    if positions_outside_universe:
+        outside_symbols = sorted([s for s, _ in positions_outside_universe])
+        logger.warning(
+            "Found {} positions outside target universe (should be closed): {}",
+            len(positions_outside_universe),
+            ", ".join(outside_symbols),
+        )
+        for sym, size in sorted(positions_outside_universe, key=lambda x: abs(x[1]), reverse=True):
+            pos = positions_final.get(sym)
+            try:
+                ob = md.get_orderbook_stats(sym)
+                px = float(ob.mid)
+                notional = abs(size * px)
+            except Exception:
+                px = float(pos.mark_price) if pos and pos.mark_price > 0 else 0.0
+                notional = abs(size * px) if px > 0 else 0.0
+            logger.warning(
+                "  - {}: qty={:.6g}, notional=${:.2f} (target=0, should close)",
+                sym,
+                size,
+                notional,
+            )
+    else:
+        logger.info("All open positions match the target universe ({} symbols)", len(positions_final))
+
     orders = plan_rebalance_orders(cfg=cfg, md=md, current_positions=positions_final, target_notionals=target_notionals)
     reconcile_top = _summarize_reconcile(positions=positions_final, target_notionals=target_notionals, md=md, limit=12)
     if reconcile_top:
@@ -782,12 +828,33 @@ def run_rebalance(
     for o in orders:
         ex.place_with_fallback(o)
 
+    # Summary of position reconciliation
+    positions_in_universe = [s for s in positions_final.keys() if abs(target_notionals.get(s, 0.0)) > 1e-8]
+    positions_outside = [s for s in positions_final.keys() if abs(target_notionals.get(s, 0.0)) < 1e-8]
+    targets_not_open = [s for s in target_notionals.keys() if s not in positions_final or abs(positions_final.get(s, Position(symbol=s, size=0.0, mark_price=0.0)).size) < 1e-8]
+    
+    logger.info(
+        "Position reconciliation summary: {} total open positions ({} in universe, {} outside), {} target symbols ({} not yet open)",
+        len(positions_final),
+        len(positions_in_universe),
+        len(positions_outside),
+        len(target_notionals),
+        len(targets_not_open),
+    )
+
     return {
         "orders": [o.__dict__ for o in orders],
         "positions": {k: v.__dict__ for k, v in positions_final.items()},
         "reconcile_top": reconcile_top,
         "canceled_open_orders": canceled,
-        "summary": {"target_symbols": len(target_notionals), "current_symbols": len(positions_final), "planned_orders": len(orders)},
+        "summary": {
+            "target_symbols": len(target_notionals),
+            "current_symbols": len(positions_final),
+            "positions_in_universe": len(positions_in_universe),
+            "positions_outside_universe": len(positions_outside),
+            "targets_not_open": len(targets_not_open),
+            "planned_orders": len(orders),
+        },
     }
 
 
