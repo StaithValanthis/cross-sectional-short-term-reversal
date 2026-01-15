@@ -214,11 +214,18 @@ class BybitClient:
         data = self._request("GET", "/v5/account/wallet-balance", {"accountType": account_type}, None)
         return dict(data.get("result") or {})
 
-    def get_positions(self, *, category: str = "linear", settle_coin: str = "USDT") -> list[dict[str, Any]]:
+    def get_positions(self, *, category: str = "linear", settle_coin: str = "USDT", limit: int | None = None) -> list[dict[str, Any]]:
         if self._auth is None:
             raise ValueError("Auth required for positions.")
-        data = self._request("GET", "/v5/position/list", {"category": category, "settleCoin": settle_coin}, None)
-        return list((data.get("result") or {}).get("list") or [])
+        params: dict[str, Any] = {"category": category, "settleCoin": settle_coin}
+        # Bybit API may have a default limit - explicitly request more if needed
+        # Note: Bybit v5 position/list doesn't have a limit param, but we log what we get
+        data = self._request("GET", "/v5/position/list", params, None)
+        result = list((data.get("result") or {}).get("list") or [])
+        # Log if we suspect there might be more positions
+        if limit is not None and len(result) >= limit:
+            logger.warning("Position list may be truncated: got {} positions, limit was {}", len(result), limit)
+        return result
 
     def set_leverage(self, *, category: str, symbol: str, leverage: str) -> None:
         if self._auth is None:

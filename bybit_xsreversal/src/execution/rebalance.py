@@ -528,6 +528,55 @@ def run_rebalance(
     # Re-fetch positions after canceling orders to get current state (in case any pending orders filled)
     raw_pos = client.get_positions(category=cfg.exchange.category, settle_coin="USDT")
     logger.info("Fetched {} raw position records from exchange", len(raw_pos))
+    
+    # Log ALL raw positions before any filtering to diagnose missing positions
+    if raw_pos:
+        all_symbols_raw = set()
+        positions_by_symbol: dict[str, list[dict[str, Any]]] = {}
+        for p in raw_pos:
+            sym = normalize_symbol(str(p.get("symbol", "")))
+            if sym:
+                all_symbols_raw.add(sym)
+                if sym not in positions_by_symbol:
+                    positions_by_symbol[sym] = []
+                positions_by_symbol[sym].append(p)
+        
+        logger.info("Raw positions breakdown: {} unique symbols from {} records", len(all_symbols_raw), len(raw_pos))
+        # Log summary of all symbols with positions
+        active_symbols = []
+        zero_symbols = []
+        for sym in sorted(all_symbols_raw):
+            sym_positions = positions_by_symbol[sym]
+            total_size = 0.0
+            has_hedge = False
+            for p in sym_positions:
+                size = float(p.get("size") or 0.0)
+                side = str(p.get("side", ""))
+                pos_idx = int(p.get("positionIdx") or 0)
+                signed = size if side == "Buy" else -size
+                total_size += signed
+                if pos_idx in (1, 2):
+                    has_hedge = True
+                logger.debug(
+                    "  Raw position: {} size={:.6g} side={} positionIdx={}",
+                    sym,
+                    size,
+                    side,
+                    pos_idx,
+                )
+            if abs(total_size) > 1e-12:
+                hedge_note = " [HEDGE MODE]" if has_hedge else ""
+                active_symbols.append(f"{sym}({total_size:.6g}){hedge_note}")
+            else:
+                zero_symbols.append(sym)
+        
+        if active_symbols:
+            logger.info("Active positions from API ({} symbols): {}", len(active_symbols), ", ".join(active_symbols))
+        if zero_symbols:
+            logger.debug("Zero-size positions filtered: {}", ", ".join(zero_symbols))
+    else:
+        logger.warning("No raw positions returned from exchange API!")
+    
     parsed = _parse_positions(raw_pos)
     positions = parsed.positions
     hedge_mode_symbols = parsed.hedge_mode_symbols
@@ -575,38 +624,83 @@ def run_rebalance(
         len(filtered_small_positions),
     )
     
-    # Early check: Identify positions outside universe from raw exchange positions (before adjustments)
-    # This gives us the true picture of what's actually open on the exchange
-    positions_outside_universe_raw: list[tuple[str, float]] = []
-    for sym, pos in positions.items():
-        tgt_notional = target_notionals.get(sym, 0.0)
-        if abs(tgt_notional) < 1e-8 and abs(pos.size) > 1e-8:
-            positions_outside_universe_raw.append((sym, pos.size))
+    # CRITICAL: Check ALL symbols from raw API response against target universe
+    # This includes positions that might be filtered out later (hedge mode, zero net, etc.)
+    all_open_symbols_from_api: dict[str, float] = {}  # symbol -> net size
+    for p in raw_pos:
+        sym = normalize_symbol(str(p.get("symbol", "")))
+        if not sym:
+            continue
+        size = float(p.get("size") or 0.0)
+        if abs(size) < 1e-12:
+            continue
+        side = str(p.get("side", ""))
+        signed = size if side == "Buy" else -size
+        all_open_symbols_from_api[sym] = all_open_symbols_from_api.get(sym, 0.0) + signed
     
-    if positions_outside_universe_raw:
-        outside_symbols = sorted([s for s, _ in positions_outside_universe_raw])
+    # Now compare ALL open symbols (from API) with target universe
+    positions_outside_universe_all: list[tuple[str, float, str]] = []  # (symbol, net_size, status)
+    for sym, net_size in all_open_symbols_from_api.items():
+        tgt_notional = target_notionals.get(sym, 0.0)
+        if abs(tgt_notional) < 1e-8 and abs(net_size) > 1e-8:
+            # Position is outside target universe
+            # Check if it's in hedge mode or will be filtered
+            status = "parsed"
+            if sym in hedge_mode_symbols:
+                status = "hedge_mode"
+            elif sym not in positions:
+                status = "filtered"
+            positions_outside_universe_all.append((sym, net_size, status))
+    
+    if positions_outside_universe_all:
+        outside_symbols = sorted([s for s, _, _ in positions_outside_universe_all])
         logger.warning(
-            "Found {} positions outside target universe (should be closed) - RAW exchange positions: {}",
-            len(positions_outside_universe_raw),
+            "Found {} positions outside target universe (should be closed) - ALL symbols from API: {}",
+            len(positions_outside_universe_all),
             ", ".join(outside_symbols),
         )
-        for sym, size in sorted(positions_outside_universe_raw, key=lambda x: abs(x[1]), reverse=True):
-            pos = positions.get(sym)
+        for sym, size, status in sorted(positions_outside_universe_all, key=lambda x: abs(x[1]), reverse=True):
             try:
                 ob = md.get_orderbook_stats(sym)
                 px = float(ob.mid)
                 notional = abs(size * px)
             except Exception:
-                px = float(pos.mark_price) if pos and pos.mark_price > 0 else 0.0
+                # Try to get price from raw position
+                px = 0.0
+                for p in raw_pos:
+                    if normalize_symbol(str(p.get("symbol", ""))) == sym:
+                        px = float(p.get("markPrice") or p.get("avgPrice") or 0.0)
+                        break
                 notional = abs(size * px) if px > 0 else 0.0
+            
+            status_note = ""
+            if status == "hedge_mode":
+                status_note = " [HEDGE MODE - CANNOT CLOSE with one-way bot, manual close required]"
+            elif status == "filtered":
+                status_note = " [FILTERED - net size too small, will attempt to close]"
+            else:
+                status_note = " [WILL BE CLOSED]"
+            
             logger.warning(
-                "  - {}: qty={:.6g}, notional=${:.2f} (target=0, should close)",
+                "  - {}: qty={:.6g}, notional=${:.2f} (target=0){}{}",
                 sym,
                 size,
                 notional,
+                status_note,
+                "" if status == "parsed" else f" - status={status}",
             )
     else:
-        logger.info("All parsed exchange positions match the target universe ({} symbols)", len(positions))
+        logger.info("All open positions from API match the target universe ({} symbols)", len(all_open_symbols_from_api))
+    
+    # Also check parsed positions (for logging consistency)
+    positions_outside_universe_parsed: list[tuple[str, float]] = []
+    for sym, pos in positions.items():
+        tgt_notional = target_notionals.get(sym, 0.0)
+        if abs(tgt_notional) < 1e-8 and abs(pos.size) > 1e-8:
+            positions_outside_universe_parsed.append((sym, pos.size))
+    
+    if positions_outside_universe_parsed:
+        logger.info("Parsed positions outside universe ({}): {}", len(positions_outside_universe_parsed), ", ".join(sorted([s for s, _ in positions_outside_universe_parsed])))
 
     # Adjust positions to account for any remaining open orders (pending fills)
     # This prevents over-sizing when orders from previous rebalances are still pending
