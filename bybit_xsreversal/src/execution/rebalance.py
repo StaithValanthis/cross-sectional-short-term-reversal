@@ -161,24 +161,51 @@ def plan_rebalance_orders(
         pos = current_positions.get(sym)
         cur_size = float(pos.size) if pos else 0.0
 
+        # Check if this symbol is in target universe
+        tgt_notional = float(target_notionals.get(sym, 0.0))
+        is_outside_universe = (tgt_notional == 0.0 and abs(cur_size) > 1e-8)
+
         # Price for qty conversion (use orderbook mid)
+        # For symbols outside universe, try to use mark price from position as fallback
+        px = 0.0
         try:
             ob = md.get_orderbook_stats(sym)
             px = float(ob.mid)
         except Exception as e:
-            logger.warning("Skipping {}: cannot fetch orderbook for sizing: {}", sym, e)
-            continue
+            if is_outside_universe and pos and pos.mark_price > 0:
+                # For positions outside universe, use mark price as fallback to allow closing
+                px = float(pos.mark_price)
+                logger.warning("Cannot fetch orderbook for {} (outside universe), using mark price {:.6f} to close position", sym, px)
+            else:
+                logger.warning("Skipping {}: cannot fetch orderbook for sizing: {}", sym, e)
+                continue
         if px <= 0:
-            continue
+            if is_outside_universe and pos and pos.mark_price > 0:
+                px = float(pos.mark_price)
+                logger.warning("Orderbook price invalid for {} (outside universe), using mark price {:.6f} to close position", sym, px)
+            else:
+                continue
 
         # Instrument constraints
         try:
             meta = md.get_instrument_meta(sym)
         except Exception as e:
-            logger.warning("Skipping {}: cannot fetch instrument meta: {}", sym, e)
-            continue
-
-        tgt_notional = float(target_notionals.get(sym, 0.0))
+            if is_outside_universe:
+                # For positions outside universe, create minimal meta to allow closing
+                # Use defaults that allow closing positions even if we can't fetch full meta
+                from src.data.market_data import InstrumentMeta
+                meta = InstrumentMeta(
+                    symbol=sym,
+                    qty_step=1e-8,  # Small step to allow any quantity
+                    min_qty=0.0,  # No minimum to allow closing
+                    max_qty=None,  # No maximum
+                    tick_size=1e-8,  # Small tick
+                    min_notional=None,  # No minimum notional
+                )
+                logger.warning("Cannot fetch instrument meta for {} (outside universe), using defaults to close position", sym)
+            else:
+                logger.warning("Skipping {}: cannot fetch instrument meta: {}", sym, e)
+                continue
         tgt_size = tgt_notional / px  # base qty, signed
 
         # If target is non-zero but below exchange minimum size, only "bump" when opening from flat.
