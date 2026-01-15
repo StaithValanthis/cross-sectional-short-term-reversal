@@ -527,8 +527,53 @@ def run_rebalance(
 
     # Re-fetch positions after canceling orders to get current state (in case any pending orders filled)
     raw_pos = client.get_positions(category=cfg.exchange.category, settle_coin="USDT")
+    logger.info("Fetched {} raw position records from exchange", len(raw_pos))
     parsed = _parse_positions(raw_pos)
     positions = parsed.positions
+    hedge_mode_symbols = parsed.hedge_mode_symbols
+    
+    # Log all positions including those filtered out
+    if hedge_mode_symbols:
+        logger.warning(
+            "Found {} positions in HEDGE MODE (positionIdx=1/2) - these are excluded from one-way mode: {}",
+            len(hedge_mode_symbols),
+            ", ".join(sorted(hedge_mode_symbols.keys())),
+        )
+        for sym, info in sorted(hedge_mode_symbols.items()):
+            logger.warning(
+                "  - {}: net_size={:.6g}, positionIdxs={} (CANNOT BE CLOSED by one-way mode bot)",
+                sym,
+                info.get("net_size", 0.0),
+                info.get("positionIdxs", []),
+            )
+    
+    # Check for positions that might have been filtered (very small sizes)
+    all_symbols_from_raw = set()
+    filtered_small_positions: list[tuple[str, float]] = []
+    for p in raw_pos:
+        sym = normalize_symbol(str(p.get("symbol", "")))
+        if not sym:
+            continue
+        all_symbols_from_raw.add(sym)
+        size = float(p.get("size") or 0.0)
+        if abs(size) > 1e-12 and sym not in positions and sym not in hedge_mode_symbols:
+            # Position exists but was filtered - likely net to zero or very small
+            filtered_small_positions.append((sym, size))
+    
+    if filtered_small_positions:
+        logger.info(
+            "Found {} positions filtered out (net size < 1e-12 or net to zero): {}",
+            len(filtered_small_positions),
+            ", ".join(sorted([s for s, _ in filtered_small_positions])),
+        )
+    
+    logger.info(
+        "Position parsing summary: {} raw records -> {} parsed positions ({} hedge mode, {} filtered as zero)",
+        len(raw_pos),
+        len(positions),
+        len(hedge_mode_symbols),
+        len(filtered_small_positions),
+    )
     
     # Early check: Identify positions outside universe from raw exchange positions (before adjustments)
     # This gives us the true picture of what's actually open on the exchange
@@ -561,7 +606,7 @@ def run_rebalance(
                 notional,
             )
     else:
-        logger.info("All raw exchange positions match the target universe ({} symbols)", len(positions))
+        logger.info("All parsed exchange positions match the target universe ({} symbols)", len(positions))
 
     # Adjust positions to account for any remaining open orders (pending fills)
     # This prevents over-sizing when orders from previous rebalances are still pending
