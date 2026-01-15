@@ -529,6 +529,39 @@ def run_rebalance(
     raw_pos = client.get_positions(category=cfg.exchange.category, settle_coin="USDT")
     parsed = _parse_positions(raw_pos)
     positions = parsed.positions
+    
+    # Early check: Identify positions outside universe from raw exchange positions (before adjustments)
+    # This gives us the true picture of what's actually open on the exchange
+    positions_outside_universe_raw: list[tuple[str, float]] = []
+    for sym, pos in positions.items():
+        tgt_notional = target_notionals.get(sym, 0.0)
+        if abs(tgt_notional) < 1e-8 and abs(pos.size) > 1e-8:
+            positions_outside_universe_raw.append((sym, pos.size))
+    
+    if positions_outside_universe_raw:
+        outside_symbols = sorted([s for s, _ in positions_outside_universe_raw])
+        logger.warning(
+            "Found {} positions outside target universe (should be closed) - RAW exchange positions: {}",
+            len(positions_outside_universe_raw),
+            ", ".join(outside_symbols),
+        )
+        for sym, size in sorted(positions_outside_universe_raw, key=lambda x: abs(x[1]), reverse=True):
+            pos = positions.get(sym)
+            try:
+                ob = md.get_orderbook_stats(sym)
+                px = float(ob.mid)
+                notional = abs(size * px)
+            except Exception:
+                px = float(pos.mark_price) if pos and pos.mark_price > 0 else 0.0
+                notional = abs(size * px) if px > 0 else 0.0
+            logger.warning(
+                "  - {}: qty={:.6g}, notional=${:.2f} (target=0, should close)",
+                sym,
+                size,
+                notional,
+            )
+    else:
+        logger.info("All raw exchange positions match the target universe ({} symbols)", len(positions))
 
     # Adjust positions to account for any remaining open orders (pending fills)
     # This prevents over-sizing when orders from previous rebalances are still pending
