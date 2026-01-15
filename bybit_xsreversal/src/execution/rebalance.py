@@ -227,12 +227,16 @@ def plan_rebalance_orders(
         # Delta in base qty
         delta = tgt_size - cur_size
         
+        # Check if this is a closing position (target is zero but current is not)
+        is_closing_position = (abs(cur_size) > 1e-8 and abs(tgt_size) < 1e-8)
+        
         # CRITICAL: If there's an existing position in the same direction, check if we should skip
         # This prevents adding to existing positions unless there's a meaningful size change needed
+        # BUT: Always allow closing positions (target = 0) regardless of size
         same_direction = (cur_size > 0 and tgt_size > 0) or (cur_size < 0 and tgt_size < 0)
         has_existing_position = abs(cur_size) > 1e-8
         
-        if has_existing_position and same_direction:
+        if has_existing_position and same_direction and not is_closing_position:
             # There's an existing position in the same direction - be more conservative
             abs_delta_notional = abs(delta * px)
             
@@ -285,7 +289,7 @@ def plan_rebalance_orders(
         
         # Skip if already at target: either absolute delta is tiny OR relative delta is tiny (< 0.1%)
         # BUT always allow closing positions (even if small) to ensure reconciliation
-        is_closing_position = (abs(cur_size) > 1e-8 and abs(tgt_size) < 1e-8)
+        # (is_closing_position already defined above)
         is_already_at_target = (
             abs_delta_notional < float(cfg.sizing.min_notional_per_symbol) or 
             (abs(tgt_size) > 1e-8 and rel_delta_pct < 0.001)  # 0.1% tolerance for non-zero targets
@@ -307,7 +311,8 @@ def plan_rebalance_orders(
         # BUT: Always allow full closes (target = 0) regardless of minQty to ensure reconciliation.
         # This ensures positions outside the universe are always closed, even if very small.
         # Skip to avoid churn (flatten now, reopen next rebalance) only for partial reductions.
-        if min_qty > 0:
+        # CRITICAL: Never skip closing positions (is_closing_position) - they must be closed even if below minQty
+        if min_qty > 0 and not is_closing_position:
             reduce_only_candidate = (cur_size > 0 and delta < 0) or (cur_size < 0 and delta > 0)
             is_full_close = abs(tgt_size) < 1e-8  # Target is zero (full close)
             if reduce_only_candidate and not is_full_close:
