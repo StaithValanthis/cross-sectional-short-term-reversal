@@ -217,15 +217,33 @@ class BybitClient:
     def get_positions(self, *, category: str = "linear", settle_coin: str = "USDT", limit: int | None = None) -> list[dict[str, Any]]:
         if self._auth is None:
             raise ValueError("Auth required for positions.")
-        params: dict[str, Any] = {"category": category, "settleCoin": settle_coin}
-        # Bybit API may have a default limit - explicitly request more if needed
-        # Note: Bybit v5 position/list doesn't have a limit param, but we log what we get
-        data = self._request("GET", "/v5/position/list", params, None)
-        result = list((data.get("result") or {}).get("list") or [])
-        # Log if we suspect there might be more positions
-        if limit is not None and len(result) >= limit:
-            logger.warning("Position list may be truncated: got {} positions, limit was {}", len(result), limit)
-        return result
+        # Bybit v5 position/list supports cursor-based pagination
+        # Fetch all positions using pagination to avoid missing any
+        all_positions: list[dict[str, Any]] = []
+        cursor: str | None = None
+        
+        while True:
+            params: dict[str, Any] = {"category": category, "settleCoin": settle_coin, "limit": 50}
+            if cursor:
+                params["cursor"] = cursor
+            
+            data = self._request("GET", "/v5/position/list", params, None)
+            result_data = data.get("result") or {}
+            chunk = list(result_data.get("list") or [])
+            all_positions.extend(chunk)
+            
+            # Check for next page
+            cursor = result_data.get("nextPageCursor") or None
+            if not cursor or len(chunk) == 0:
+                break
+            
+            # Safety limit to prevent infinite loops
+            if len(all_positions) > 1000:
+                logger.warning("Position list exceeded 1000 items, stopping pagination")
+                break
+        
+        logger.debug("Fetched {} positions via pagination ({} pages)", len(all_positions), "multiple" if cursor else "single")
+        return all_positions
 
     def set_leverage(self, *, category: str, symbol: str, leverage: str) -> None:
         if self._auth is None:
