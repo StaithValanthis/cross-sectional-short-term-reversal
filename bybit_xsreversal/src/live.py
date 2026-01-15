@@ -123,8 +123,8 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                                     days_since_last,
                                 )
                                 return
-                except Exception as e:
-                    logger.warning("Failed to parse rebalance_state.json: {}", e)
+                    except Exception as e:
+                        logger.warning("Failed to parse rebalance_state.json: {}", e)
 
             # Universe + microstructure filtering
             symbols = [normalize_symbol(s) for s in md.get_liquidity_ranked_symbols()]
@@ -132,9 +132,9 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
             micro_meta: dict[str, Any] = {}
             for s in symbols:
                 try:
-                        ok_ms, info = md.passes_microstructure_filters(s)
+                    ok_ms, info = md.passes_microstructure_filters(s)
                     micro_meta[s] = info
-                        if ok_ms:
+                    if ok_ms:
                         passed.append(s)
                 except Exception as e:
                     micro_meta[s] = {"error": str(e)}
