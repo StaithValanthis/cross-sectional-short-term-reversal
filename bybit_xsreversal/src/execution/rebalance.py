@@ -244,12 +244,17 @@ def plan_rebalance_orders(
             
             # Skip if the adjustment is too small (either absolute or relative)
             # Use a larger tolerance (5%) when there's already a position in the same direction
+            # BUT: If the relative change is significant (>10%), allow it even if absolute notional is small
+            # This prevents positions from drifting too far from target
             min_meaningful_delta_notional = float(cfg.sizing.min_notional_per_symbol)
             min_meaningful_rel_delta = 0.05  # 5% - only adjust if size change is > 5%
+            significant_rel_delta = 0.10  # 10% - if relative change is >10%, always adjust
             
             is_meaningful_adjustment = (
-                abs_delta_notional >= min_meaningful_delta_notional and
-                rel_delta_pct >= min_meaningful_rel_delta
+                # Either: absolute notional is above minimum AND relative change is >5%
+                (abs_delta_notional >= min_meaningful_delta_notional and rel_delta_pct >= min_meaningful_rel_delta) or
+                # Or: relative change is significant (>10%) - allow even if absolute is small
+                (rel_delta_pct >= significant_rel_delta)
             )
             
             if not is_meaningful_adjustment:
@@ -300,6 +305,7 @@ def plan_rebalance_orders(
 
         # If this is a reduce-only trim and the delta is below minQty, we can't execute it without over-closing.
         # BUT: Always allow full closes (target = 0) regardless of minQty to ensure reconciliation.
+        # This ensures positions outside the universe are always closed, even if very small.
         # Skip to avoid churn (flatten now, reopen next rebalance) only for partial reductions.
         if min_qty > 0:
             reduce_only_candidate = (cur_size > 0 and delta < 0) or (cur_size < 0 and delta > 0)
