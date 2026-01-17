@@ -319,9 +319,12 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                 try:
                     state_path.parent.mkdir(parents=True, exist_ok=True)
                     # Use rb_now.date() (today) to match the interval check logic, not asof_bar (yesterday's bar)
+                    saved_date = rb_now.date().isoformat()
                     state_path.write_bytes(
-                        orjson.dumps({"last_rebalance_day": rb_now.date().isoformat()}, option=orjson.OPT_INDENT_2)
+                        orjson.dumps({"last_rebalance_day": saved_date}, option=orjson.OPT_INDENT_2)
                     )
+                    logger.info("Saved rebalance state: last_rebalance_day={} (interval_days={}, next rebalance in {} days)", 
+                                saved_date, interval_days, interval_days)
                 except Exception as e:
                     logger.warning("Failed to write rebalance_state.json: {}", e)
             except Exception as e:
