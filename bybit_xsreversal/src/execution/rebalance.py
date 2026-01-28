@@ -10,7 +10,18 @@ from src.config import BotConfig
 from src.data.bybit_client import BybitClient
 from src.data.market_data import MarketData, normalize_symbol
 from src.execution.executor import Executor, PlannedOrder
+from src.execution.risk_exits import (
+    apply_cooldown_exclusions,
+    evaluate_risk_exits,
+    extract_pnl_metrics_by_symbol,
+    load_positions_risk_state,
+    mark_forced_exits_in_state,
+    save_positions_risk_state,
+    update_state_from_positions,
+)
 import time
+from datetime import UTC, datetime
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -147,6 +158,7 @@ def plan_rebalance_orders(
     md: MarketData,
     current_positions: dict[str, Position],
     target_notionals: dict[str, float],
+    force_close_reasons: dict[str, str] | None = None,
 ) -> list[PlannedOrder]:
     """
     Convert target USD notionals into base qty deltas, with safe handling of sign flips:
@@ -161,13 +173,28 @@ def plan_rebalance_orders(
         pos = current_positions.get(sym)
         cur_size = float(pos.size) if pos else 0.0
 
+        force_reason = (force_close_reasons or {}).get(sym)
         # Check if this symbol is in target universe
         tgt_notional = float(target_notionals.get(sym, 0.0))
         is_outside_universe = (tgt_notional == 0.0 and abs(cur_size) > 1e-8)
         
         # Debug logging for positions outside universe
         if is_outside_universe:
-            logger.info("DEBUG: Processing position outside universe: {} (cur_size={:.6g}, tgt_notional={:.2f})", sym, cur_size, tgt_notional)
+            if force_reason:
+                logger.info(
+                    "DEBUG: Processing FORCED CLOSE {}: {} (cur_size={:.6g}, tgt_notional={:.2f})",
+                    force_reason,
+                    sym,
+                    cur_size,
+                    tgt_notional,
+                )
+            else:
+                logger.info(
+                    "DEBUG: Processing position outside universe: {} (cur_size={:.6g}, tgt_notional={:.2f})",
+                    sym,
+                    cur_size,
+                    tgt_notional,
+                )
 
         # Price for qty conversion (use orderbook mid)
         # For symbols outside universe, try to use mark price from position as fallback
@@ -404,7 +431,8 @@ def plan_rebalance_orders(
         # Log if this is closing a position outside the universe
         if is_closing_position:
             logger.info(
-                "Planning order to close position outside universe: {} {} qty={:.6g} (cur={:.6g}, tgt=0, delta_notional=${:.2f}, reduceOnly={})",
+                "Planning order to close position (reason={}): {} {} qty={:.6g} (cur={:.6g}, tgt=0, delta_notional=${:.2f}, reduceOnly={})",
+                force_reason or "close_outside_universe",
                 sym,
                 side,
                 abs(delta),
@@ -421,7 +449,7 @@ def plan_rebalance_orders(
                 reduce_only=bool(reduce_only),
                 order_type=cfg.execution.order_type,
                 limit_price=None,
-                reason="close_outside_universe" if is_closing_position else "rebalance_delta",
+                reason=(force_reason or "close_outside_universe") if is_closing_position else "rebalance_delta",
             )
         )
 
@@ -785,7 +813,7 @@ def run_rebalance(
             "summary": {
                 "error": "hedge_mode_not_supported",
                 "target_symbols": len(target_notionals),
-                "current_symbols": len(positions_final),
+                "current_symbols": len(positions),
                 "planned_orders": 0,
             },
         }
@@ -940,6 +968,62 @@ def run_rebalance(
     
     # Store actual positions BEFORE adjustment (needed for closing positions outside universe)
     positions_actual = positions_final.copy()
+
+    # ---------- Risk exits (soft forced closes) ----------
+    # Applied BEFORE order planning by overriding target_notionals[sym]=0, so they behave like outside-universe closes
+    # and bypass all "small delta" / min-notional / partial-rebalance gating.
+    risk_state_path = Path("outputs") / "state" / "positions_state.json"
+    risk_state = load_positions_risk_state(risk_state_path)
+    today = datetime.now(tz=UTC).date()
+    pnl_metrics = extract_pnl_metrics_by_symbol(raw_pos_final)
+    update_state_from_positions(st=risk_state, positions=positions_actual, pnl_metrics=pnl_metrics, today=today)
+
+    target_notionals_eff = dict(target_notionals)
+
+    cooldown_syms, cooldown_events = apply_cooldown_exclusions(
+        cfg=cfg.risk,
+        st=risk_state,
+        target_notionals=target_notionals_eff,
+        today=today,
+    )
+
+    force_close_reasons, risk_events = evaluate_risk_exits(
+        cfg=cfg.risk,
+        st=risk_state,
+        positions=positions_actual,
+        pnl_metrics=pnl_metrics,
+        equity_usdt=equity_exec,
+        today=today,
+    )
+    force_close_symbols = set(force_close_reasons.keys())
+    if force_close_symbols:
+        for s in force_close_symbols:
+            target_notionals_eff[normalize_symbol(s)] = 0.0
+        mark_forced_exits_in_state(st=risk_state, symbols=force_close_symbols, today=today)
+
+    save_positions_risk_state(risk_state_path, risk_state)
+
+    if cooldown_syms or force_close_symbols:
+        n_time = sum(1 for e in risk_events if e.kind == "risk_time_stop")
+        n_loss = sum(1 for e in risk_events if e.kind == "risk_loss_cap")
+        logger.warning(
+            "Risk exits: forced_closes={} (time_stop={}, loss_cap={}), cooldown_exclusions={} (cooldown_days={})",
+            len(force_close_symbols),
+            n_time,
+            n_loss,
+            len(cooldown_syms),
+            int(getattr(cfg.risk, "cooldown_days_after_forced_exit", 0) or 0),
+        )
+        for e in risk_events[: min(12, len(risk_events))]:
+            logger.warning(
+                "  - {}: kind={} held_days={} pnl_since_open={} loss_pct_equity={} threshold={}",
+                e.symbol,
+                e.kind,
+                e.held_days,
+                e.pnl_since_open,
+                e.loss_pct_equity,
+                e.threshold,
+            )
     
     # Adjust positions to account for pending orders
     if pending_qty_by_symbol:
@@ -968,7 +1052,7 @@ def run_rebalance(
     # The adjustment is only for calculating deltas, not for determining if a position exists
     positions_outside_universe: list[tuple[str, float]] = []
     for sym, pos in positions_actual.items():
-        tgt_notional = target_notionals.get(sym, 0.0)
+        tgt_notional = target_notionals_eff.get(sym, 0.0)
         if abs(tgt_notional) < 1e-8 and abs(pos.size) > 1e-8:
             # Position exists but target is zero (outside universe)
             positions_outside_universe.append((sym, pos.size))
@@ -1002,15 +1086,21 @@ def run_rebalance(
     # positions outside the universe are always identified and closed, regardless of pending orders.
     # The adjustment is only used for calculating deltas to avoid over-trading, but we need to
     # use actual positions to determine which positions exist and need to be closed.
-    orders = plan_rebalance_orders(cfg=cfg, md=md, current_positions=positions_actual, target_notionals=target_notionals)
-    reconcile_top = _summarize_reconcile(positions=positions_final, target_notionals=target_notionals, md=md, limit=12)
+    orders = plan_rebalance_orders(
+        cfg=cfg,
+        md=md,
+        current_positions=positions_actual,
+        target_notionals=target_notionals_eff,
+        force_close_reasons=force_close_reasons,
+    )
+    reconcile_top = _summarize_reconcile(positions=positions_final, target_notionals=target_notionals_eff, md=md, limit=12)
     if reconcile_top:
         logger.info("Reconcile (top diffs): {}", reconcile_top)
 
     if not orders:
         logger.info(
             "No rebalance orders required (targets={}, current_positions={}).",
-            len(target_notionals),
+            len(target_notionals_eff),
             len(positions),
         )
         return {
@@ -1018,7 +1108,13 @@ def run_rebalance(
             "positions": {k: v.__dict__ for k, v in positions_final.items()},
             "reconcile_top": reconcile_top,
             "canceled_open_orders": canceled,
-            "summary": {"target_symbols": len(target_notionals), "current_symbols": len(positions_final), "planned_orders": 0},
+            "targets_effective": target_notionals_eff,
+            "risk_exits": {
+                "force_close_reasons": force_close_reasons,
+                "risk_events": [e.__dict__ for e in risk_events],
+                "cooldown_events": [e.__dict__ for e in cooldown_events],
+            },
+            "summary": {"target_symbols": len(target_notionals_eff), "current_symbols": len(positions_final), "planned_orders": 0},
         }
 
     logger.info("Planned {} orders", len(orders))
@@ -1026,16 +1122,20 @@ def run_rebalance(
         ex.place_with_fallback(o)
 
     # Summary of position reconciliation
-    positions_in_universe = [s for s in positions_final.keys() if abs(target_notionals.get(s, 0.0)) > 1e-8]
-    positions_outside = [s for s in positions_final.keys() if abs(target_notionals.get(s, 0.0)) < 1e-8]
-    targets_not_open = [s for s in target_notionals.keys() if s not in positions_final or abs(positions_final.get(s, Position(symbol=s, size=0.0, mark_price=0.0)).size) < 1e-8]
+    positions_in_universe = [s for s in positions_final.keys() if abs(target_notionals_eff.get(s, 0.0)) > 1e-8]
+    positions_outside = [s for s in positions_final.keys() if abs(target_notionals_eff.get(s, 0.0)) < 1e-8]
+    targets_not_open = [
+        s
+        for s in target_notionals_eff.keys()
+        if s not in positions_final or abs(positions_final.get(s, Position(symbol=s, size=0.0, mark_price=0.0)).size) < 1e-8
+    ]
     
     logger.info(
         "Position reconciliation summary: {} total open positions ({} in universe, {} outside), {} target symbols ({} not yet open)",
         len(positions_final),
         len(positions_in_universe),
         len(positions_outside),
-        len(target_notionals),
+        len(target_notionals_eff),
         len(targets_not_open),
     )
 
@@ -1044,8 +1144,14 @@ def run_rebalance(
         "positions": {k: v.__dict__ for k, v in positions_final.items()},
         "reconcile_top": reconcile_top,
         "canceled_open_orders": canceled,
+        "targets_effective": target_notionals_eff,
+        "risk_exits": {
+            "force_close_reasons": force_close_reasons,
+            "risk_events": [e.__dict__ for e in risk_events],
+            "cooldown_events": [e.__dict__ for e in cooldown_events],
+        },
         "summary": {
-            "target_symbols": len(target_notionals),
+            "target_symbols": len(target_notionals_eff),
             "current_symbols": len(positions_final),
             "positions_in_universe": len(positions_in_universe),
             "positions_outside_universe": len(positions_outside),

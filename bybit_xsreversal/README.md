@@ -177,6 +177,34 @@ Operational notes:
 
 ---
 
+## Soft per-position risk exits (forced closes)
+
+In addition to portfolio-level kill-switches, the live rebalance supports **soft per-position exits** that **force a full reduce-only close** when breached.
+
+Key properties:
+- Implemented by overriding `target_notional[symbol] = 0` **inside the rebalance**, right before order planning.
+- Forced closes therefore **bypass** partial rebalance (`rebalance_fraction`), `min_weight_change_bps`, and “small delta/min notional” skip logic.
+- Forced closes are logged and written into `outputs/live/<ts>/rebalance_snapshot.json` under `risk_exits`.
+
+Config keys (all default to disabled):
+- `risk.max_hold_days`: time stop in **UTC days** since the position was first observed (tracked locally in `outputs/state/positions_state.json`).
+- `risk.max_loss_per_position_pct_equity`: equity-based loss cap since open (uses unrealised PnL; if Bybit exposes cumulative realised PnL, it is incorporated).
+- `risk.cooldown_days_after_forced_exit`: exclude symbols from targets for N days after a forced exit to avoid churn.
+
+Example:
+
+```yaml
+risk:
+  max_hold_days: 3
+  max_loss_per_position_pct_equity: 0.75
+  cooldown_days_after_forced_exit: 2
+```
+
+Operational note for small accounts:
+- If your equity is small (e.g. ~$155) and you are frequently hitting Bybit minQty/minNotional constraints, start with a **higher** `max_loss_per_position_pct_equity` to avoid “forced close triggers” on positions that the exchange cannot economically close until they move/scale (and rely on the existing market-fallback + future rebalances to clear the remainder).
+
+---
+
 ## Notes on Daily Candle Alignment (UTC)
 
 Bybit `interval=D` klines are aligned to **UTC day boundaries**. This bot trades at `rebalance.time_utc` (default `00:05`) and uses the **last complete daily candle** (yesterday’s close) to avoid look-ahead.

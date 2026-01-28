@@ -120,14 +120,19 @@ class Executor:
     def place(self, order: PlannedOrder) -> dict[str, Any] | None:
         meta = self.md.get_instrument_meta(order.symbol)
         qty_str = self._format_qty_str(order.qty, meta)
-        is_closing_outside_universe = bool(order.reduce_only) and "close_outside_universe" in str(order.reason)
+        reason_s = str(order.reason)
+        # Forced closes must prioritize closure over minQty/minNotional edge-cases.
+        # Treat outside-universe closes and risk-triggered closes the same.
+        is_forced_close = bool(order.reduce_only) and (
+            ("close_outside_universe" in reason_s) or reason_s.startswith("risk_") or ("|risk_" in reason_s)
+        )
         
         if not qty_str:
             # For positions outside the universe that must be closed, try market order even if below minQty
             # The exchange may accept market orders for very small positions even if limit orders are rejected
-            if is_closing_outside_universe:
+            if is_forced_close:
                 logger.warning(
-                    "Order qty below minQty for {} {} (closing position outside universe). Attempting market order with minQty.",
+                    "Order qty below minQty for {} {} (forced close). Attempting market order with minQty.",
                     order.symbol,
                     order.side,
                 )
@@ -136,7 +141,7 @@ class Executor:
                     qty_str = self._ceil_qty_str(float(meta.min_qty), meta)
                     if qty_str:
                         # Force market order for closing positions outside universe when qty is too small
-                        logger.info("Using market order with minQty={} for {} {} (closing position outside universe)", qty_str, order.symbol, order.side)
+                        logger.info("Using market order with minQty={} for {} {} (forced close)", qty_str, order.symbol, order.side)
                         # Create a new order with market type
                         market_order = PlannedOrder(
                             symbol=order.symbol,
@@ -150,10 +155,10 @@ class Executor:
                         # Recursively call place with the market order
                         return self.place(market_order)
                     else:
-                        logger.error("Cannot format minQty for {} {} - cannot close position outside universe", order.symbol, order.side)
+                        logger.error("Cannot format minQty for {} {} - cannot force-close position", order.symbol, order.side)
                         return None
                 else:
-                    logger.error("No minQty available for {} {} - cannot close position outside universe", order.symbol, order.side)
+                    logger.error("No minQty available for {} {} - cannot force-close position", order.symbol, order.side)
                     return None
             
             # Optional: bump tiny orders up to minQty when possible.

@@ -25,9 +25,9 @@ rebalance:
   time_utc: 00:05
   candle_close_delay_seconds: 30
   startup_grace_seconds: 300
-  interval_days: 3
+  interval_days: 1
   rebalance_fraction: 0.36
-  min_weight_change_bps: 0.0
+  min_weight_change_bps: 400.0
 sizing:
   target_gross_leverage: 0.92
   vol_lookback_days: 14
@@ -68,6 +68,9 @@ risk:
   max_drawdown_pct: 20.0
   max_turnover: 2.0
   kill_switch_enabled: true
+  max_hold_days: 3
+  max_loss_per_position_pct_equity: 3.0
+  cooldown_days_after_forced_exit: 2
   stop_new_trades_on_vol_spike:
     enabled: false
     lookback_days: 14

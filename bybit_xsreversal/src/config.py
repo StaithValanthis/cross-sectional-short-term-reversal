@@ -111,6 +111,13 @@ class RiskConfig(BaseModel):
     max_drawdown_pct: float = 20.0
     max_turnover: float = 2.0
     kill_switch_enabled: bool = True
+    # Soft per-position exits (applied at rebalance time by overriding target_notional -> 0)
+    # 0 disables.
+    max_hold_days: int = 0
+    # 0 disables. Example: 0.75 means a position may not lose more than 0.75% of equity (unrealized).
+    max_loss_per_position_pct_equity: float = 0.0
+    # 0 disables. If > 0, symbols that were force-closed by risk controls are excluded from targets for N days.
+    cooldown_days_after_forced_exit: int = 0
     stop_new_trades_on_vol_spike: VolSpikeConfig = Field(default_factory=VolSpikeConfig)
 
 
