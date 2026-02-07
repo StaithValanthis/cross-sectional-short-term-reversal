@@ -249,7 +249,13 @@ class BybitClient:
         if self._auth is None:
             raise ValueError("Auth required for set_leverage.")
         body = {"category": category, "symbol": symbol, "buyLeverage": leverage, "sellLeverage": leverage}
-        self._request("POST", "/v5/position/set-leverage", None, body)
+        try:
+            self._request("POST", "/v5/position/set-leverage", None, body)
+        except BybitAPIError as e:
+            # 110043: leverage not modified (typically means it's already set to requested value)
+            if int(e.ret_code or -1) == 110043:
+                return
+            raise
 
     def create_order(self, *, category: str, order: dict[str, Any]) -> dict[str, Any]:
         if self._auth is None:
