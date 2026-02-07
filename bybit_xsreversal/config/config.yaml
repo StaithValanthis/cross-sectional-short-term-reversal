@@ -1,3 +1,5 @@
+config_profile: "default"
+
 exchange:
   api_key_env: BYBIT_API_KEY
   api_secret_env: BYBIT_API_SECRET
@@ -141,6 +143,3 @@ backtest:
   borrow_cost_bps: 0.0
   allow_partial_fills: true
   cache_dir: data_cache
-
-# Optional overlay profile applied by loader: base config.yaml + config/profiles/profile_<name>.yaml
-# config_profile: "default"
