@@ -17,6 +17,9 @@ class RiskState:
     start_equity: float
     high_water: float
     kill_switch: bool
+    # observability / multi-day controls
+    consecutive_loss_days: int = 0
+    last_seen_equity: float | None = None
 
 
 class RiskManager:
@@ -44,12 +47,38 @@ class RiskManager:
                         start_equity=float(raw["start_equity"]),
                         high_water=float(raw.get("high_water", raw["start_equity"])),
                         kill_switch=bool(raw.get("kill_switch", False)),
+                        consecutive_loss_days=int(raw.get("consecutive_loss_days", 0) or 0),
+                        last_seen_equity=float(raw.get("last_seen_equity")) if raw.get("last_seen_equity") is not None else None,
                     )
                     return self.state
+                # Day rollover: carry consecutive-loss counter forward based on prior day's outcome.
+                prev_start = float(raw.get("start_equity") or current_equity)
+                prev_last = raw.get("last_seen_equity")
+                prev_last_f = float(prev_last) if prev_last is not None else prev_start
+                prev_pnl = prev_last_f - prev_start
+                prev_cons = int(raw.get("consecutive_loss_days", 0) or 0)
+                cons = (prev_cons + 1) if float(prev_pnl) < 0 else 0
+                self.state = RiskState(
+                    day=day,
+                    start_equity=float(current_equity),
+                    high_water=float(current_equity),
+                    kill_switch=False,
+                    consecutive_loss_days=int(cons),
+                    last_seen_equity=float(current_equity),
+                )
+                self._persist()
+                return self.state
             except Exception as e:
                 logger.warning("Failed to parse risk state; reinitializing: {}", e)
 
-        self.state = RiskState(day=day, start_equity=float(current_equity), high_water=float(current_equity), kill_switch=False)
+        self.state = RiskState(
+            day=day,
+            start_equity=float(current_equity),
+            high_water=float(current_equity),
+            kill_switch=False,
+            consecutive_loss_days=0,
+            last_seen_equity=float(current_equity),
+        )
         self._persist()
         return self.state
 
@@ -61,6 +90,8 @@ class RiskManager:
             "start_equity": self.state.start_equity,
             "high_water": self.state.high_water,
             "kill_switch": self.state.kill_switch,
+            "consecutive_loss_days": int(self.state.consecutive_loss_days),
+            "last_seen_equity": self.state.last_seen_equity,
         }
         self.state_path.write_bytes(orjson.dumps(payload, option=orjson.OPT_INDENT_2))
 
@@ -73,18 +104,58 @@ class RiskManager:
 
         st = self.load_or_init(current_equity)
         st.high_water = max(st.high_water, float(current_equity))
+        st.last_seen_equity = float(current_equity)
 
         loss_limit = 1.0 - float(self.cfg.daily_loss_limit_pct) / 100.0
+        tier2_pct = getattr(self.cfg, "daily_loss_limit_pct_tier2", None)
+        tier2_limit = None
+        if tier2_pct is not None:
+            try:
+                tier2_limit = 1.0 - float(tier2_pct) / 100.0
+            except Exception:
+                tier2_limit = None
         dd_limit = 1.0 - float(self.cfg.max_drawdown_pct) / 100.0
 
         daily_ok = float(current_equity) >= float(st.start_equity) * loss_limit
+        daily_ok_tier2 = True
+        if tier2_limit is not None:
+            daily_ok_tier2 = float(current_equity) >= float(st.start_equity) * float(tier2_limit)
         dd_ok = float(current_equity) >= float(st.high_water) * dd_limit
+        max_cons = int(getattr(self.cfg, "max_consecutive_loss_days", 0) or 0)
+        cons_ok = True if max_cons <= 0 else int(st.consecutive_loss_days) < int(max_cons)
+
+        if not cons_ok:
+            st.kill_switch = True
+            self._persist()
+            return False, {
+                "kill_switch": True,
+                "reason": "kill_switch_consecutive_loss",
+                "consecutive_loss_days": int(st.consecutive_loss_days),
+                "max_consecutive_loss_days": int(max_cons),
+                "start_equity": st.start_equity,
+                "high_water": st.high_water,
+                "current_equity": float(current_equity),
+            }
+
+        if not daily_ok_tier2:
+            st.kill_switch = True
+            self._persist()
+            return False, {
+                "kill_switch": True,
+                "reason": "kill_switch_tier2",
+                "daily_ok_tier2": daily_ok_tier2,
+                "tier2_pct": tier2_pct,
+                "start_equity": st.start_equity,
+                "high_water": st.high_water,
+                "current_equity": float(current_equity),
+            }
 
         if not daily_ok or not dd_ok:
             st.kill_switch = True
             self._persist()
             return False, {
                 "kill_switch": True,
+                "reason": "kill_switch_tier1",
                 "daily_ok": daily_ok,
                 "dd_ok": dd_ok,
                 "start_equity": st.start_equity,
@@ -103,6 +174,7 @@ class RiskManager:
             "start_equity": st.start_equity,
             "high_water": st.high_water,
             "current_equity": float(current_equity),
+            "consecutive_loss_days": int(st.consecutive_loss_days),
         }
 
 

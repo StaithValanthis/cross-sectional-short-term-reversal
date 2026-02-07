@@ -1,0 +1,4 @@
+# Default overlay profile (intentionally minimal).
+# Use this to document/override settings without editing `config.yaml`.
+{}
+

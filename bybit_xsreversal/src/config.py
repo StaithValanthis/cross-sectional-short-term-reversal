@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 
 class ExchangeConfig(BaseModel):
@@ -12,6 +12,20 @@ class ExchangeConfig(BaseModel):
     api_secret_env: str = Field(default="BYBIT_API_SECRET")
     testnet: bool = True
     category: Literal["linear"] = "linear"
+
+    # Startup-only leverage alignment (opt-in)
+    set_leverage_on_startup: bool = False
+    leverage: str = "5"
+    leverage_apply_mode: Literal["universe", "positions"] = "universe"
+    leverage_symbols_max: int = 200
+    leverage_state_path: str = "outputs/state/leverage_state.json"
+
+    @field_validator("category")
+    @classmethod
+    def _category_linear_only(cls, v: str) -> str:
+        if str(v) != "linear":
+            raise ValueError("Only USDT linear perps are supported: exchange.category must be 'linear'")
+        return v
 
 
 class LiquidityBucketConfig(BaseModel):
@@ -37,6 +51,14 @@ class SignalConfig(BaseModel):
     short_quantile: float = 0.1
     long_only: bool = False
 
+    @model_validator(mode="after")
+    def _validate_quantiles(self) -> "SignalConfig":
+        if not (0.0 < float(self.long_quantile) < 1.0):
+            raise ValueError("signal.long_quantile must be in (0,1)")
+        if not (0.0 < float(self.short_quantile) < 1.0):
+            raise ValueError("signal.short_quantile must be in (0,1)")
+        return self
+
 
 class RebalanceConfig(BaseModel):
     frequency: Literal["daily"] = "daily"
@@ -47,6 +69,10 @@ class RebalanceConfig(BaseModel):
     rebalance_fraction: float = 1.0  # 1.0 = full rebalance, 0.5 = half-way toward target
     min_weight_change_bps: float = 5.0  # skip trades below this weight delta (bps of equity)
     flatten_on_empty_targets: bool = False  # if true, close all positions when target book is empty
+
+    # Turnover / fee guardrail (optional). Applies to NON-risk orders only.
+    max_turnover_per_rebalance_equity_mult: float | None = None
+    turnover_cap_mode: Literal["scale", "skip"] = "scale"
 
 
 class SizingConfig(BaseModel):
@@ -67,6 +93,12 @@ class RegimeFilterConfig(BaseModel):
     ema_slow: int = 50
     action: Literal["skip", "scale_down", "switch_to_momentum"] = "scale_down"
     scale_factor: float = 0.35
+
+    # Observability + optional dynamic gross scaling
+    log_actions: bool = False
+    dynamic_gross_scale_enabled: bool = False
+    dynamic_gross_scale_min: float = 1.0
+    dynamic_gross_scale_max: float = 5.0
 
 
 class FiltersConfig(BaseModel):
@@ -99,6 +131,10 @@ class ExecutionConfig(BaseModel):
     bump_mode: Literal["respect_cap", "force_exchange_min"] = "respect_cap"
     min_order_value_usdt: float | None = 5.0
 
+    # Churn reduction + observability
+    max_cancel_replace_per_symbol: int = 3
+    log_execution_quality: bool = True
+
 
 class VolSpikeConfig(BaseModel):
     enabled: bool = False
@@ -108,17 +144,76 @@ class VolSpikeConfig(BaseModel):
 
 class RiskConfig(BaseModel):
     daily_loss_limit_pct: float = 2.5
+    daily_loss_limit_pct_tier2: float | None = None
     max_drawdown_pct: float = 20.0
     max_turnover: float = 2.0
     kill_switch_enabled: bool = True
+    max_consecutive_loss_days: int = 0
+
     # Soft per-position exits (applied at rebalance time by overriding target_notional -> 0)
-    # 0 disables.
     max_hold_days: int = 0
-    # 0 disables. Example: 0.75 means a position may not lose more than 0.75% of equity (unrealized).
     max_loss_per_position_pct_equity: float = 0.0
-    # 0 disables. If > 0, symbols that were force-closed by risk controls are excluded from targets for N days.
     cooldown_days_after_forced_exit: int = 0
     stop_new_trades_on_vol_spike: VolSpikeConfig = Field(default_factory=VolSpikeConfig)
+
+
+class IntradayExitsConfig(BaseModel):
+    enabled: bool = False
+    dry_run: bool = True
+    interval_minutes: int = 60
+    category: Literal["linear"] = "linear"
+    state_path: str = "outputs/state/intraday_exits_state.json"
+
+    candle_interval_trigger: str = "60"  # 1H
+    atr_interval: str = "240"  # 4H
+    atr_period: int = 14
+    min_bars_trigger: int = 3
+    min_bars_atr: int = 30
+
+    fixed_atr_stop_enabled: bool = False
+    fixed_atr_k: float = 2.0
+
+    trailing_atr_stop_enabled: bool = False
+    trailing_atr_k: float = 2.5
+
+    stop_to_breakeven_enabled: bool = False
+    breakeven_trigger_atr_t: float = 1.5
+    breakeven_costs_bps: float = 6.0
+
+    time_stop_enabled: bool = False
+    time_stop_hours: int = 24
+    time_stop_only_if_unprofitable: bool = True
+
+    use_intrabar_trigger: bool = True
+    use_last_price_trigger: bool = False
+    max_positions_per_cycle: int = 200
+
+    exit_order_type: Literal["market", "limit"] = "market"
+    exit_price_offset_bps: float = 0.0
+    cancel_existing_exit_orders: bool = True
+    min_notional_to_exit_usd: float = 5.0
+
+    @model_validator(mode="after")
+    def _validate_intraday(self) -> "IntradayExitsConfig":
+        if str(self.category) != "linear":
+            raise ValueError("intraday_exits.category must be 'linear'")
+        if int(self.interval_minutes) < 5:
+            raise ValueError("intraday_exits.interval_minutes must be >= 5")
+        if int(self.atr_period) < 2:
+            raise ValueError("intraday_exits.atr_period must be >= 2")
+        if float(self.fixed_atr_k) <= 0:
+            raise ValueError("intraday_exits.fixed_atr_k must be > 0")
+        if float(self.trailing_atr_k) <= 0:
+            raise ValueError("intraday_exits.trailing_atr_k must be > 0")
+        if float(self.breakeven_trigger_atr_t) <= 0:
+            raise ValueError("intraday_exits.breakeven_trigger_atr_t must be > 0")
+        if int(self.time_stop_hours) < 1 or int(self.time_stop_hours) > 168:
+            raise ValueError("intraday_exits.time_stop_hours must be between 1 and 168")
+        if int(self.max_positions_per_cycle) <= 0:
+            raise ValueError("intraday_exits.max_positions_per_cycle must be > 0")
+        if float(self.min_notional_to_exit_usd) < 0:
+            raise ValueError("intraday_exits.min_notional_to_exit_usd must be >= 0")
+        return self
 
 
 class BacktestConfig(BaseModel):
@@ -134,6 +229,9 @@ class BacktestConfig(BaseModel):
 
 
 class BotConfig(BaseModel):
+    # Optional overlay profile applied by the loader (base config + profiles/<config_profile>.yaml).
+    config_profile: str = "default"
+
     exchange: ExchangeConfig = Field(default_factory=ExchangeConfig)
     universe: UniverseConfig = Field(default_factory=UniverseConfig)
     signal: SignalConfig = Field(default_factory=SignalConfig)
@@ -143,6 +241,8 @@ class BotConfig(BaseModel):
     funding: FundingConfig = Field(default_factory=FundingConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
+    intraday_exits: IntradayExitsConfig = Field(default_factory=IntradayExitsConfig)
+
     backtest: BacktestConfig
 
 
@@ -157,12 +257,30 @@ def load_yaml_config(path: str | Path) -> dict:
     return data
 
 
+def _deep_merge_dicts(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = dict(base)
+    for k, v in (overlay or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge_dicts(out[k], v)  # type: ignore[arg-type]
+        else:
+            out[k] = v
+    return out
+
+
 def load_config(path: str | Path) -> BotConfig:
     raw = load_yaml_config(path)
+
+    profile = str(raw.get("config_profile") or "default").strip()
+    if profile and profile != "default":
+        prof_path = Path(path).parent / "profiles" / f"profile_{profile}.yaml"
+        if prof_path.exists():
+            overlay = load_yaml_config(prof_path)
+            raw = _deep_merge_dicts(raw, overlay)
+        else:
+            raise ValueError(f"config_profile='{profile}' requested but profile file not found: {prof_path.resolve()}")
+
     try:
         return BotConfig.model_validate(raw)
     except ValidationError as e:
         msg = f"Invalid config at {Path(path).resolve()}:\n{e}"
         raise ValueError(msg) from e
-
-

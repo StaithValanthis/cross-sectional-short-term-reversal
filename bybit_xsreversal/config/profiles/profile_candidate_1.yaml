@@ -1,0 +1,13 @@
+# Candidate profile (placeholder for research winners).
+# Activate by setting in `config.yaml`:
+#   config_profile: "candidate_1"
+signal:
+  lookback_days: 1
+  long_quantile: 0.2
+  short_quantile: 0.2
+sizing:
+  vol_lookback_days: 14
+rebalance:
+  rebalance_fraction: 0.36
+  min_weight_change_bps: 400.0
+

@@ -1,0 +1,1 @@
+# Research scripts for 30-day trade analysis and counterfactuals (read-only).

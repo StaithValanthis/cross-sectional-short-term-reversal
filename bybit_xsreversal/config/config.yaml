@@ -3,6 +3,12 @@ exchange:
   api_secret_env: BYBIT_API_SECRET
   testnet: true
   category: linear
+  # Startup-only leverage alignment (opt-in). This only runs at process start.
+  set_leverage_on_startup: false
+  leverage: "5"
+  leverage_apply_mode: "universe"      # "universe" or "positions"
+  leverage_symbols_max: 200
+  leverage_state_path: "outputs/state/leverage_state.json"
 universe:
   top_n_by_volume: 80
   exclude_symbols: []
@@ -28,6 +34,12 @@ rebalance:
   interval_days: 1
   rebalance_fraction: 0.36
   min_weight_change_bps: 400.0
+  # Optional turnover/fee guardrail applied per rebalance to NON-risk orders.
+  # - null disables.
+  # - cap = mult * equity_usdt.
+  # - mode "scale" scales deltas down; "skip" drops all non-risk orders.
+  max_turnover_per_rebalance_equity_mult: null
+  turnover_cap_mode: "scale"
 sizing:
   target_gross_leverage: 0.92
   vol_lookback_days: 14
@@ -48,6 +60,10 @@ filters:
     ema_slow: 50
     action: switch_to_momentum
     scale_factor: 0.35
+    log_actions: false
+    dynamic_gross_scale_enabled: false
+    dynamic_gross_scale_min: 1.0
+    dynamic_gross_scale_max: 5.0
 funding:
   model_in_backtest: true
   filter:
@@ -63,11 +79,15 @@ execution:
   ioc_fallback: true
   bump_to_min_qty: false
   cancel_open_orders: "symbols"
+  max_cancel_replace_per_symbol: 3
+  log_execution_quality: true
 risk:
   daily_loss_limit_pct: 2.5
+  daily_loss_limit_pct_tier2: null
   max_drawdown_pct: 20.0
   max_turnover: 2.0
   kill_switch_enabled: true
+  max_consecutive_loss_days: 0
   max_hold_days: 3
   max_loss_per_position_pct_equity: 3.0
   cooldown_days_after_forced_exit: 2
@@ -75,6 +95,42 @@ risk:
     enabled: false
     lookback_days: 14
     threshold_multiplier: 2.5
+intraday_exits:
+  # Exit-only, optional intraday loop that can CLOSE positions between daily rebalances.
+  enabled: false
+  dry_run: true
+  interval_minutes: 60
+  category: "linear"
+  state_path: "outputs/state/intraday_exits_state.json"
+
+  candle_interval_trigger: "60"    # 1H
+  atr_interval: "240"             # 4H
+  atr_period: 14
+  min_bars_trigger: 3
+  min_bars_atr: 30
+
+  fixed_atr_stop_enabled: false
+  fixed_atr_k: 2.0
+
+  trailing_atr_stop_enabled: false
+  trailing_atr_k: 2.5
+
+  stop_to_breakeven_enabled: false
+  breakeven_trigger_atr_t: 1.5
+  breakeven_costs_bps: 6.0
+
+  time_stop_enabled: false
+  time_stop_hours: 24
+  time_stop_only_if_unprofitable: true
+
+  use_intrabar_trigger: true      # 1H bar low/high crossing
+  use_last_price_trigger: false   # optional alternative
+  max_positions_per_cycle: 200
+
+  exit_order_type: "market"       # default safest
+  exit_price_offset_bps: 0        # only if limit exits supported
+  cancel_existing_exit_orders: true
+  min_notional_to_exit_usd: 5.0
 backtest:
   start_date: '2023-01-01'
   end_date: '2025-01-01'
@@ -85,3 +141,6 @@ backtest:
   borrow_cost_bps: 0.0
   allow_partial_fills: true
   cache_dir: data_cache
+
+# Optional overlay profile applied by loader: base config.yaml + config/profiles/profile_<name>.yaml
+# config_profile: "default"

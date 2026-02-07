@@ -152,6 +152,102 @@ def _wallet_equity_usdt(wallet: dict[str, Any]) -> float:
         return 0.0
 
 
+def apply_turnover_cap(
+    *,
+    cfg: BotConfig,
+    md: MarketData,
+    positions_actual: dict[str, Position],
+    target_notionals: dict[str, float],
+    force_close_reasons: dict[str, str] | None,
+    equity_usdt: float | None,
+) -> tuple[dict[str, float], dict[str, Any] | None]:
+    """
+    Optional turnover cap guardrail. Applies to NON-risk orders only.
+    Risk exits (force_close_reasons) and reconciliation closes (target=0, position!=0) bypass the cap.
+    """
+    cap_mult = getattr(cfg.rebalance, "max_turnover_per_rebalance_equity_mult", None)
+    if cap_mult is None or equity_usdt is None:
+        return dict(target_notionals), None
+    try:
+        cap_mult_f = float(cap_mult)
+    except Exception:
+        return dict(target_notionals), None
+    if not cap_mult_f or cap_mult_f <= 0:
+        return dict(target_notionals), None
+
+    cap_usd = float(cap_mult_f) * float(equity_usdt)
+    mode_tc = str(getattr(cfg.rebalance, "turnover_cap_mode", "scale"))
+    force = force_close_reasons or {}
+
+    projected = 0.0
+    for sym in sorted(set(positions_actual) | set(target_notionals)):
+        pos = positions_actual.get(sym)
+        cur_qty = float(pos.size) if pos else 0.0
+        tgt_notional = float(target_notionals.get(sym, 0.0))
+
+        if sym in force:
+            continue
+        if abs(tgt_notional) < 1e-9 and abs(cur_qty) > 1e-9:
+            continue
+
+        px = 0.0
+        try:
+            px = float(md.get_orderbook_stats(sym).mid)
+        except Exception:
+            px = float(pos.mark_price) if pos and pos.mark_price > 0 else 0.0
+        if px <= 0:
+            continue
+        cur_notional = float(cur_qty) * float(px)
+        projected += abs(float(tgt_notional) - float(cur_notional))
+
+    if projected <= cap_usd or projected <= 0:
+        return dict(target_notionals), None
+
+    factor = cap_usd / projected if cap_usd > 0 else 0.0
+    factor = max(0.0, min(1.0, factor))
+    info = {"projected_turnover_usd": projected, "cap_usd": cap_usd, "factor": factor, "mode": mode_tc}
+
+    out = dict(target_notionals)
+    if mode_tc == "skip":
+        for sym in sorted(set(positions_actual) | set(target_notionals)):
+            if sym in force:
+                continue
+            pos = positions_actual.get(sym)
+            cur_qty = float(pos.size) if pos else 0.0
+            tgt_notional = float(target_notionals.get(sym, 0.0))
+            if abs(tgt_notional) < 1e-9 and abs(cur_qty) > 1e-9:
+                continue
+            px = 0.0
+            try:
+                px = float(md.get_orderbook_stats(sym).mid)
+            except Exception:
+                px = float(pos.mark_price) if pos and pos.mark_price > 0 else 0.0
+            if px <= 0:
+                continue
+            out[sym] = float(cur_qty) * float(px)
+        return out, info
+
+    # scale
+    for sym in sorted(set(positions_actual) | set(target_notionals)):
+        if sym in force:
+            continue
+        pos = positions_actual.get(sym)
+        cur_qty = float(pos.size) if pos else 0.0
+        tgt_notional = float(target_notionals.get(sym, 0.0))
+        if abs(tgt_notional) < 1e-9 and abs(cur_qty) > 1e-9:
+            continue
+        px = 0.0
+        try:
+            px = float(md.get_orderbook_stats(sym).mid)
+        except Exception:
+            px = float(pos.mark_price) if pos and pos.mark_price > 0 else 0.0
+        if px <= 0:
+            continue
+        cur_notional = float(cur_qty) * float(px)
+        out[sym] = float(cur_notional + factor * (float(tgt_notional) - float(cur_notional)))
+    return out, info
+
+
 def plan_rebalance_orders(
     *,
     cfg: BotConfig,
@@ -1024,6 +1120,18 @@ def run_rebalance(
                 e.loss_pct_equity,
                 e.threshold,
             )
+
+    # ---------- Turnover cap (optional, NON-risk only) ----------
+    target_notionals_eff, turnover_cap_info = apply_turnover_cap(
+        cfg=cfg,
+        md=md,
+        positions_actual=positions_actual,
+        target_notionals=target_notionals_eff,
+        force_close_reasons=force_close_reasons,
+        equity_usdt=equity_exec,
+    )
+    if turnover_cap_info is not None:
+        logger.warning("Turnover cap applied: {}", turnover_cap_info)
     
     # Adjust positions to account for pending orders
     if pending_qty_by_symbol:
@@ -1120,6 +1228,8 @@ def run_rebalance(
     logger.info("Planned {} orders", len(orders))
     for o in orders:
         ex.place_with_fallback(o)
+    if bool(getattr(cfg.execution, "log_execution_quality", True)):
+        logger.info("Execution quality: {}", ex.execution_quality())
 
     # Summary of position reconciliation
     positions_in_universe = [s for s in positions_final.keys() if abs(target_notionals_eff.get(s, 0.0)) > 1e-8]
@@ -1150,6 +1260,8 @@ def run_rebalance(
             "risk_events": [e.__dict__ for e in risk_events],
             "cooldown_events": [e.__dict__ for e in cooldown_events],
         },
+        "turnover_cap": turnover_cap_info,
+        "execution_quality": ex.execution_quality(),
         "summary": {
             "target_symbols": len(target_notionals_eff),
             "current_symbols": len(positions_final),

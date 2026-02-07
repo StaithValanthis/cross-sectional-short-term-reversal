@@ -39,6 +39,8 @@ class PlannedOrder:
     order_type: Literal["limit", "market"]
     limit_price: float | None
     reason: str
+    # Optional orderLinkId prefix (used to tag specific subsystems like intraday exits)
+    order_link_id_prefix: str | None = None
 
 
 class Executor:
@@ -48,6 +50,18 @@ class Executor:
         self.cfg = cfg
         self.dry_run = dry_run
         self.equity_usdt = float(equity_usdt) if equity_usdt is not None else None
+        self._cancel_replace_counts: dict[str, int] = {}
+        self._quality: dict[str, Any] = {
+            "placed_limit": 0,
+            "placed_market": 0,
+            "fallback_market": 0,
+            "canceled_stale": 0,
+            "cancel_failed": 0,
+            "poll_fail": 0,
+            "min_value_market_fallback": 0,
+            "forced_close_direct_market": 0,
+            "avg_cancel_age_seconds": None,
+        }
 
     def _limit_price(self, symbol: str, side: Side) -> float:
         stats = self.md.get_orderbook_stats(symbol)
@@ -305,8 +319,10 @@ class Executor:
                         order.symbol, order.side, qty_str, order.reduce_only, order.order_type, order.limit_price, order.reason)
             return None
 
-        link_id = f"xsrev-{uuid.uuid4().hex[:16]}"
+        prefix = str(order.order_link_id_prefix or "xsrev-")
+        link_id = f"{prefix}{uuid.uuid4().hex[:16]}"
         if order.order_type == "market":
+            self._quality["placed_market"] = int(self._quality["placed_market"]) + 1
             payload = {
                 "symbol": order.symbol,
                 "side": order.side,
@@ -317,8 +333,15 @@ class Executor:
                 "orderLinkId": link_id,
             }
         else:
-            px = float(order.limit_price) if order.limit_price is not None else self._limit_price(order.symbol, order.side)
-            tif = "PostOnly" if self.cfg.execution.post_only else "GTC"
+            # For forced closes, do NOT use post-only / maker bias. Prefer IOC so we close now.
+            if is_forced_close:
+                stats = self.md.get_orderbook_stats(order.symbol)
+                px = float(order.limit_price) if order.limit_price is not None else (float(stats.best_ask) if order.side == "Buy" else float(stats.best_bid))
+                tif = "IOC"
+            else:
+                px = float(order.limit_price) if order.limit_price is not None else self._limit_price(order.symbol, order.side)
+                tif = "PostOnly" if self.cfg.execution.post_only else "GTC"
+            self._quality["placed_limit"] = int(self._quality["placed_limit"]) + 1
             payload = {
                 "symbol": order.symbol,
                 "side": order.side,
@@ -356,6 +379,7 @@ class Executor:
                     order.symbol,
                     order.side,
                 )
+                self._quality["min_value_market_fallback"] = int(self._quality["min_value_market_fallback"]) + 1
                 # Retry with market order - for closing positions, we prioritize execution over maker fees
                 market_payload = {
                     "symbol": order.symbol,
@@ -364,9 +388,10 @@ class Executor:
                     "qty": qty_str,
                     "timeInForce": "IOC",
                     "reduceOnly": bool(order.reduce_only),
-                    "orderLinkId": f"xsrev-{uuid.uuid4().hex[:16]}",
+                    "orderLinkId": f"{prefix}{uuid.uuid4().hex[:16]}",
                 }
                 try:
+                    self._quality["placed_market"] = int(self._quality["placed_market"]) + 1
                     res = self.client.create_order(category=self.cfg.exchange.category, order=market_payload)
                     logger.info(
                         "Market order placed (fallback for min value): {} {} qty={} reduceOnly={} reason={} id={}",
@@ -405,6 +430,29 @@ class Executor:
         """
         Place a maker-biased limit order and wait briefly. If still open, cancel and fall back to market/IOC.
         """
+        reason_s = str(order.reason)
+        is_forced_close = bool(order.reduce_only) and (
+            ("close_outside_universe" in reason_s) or reason_s.startswith("risk_") or ("|risk_" in reason_s)
+        )
+
+        # Churn reduction: after N cancel/replace attempts per symbol in this cycle, use market directly for closes.
+        max_cr = int(getattr(self.cfg.execution, "max_cancel_replace_per_symbol", 3) or 0)
+        n_cr = int(self._cancel_replace_counts.get(order.symbol, 0))
+        if is_forced_close and max_cr > 0 and n_cr >= max_cr:
+            self._quality["forced_close_direct_market"] = int(self._quality["forced_close_direct_market"]) + 1
+            fallback = PlannedOrder(
+                symbol=order.symbol,
+                side=order.side,
+                qty=order.qty,
+                reduce_only=order.reduce_only,
+                order_type="market",
+                limit_price=None,
+                reason=f"{order.reason}|direct_market_after_cancel_replace_cap",
+                order_link_id_prefix=order.order_link_id_prefix,
+            )
+            self.place(fallback)
+            return
+
         if order.order_type == "market" or not self.cfg.execution.ioc_fallback:
             self.place(order)
             return
@@ -426,14 +474,18 @@ class Executor:
             except Exception as e:
                 # Don't crash the whole rebalance if an order status poll fails (rate limits, temporary API issues).
                 logger.warning("Open-order poll failed for {} (orderId={}): {}", order.symbol, oid, e)
+                self._quality["poll_fail"] = int(self._quality["poll_fail"]) + 1
             time.sleep(0.5)
 
         # Cancel and fallback
         try:
             self.client.cancel_order(category=self.cfg.exchange.category, symbol=order.symbol, order_id=oid)
             logger.info("Canceled stale order {}", oid)
+            self._quality["canceled_stale"] = int(self._quality["canceled_stale"]) + 1
+            self._cancel_replace_counts[order.symbol] = int(self._cancel_replace_counts.get(order.symbol, 0)) + 1
         except Exception as e:
             logger.warning("Cancel failed (maybe already filled): {}: {}", oid, e)
+            self._quality["cancel_failed"] = int(self._quality["cancel_failed"]) + 1
 
         fallback = PlannedOrder(
             symbol=order.symbol,
@@ -443,7 +495,14 @@ class Executor:
             order_type="market",
             limit_price=None,
             reason=f"{order.reason}|fallback_market",
+            order_link_id_prefix=order.order_link_id_prefix,
         )
+        self._quality["fallback_market"] = int(self._quality["fallback_market"]) + 1
         self.place(fallback)
+
+    def execution_quality(self) -> dict[str, Any]:
+        # Provide a stable snapshot for logging / returning in run_rebalance
+        q = dict(self._quality)
+        return q
 
 

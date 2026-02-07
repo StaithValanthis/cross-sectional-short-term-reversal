@@ -135,6 +135,7 @@ def compute_targets_from_daily_candles(
     signal_mode: str = "reversal"
     rf = config.filters.regime_filter
     market_df = market_proxy_candles if (rf.enabled and rf.use_market_regime) else None
+    market_decision = None
     if rf.enabled and market_df is not None:
         mdec = regime_gate(
             symbol_df=market_df,
@@ -146,6 +147,9 @@ def compute_targets_from_daily_candles(
             action=rf.action,
             scale_factor=rf.scale_factor,
         )
+        market_decision = mdec
+        if bool(getattr(rf, "log_actions", False)):
+            logger.info("Regime (market) decision={} scale={} meta={}", mdec.action, float(mdec.scale), mdec.meta)
         if mdec.action == "switch_to_momentum":
             signal_mode = "momentum"
             # Flip selection: long winners, short losers
@@ -156,10 +160,22 @@ def compute_targets_from_daily_candles(
     long_scores = {s: 1.0 / vol[s] for s in selected_longs}
     short_scores = {s: 1.0 / vol[s] for s in selected_shorts}
 
+    # Optional dynamic gross scaling (opt-in): adjust target gross based on market regime scale.
+    base_gross = float(config.sizing.target_gross_leverage)
+    eff_gross = base_gross
+    if bool(getattr(rf, "dynamic_gross_scale_enabled", False)) and market_decision is not None:
+        try:
+            eff_gross = float(base_gross) * float(market_decision.scale)
+            eff_gross = max(float(getattr(rf, "dynamic_gross_scale_min", 1.0)), min(float(getattr(rf, "dynamic_gross_scale_max", 5.0)), eff_gross))
+        except Exception:
+            eff_gross = base_gross
+        if bool(getattr(rf, "log_actions", False)):
+            logger.info("Dynamic gross scaling: base_gross={} effective_gross={}", base_gross, eff_gross)
+
     raw_weights = build_dollar_neutral_weights(
         long_scores=long_scores,
         short_scores=short_scores,
-        target_gross_leverage=float(config.sizing.target_gross_leverage),
+        target_gross_leverage=float(eff_gross),
         max_abs_weight_per_symbol=float(config.sizing.max_leverage_per_symbol),
         long_only=bool(config.signal.long_only),
     )
@@ -170,7 +186,7 @@ def compute_targets_from_daily_candles(
     if rf.enabled:
         # Market regime decision (single) can scale the whole book.
         if market_df is not None:
-            mdec = regime_gate(
+            mdec = market_decision or regime_gate(
                 symbol_df=market_df,
                 market_df=None,
                 symbol_adx_threshold=rf.market_adx_threshold,
@@ -181,9 +197,13 @@ def compute_targets_from_daily_candles(
                 scale_factor=rf.scale_factor,
             )
             regime_meta["market"] = {"decision": mdec.action, "scale": mdec.scale, **mdec.meta}
+            regime_meta["effective_target_gross_leverage"] = float(eff_gross)
+            # If dynamic gross scaling is enabled, we already applied market scale via eff_gross.
+            apply_market_scale_to_weights = not bool(getattr(rf, "dynamic_gross_scale_enabled", False))
+
             if mdec.scale == 0.0:
                 final_weights = {k: 0.0 for k in final_weights}
-            else:
+            elif apply_market_scale_to_weights:
                 final_weights = {k: v * mdec.scale for k, v in final_weights.items()}
 
         # Symbol regime (optional): scale per-symbol
@@ -202,6 +222,10 @@ def compute_targets_from_daily_candles(
             per_symbol[sym] = {"decision": sdec.action, "scale": sdec.scale, **sdec.meta}
             final_weights[sym] = float(final_weights[sym]) * float(sdec.scale)
         regime_meta["per_symbol"] = per_symbol
+        if bool(getattr(rf, "log_actions", False)):
+            # Avoid logging thousands of lines: only log decisions for symbols we actually trade.
+            for sym, info in list(per_symbol.items())[:200]:
+                logger.info("Regime (symbol) {} decision={} scale={} meta={}", sym, info.get("decision"), info.get("scale"), {k: info.get(k) for k in ("symbol_adx", "symbol_ema_slope", "market_adx")})
 
     # Drop tiny weights induced by scaling
     final_weights = {k: float(v) for k, v in final_weights.items() if abs(float(v)) > 1e-8}

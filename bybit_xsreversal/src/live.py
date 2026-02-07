@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +14,14 @@ from rich.table import Table
 from src.config import BotConfig
 from src.data.bybit_client import BybitAuth, BybitClient
 from src.data.market_data import MarketData, normalize_symbol
+from src.execution.executor import Executor, PlannedOrder
+from src.execution.intraday_exits import (
+    build_intraday_candle_window,
+    ensure_entry_ts_from_position,
+    evaluate_intraday_exit_decisions,
+    load_intraday_state,
+    save_intraday_state,
+)
 from src.execution.rebalance import fetch_equity_usdt, run_rebalance
 from src.execution.risk import RiskManager
 from src.strategy.xs_reversal import compute_targets_from_daily_candles
@@ -47,11 +55,120 @@ def _print_targets(console: Console, notionals: dict[str, float]) -> None:
     console.print(t)
 
 
+def _apply_leverage_on_startup(*, cfg: BotConfig, client: BybitClient, md: MarketData) -> None:
+    ex = cfg.exchange
+    if not bool(getattr(ex, "set_leverage_on_startup", False)):
+        return
+
+    state_path = Path(str(getattr(ex, "leverage_state_path", "outputs/state/leverage_state.json")))
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+
+    today = datetime.now(tz=UTC).date().isoformat()
+    leverage = str(getattr(ex, "leverage", "5"))
+    mode = str(getattr(ex, "leverage_apply_mode", "universe"))
+
+    # Idempotency: don't spam on restart.
+    if state_path.exists():
+        try:
+            raw = orjson.loads(state_path.read_bytes())
+            if (
+                str(raw.get("day") or "") == today
+                and str(raw.get("leverage") or "") == leverage
+                and str(raw.get("mode") or "") == mode
+            ):
+                logger.info("Leverage already applied today (mode={}, leverage={}); skipping set-leverage calls.", mode, leverage)
+                return
+        except Exception:
+            pass
+
+    symbols: list[str] = []
+    if mode == "positions":
+        pos = client.get_positions(category="linear", settle_coin="USDT")
+        for p in pos:
+            sym = normalize_symbol(str(p.get("symbol", "")))
+            if not sym:
+                continue
+            size = float(p.get("size") or 0.0)
+            if abs(size) <= 1e-12:
+                continue
+            symbols.append(sym)
+    else:
+        symbols = [normalize_symbol(s) for s in md.get_liquidity_ranked_symbols()]
+
+    symbols = sorted(set(symbols))[: int(getattr(ex, "leverage_symbols_max", 200))]
+    if not symbols:
+        logger.info("Leverage-on-startup enabled but no symbols selected (mode={}).", mode)
+        return
+
+    ok = 0
+    for sym in symbols:
+        try:
+            client.set_leverage(category="linear", symbol=sym, leverage=leverage)
+            ok += 1
+        except Exception as e:
+            logger.warning("Failed to set leverage for {}: {}", sym, e)
+
+    payload = {"day": today, "ts_utc": datetime.now(tz=UTC).isoformat(), "mode": mode, "leverage": leverage, "symbols": symbols, "ok": ok}
+    state_path.write_bytes(orjson.dumps(payload, option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS))
+    logger.info("Set leverage on startup: ok={} / {} (mode={}, leverage={})", ok, len(symbols), mode, leverage)
+
+
+def _has_hedge_mode_positions(raw_positions: list[dict[str, Any]]) -> bool:
+    for p in raw_positions or []:
+        try:
+            pos_idx = int(p.get("positionIdx") or 0)
+        except Exception:
+            pos_idx = 0
+        size = float(p.get("size") or 0.0)
+        if pos_idx in (1, 2) and abs(size) > 1e-12:
+            return True
+    return False
+
+
+def _get_last_prices_by_symbol(client: BybitClient, symbols: list[str]) -> dict[str, float]:
+    want = set(map(normalize_symbol, symbols))
+    out: dict[str, float] = {}
+    for t in client.get_tickers(category="linear"):
+        sym = normalize_symbol(str(t.get("symbol", "")))
+        if sym not in want:
+            continue
+        lp = t.get("lastPrice") or t.get("markPrice") or t.get("indexPrice")
+        try:
+            out[sym] = float(lp)
+        except Exception:
+            continue
+    return out
+
+
+def _cancel_existing_exit_orders(*, client: BybitClient, symbols: list[str]) -> int:
+    """
+    Cancel only intraday-exit bot orders (identified by orderLinkId prefix).
+    """
+    canceled = 0
+    for sym in symbols:
+        try:
+            open_orders = client.get_open_orders(category="linear", symbol=sym)
+        except Exception:
+            continue
+        for o in open_orders:
+            link = str(o.get("orderLinkId") or "")
+            oid = str(o.get("orderId") or "")
+            if not oid:
+                continue
+            if not link.startswith("xsrev-exit-"):
+                continue
+            try:
+                client.cancel_order(category="linear", symbol=sym, order_id=oid)
+                canceled += 1
+            except Exception:
+                pass
+    return canceled
+
+
 def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bool = False) -> None:
     console = Console()
 
-    # Optional env override for testnet (installer writes this, and many operators expect it to control the environment).
-    # Config still remains the source of truth if env var is absent.
+    # Optional env override for testnet.
     env_testnet = os.getenv("BYBIT_TESTNET", "").strip().lower()
     if env_testnet in ("1", "true", "yes", "y"):
         if cfg.exchange.testnet is not True:
@@ -62,49 +179,51 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
             logger.warning("Overriding config exchange.testnet={} with env BYBIT_TESTNET=false", cfg.exchange.testnet)
         cfg.exchange.testnet = False
 
-    auth = BybitAuth(
-        api_key=_need_env(cfg.exchange.api_key_env),
-        api_secret=_need_env(cfg.exchange.api_secret_env),
-    )
+    auth = BybitAuth(api_key=_need_env(cfg.exchange.api_key_env), api_secret=_need_env(cfg.exchange.api_secret_env))
     client = BybitClient(auth=auth, testnet=cfg.exchange.testnet)
     md = MarketData(client=client, config=cfg, cache_dir=cfg.backtest.cache_dir)
     risk = RiskManager(cfg=cfg.risk, state_dir=Path("outputs") / "state")
-    state_path = Path("outputs") / "state" / "rebalance_state.json"
+    rb_state_path = Path("outputs") / "state" / "rebalance_state.json"
+
+    intraday_cfg = cfg.intraday_exits
+    intraday_state = load_intraday_state(intraday_cfg.state_path) if intraday_cfg.enabled else None
+    next_intraday_ts: datetime | None = None
 
     try:
         logger.info(
-            "Live trader starting: testnet={} base_url={} category={} dry_run={} rebalance_time_utc={}",
+            "Live trader starting: testnet={} base_url={} category={} dry_run={} rebalance_time_utc={} intraday_exits={}",
             bool(cfg.exchange.testnet),
             getattr(client, "_base_url", "unknown"),
             str(cfg.exchange.category),
             bool(dry_run),
             str(cfg.rebalance.time_utc),
+            bool(intraday_cfg.enabled),
         )
+
+        _apply_leverage_on_startup(cfg=cfg, client=client, md=md)
 
         def _rebalance_once() -> None:
             lock = FileLock(Path("outputs") / "state" / "rebalance.lock")
             if not lock.acquire():
-                logger.warning("Rebalance lock is held by another process; skipping this run to avoid duplicate orders.")
+                logger.warning("Rebalance lock is held by another process; skipping to avoid duplicate orders.")
                 return
             try:
-                # small delay to ensure daily candle is finalized
+                # Delay to ensure daily candle is finalized
                 time.sleep(max(0, int(cfg.rebalance.candle_close_delay_seconds)))
 
-                rb_now = now_utc()  # use current wall time after delay
+                rb_now = now_utc()
                 close_ts = last_complete_daily_close(rb_now, cfg.rebalance.candle_close_delay_seconds)
                 asof_bar = close_ts - timedelta(days=1)
                 logger.info("Rebalance now={} using last complete daily bar start={}", rb_now.isoformat(), asof_bar.isoformat())
 
-                # Rebalance interval control (stateful)
-                # Use current date (not asof_bar date) for interval check to ensure correct calendar day counting
+                # Interval control (stateful)
                 interval_days = max(1, int(cfg.rebalance.interval_days))
-                if not force and interval_days > 1 and state_path.exists():
+                if not force and interval_days > 1 and rb_state_path.exists():
                     try:
-                        st = orjson.loads(state_path.read_bytes())
+                        st = orjson.loads(rb_state_path.read_bytes())
                         last = st.get("last_rebalance_day")
                         if last:
                             last_dt = datetime.fromisoformat(last).replace(tzinfo=UTC)
-                            # Use current date (rb_now) for interval check, not asof_bar (which is yesterday's bar)
                             days_since_last = (rb_now.date() - last_dt.date()).days
                             logger.debug(
                                 "Interval check: last_rebalance_day={}, today={}, days_since={}, interval_days={}, will_rebalance={}",
@@ -124,7 +243,7 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                                 )
                                 return
                     except Exception as e:
-                        logger.warning("Failed to parse rebalance_state.json: {}", e)
+                        logger.warning("Failed to parse rebalance_state.json (continuing): {}", e)
 
                 # Universe + microstructure filtering
                 symbols = [normalize_symbol(s) for s in md.get_liquidity_ranked_symbols()]
@@ -172,11 +291,7 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
 
                 # Equity + risk check
                 equity = fetch_equity_usdt(client=client)
-                logger.info(
-                    "Equity: {:.4f} USDT (min_notional_per_symbol={} USDT)",
-                    float(equity),
-                    float(cfg.sizing.min_notional_per_symbol),
-                )
+                logger.info("Equity: {:.4f} USDT (min_notional_per_symbol={} USDT)", float(equity), float(cfg.sizing.min_notional_per_symbol))
                 if float(equity) <= 0.0:
                     logger.error("Equity is <= 0 USDT; cannot size trades. Skipping rebalance.")
                     return
@@ -185,10 +300,10 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                     logger.error("Risk kill-switch active; skipping trades: {}", risk_info)
                     return
 
-                # Current weights from positions (for turnover controls)
+                # Current weights from positions (for turnover controls inside target computation)
                 current_weights: dict[str, float] = {}
                 try:
-                    positions = client.get_positions(category=cfg.exchange.category, settle_coin="USDT")
+                    positions = client.get_positions(category="linear", settle_coin="USDT")
                     for p in positions:
                         sym = normalize_symbol(str(p.get("symbol", "")))
                         side = str(p.get("side", ""))
@@ -202,7 +317,7 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                 except Exception as e:
                     logger.warning("Failed to compute current weights from positions: {}", e)
 
-                # Fetch candles needed for indicators/signal.
+                # Fetch daily candles
                 buffer_days = int(
                     max(
                         cfg.universe.min_history_days + 10,
@@ -281,7 +396,6 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                     gross_w,
                     str(snapshot.filters.get("signal_mode")),
                 )
-
                 _print_targets(console, targets.notionals_usd)
 
                 out_dir = _ts_dir(Path("outputs") / "live")
@@ -304,37 +418,26 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                         "No target notionals produced (empty target book). Will still reconcile existing positions. See snapshot: {}",
                         snap_path.resolve(),
                     )
-                    # Always reconcile positions even when target book is empty (close positions not in targets)
-                    # This ensures the portfolio matches the strategy's intent (flat when no signals)
 
+                res = run_rebalance(cfg=cfg, client=client, md=md, target_notionals=targets.notionals_usd, dry_run=dry_run)
+                (out_dir / "execution_result.json").write_bytes(orjson.dumps(res, option=orjson.OPT_INDENT_2))
+                logger.info("Rebalance done. Result saved to {}", (out_dir / "execution_result.json").resolve())
+
+                # Enrich snapshot with risk-exit details computed during execution
                 try:
-                    res = run_rebalance(cfg=cfg, client=client, md=md, target_notionals=targets.notionals_usd, dry_run=dry_run)
-                    (out_dir / "execution_result.json").write_bytes(orjson.dumps(res, option=orjson.OPT_INDENT_2))
-                    logger.info("Rebalance done. Result saved to {}", (out_dir / "execution_result.json").resolve())
-                    # Enrich the already-written snapshot with risk-exit details computed during execution
-                    # (risk exits are applied inside run_rebalance after positions are fetched/reconciled).
-                    try:
-                        snap_obj = orjson.loads(snap_path.read_bytes())
-                        snap_obj["risk_exits"] = res.get("risk_exits") or {}
-                        snap_obj["targets_effective"] = res.get("targets_effective") or snap_obj.get("targets")
-                        snap_path.write_bytes(orjson.dumps(snap_obj, option=orjson.OPT_INDENT_2))
-                        logger.info("Updated rebalance snapshot with risk_exits: {}", snap_path.resolve())
-                    except Exception as e:
-                        logger.warning("Failed to enrich rebalance snapshot with risk exits: {}", e)
+                    snap_obj = orjson.loads(snap_path.read_bytes())
+                    snap_obj["risk_exits"] = res.get("risk_exits") or {}
+                    snap_obj["targets_effective"] = res.get("targets_effective") or snap_obj.get("targets")
+                    snap_path.write_bytes(orjson.dumps(snap_obj, option=orjson.OPT_INDENT_2))
                 except Exception as e:
-                    logger.exception("Rebalance execution failed (continuing scheduler): {}", e)
-                    return
+                    logger.warning("Failed to enrich rebalance snapshot with risk exits: {}", e)
 
                 # Update rebalance state
                 try:
-                    state_path.parent.mkdir(parents=True, exist_ok=True)
-                    # Use rb_now.date() (today) to match the interval check logic, not asof_bar (yesterday's bar)
+                    rb_state_path.parent.mkdir(parents=True, exist_ok=True)
                     saved_date = rb_now.date().isoformat()
-                    state_path.write_bytes(
-                        orjson.dumps({"last_rebalance_day": saved_date}, option=orjson.OPT_INDENT_2)
-                    )
-                    logger.info("Saved rebalance state: last_rebalance_day={} (interval_days={}, next rebalance in {} days)", 
-                                saved_date, interval_days, interval_days)
+                    rb_state_path.write_bytes(orjson.dumps({"last_rebalance_day": saved_date}, option=orjson.OPT_INDENT_2))
+                    logger.info("Saved rebalance state: last_rebalance_day={} (interval_days={})", saved_date, interval_days)
                 except Exception as e:
                     logger.warning("Failed to write rebalance_state.json: {}", e)
             except Exception as e:
@@ -342,63 +445,187 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
             finally:
                 lock.release()
 
+        def _intraday_exits_cycle() -> None:
+            nonlocal intraday_state
+            if not intraday_cfg.enabled or intraday_state is None:
+                return
+
+            cycle0 = time.time()
+            counters = {
+                "positions_checked": 0,
+                "decisions_triggered": 0,
+                "exits_placed": 0,
+                "skipped_hedge_mode": 0,
+                "skipped_kill_switch": 0,
+                "missing_candles": 0,
+                "missing_entry_price": 0,
+            }
+
+            try:
+                equity = fetch_equity_usdt(client=client)
+                ok_risk, risk_info = risk.check(equity)
+                if not ok_risk:
+                    counters["skipped_kill_switch"] += 1
+                    logger.warning("Intraday exits: kill-switch active; skipping cycle: {}", risk_info)
+                    return
+
+                raw_pos = client.get_positions(category="linear", settle_coin="USDT")
+                if _has_hedge_mode_positions(raw_pos):
+                    counters["skipped_hedge_mode"] += 1
+                    logger.warning("Intraday exits: hedge-mode positions detected (positionIdx=1/2). Skipping intraday cycle.")
+                    return
+
+                # Only consider non-zero positions
+                active = [p for p in raw_pos if abs(float(p.get("size") or 0.0)) > 1e-12]
+                counters["positions_checked"] = len(active)
+                if not active:
+                    return
+
+                ensure_entry_ts_from_position(st=intraday_state, positions=active)
+
+                start, end = build_intraday_candle_window(intraday_cfg)
+                symbols = sorted({normalize_symbol(str(p.get("symbol", ""))) for p in active if p.get("symbol")})
+
+                c1: dict[str, Any] = {}
+                c4: dict[str, Any] = {}
+                for sym in symbols:
+                    try:
+                        c1[sym] = md.get_candles(sym, intraday_cfg.candle_interval_trigger, start, end, use_cache=True, cache_write=True)
+                        c4[sym] = md.get_candles(sym, intraday_cfg.atr_interval, start, end, use_cache=True, cache_write=True)
+                    except Exception as e:
+                        counters["missing_candles"] += 1
+                        logger.warning("Intraday exits: candle fetch failed for {}: {}", sym, e)
+
+                last_px = None
+                if intraday_cfg.use_last_price_trigger:
+                    last_px = _get_last_prices_by_symbol(client, symbols)
+
+                decisions = evaluate_intraday_exit_decisions(
+                    cfg=intraday_cfg,
+                    positions=active,
+                    candles_1h_by_symbol=c1,
+                    candles_4h_by_symbol=c4,
+                    last_prices_by_symbol=last_px,
+                    state=intraday_state,
+                )
+                counters["decisions_triggered"] = len(decisions)
+
+                if not decisions:
+                    return
+
+                if intraday_cfg.dry_run:
+                    for d in decisions:
+                        logger.info(
+                            "Intraday exits [DRY RUN] would_exit {} {} qty={} reason={} stop_type={} stop={} trigger={} atr={} entry={}",
+                            d.symbol,
+                            d.side,
+                            d.qty_to_close,
+                            d.reason,
+                            d.stop_type,
+                            d.stop_price,
+                            d.trigger_price,
+                            d.atr,
+                            d.entry_price,
+                        )
+                    return
+
+                # Cancel previous exit orders (optional)
+                if intraday_cfg.cancel_existing_exit_orders:
+                    _cancel_existing_exit_orders(client=client, symbols=[d.symbol for d in decisions])
+
+                ex = Executor(client=client, md=md, cfg=cfg, dry_run=False, equity_usdt=equity)
+                for d in decisions:
+                    order_type = "market" if intraday_cfg.exit_order_type == "market" else "limit"
+                    limit_px = None
+                    if order_type == "limit":
+                        off = float(intraday_cfg.exit_price_offset_bps) / 10_000.0
+                        stats = md.get_orderbook_stats(d.symbol)
+                        if d.side == "Sell":
+                            limit_px = float(stats.best_bid) * (1.0 - off)
+                        else:
+                            limit_px = float(stats.best_ask) * (1.0 + off)
+                    po = PlannedOrder(
+                        symbol=d.symbol,
+                        side=d.side,
+                        qty=d.qty_to_close,
+                        reduce_only=True,
+                        order_type=order_type,
+                        limit_price=limit_px,
+                        reason=d.reason,
+                        order_link_id_prefix="xsrev-exit-",
+                    )
+                    ex.place_with_fallback(po)
+                    counters["exits_placed"] += 1
+
+            finally:
+                if intraday_state is not None:
+                    save_intraday_state(intraday_cfg.state_path, intraday_state)
+                dt = time.time() - cycle0
+                logger.info(
+                    "Intraday exits cycle done in {:.2f}s: {}",
+                    dt,
+                    counters,
+                )
+
         if run_once:
             logger.info("run_once enabled: executing a single rebalance immediately.")
             _rebalance_once()
             return
 
-        # Catch-up behavior:
-        # If the process starts AFTER today's scheduled time (or grace window) and we haven't rebalanced for the
-        # current asof_bar yet, run once immediately instead of silently skipping a whole day.
-        # Note: The interval check inside _rebalance_once() will still apply, so this won't bypass interval_days.
+        # Startup catch-up: if started after today's scheduled time and we haven't rebalanced today, run once.
         try:
             now0 = now_utc()
             t = parse_hhmm(cfg.rebalance.time_utc)
-            today = utc_day_start(now0)
-            scheduled_today = datetime.combine(today.date(), t, tzinfo=UTC)
+            today0 = utc_day_start(now0)
+            scheduled_today = datetime.combine(today0.date(), t, tzinfo=UTC)
             if now0 >= scheduled_today:
-                close_ts0 = last_complete_daily_close(now0, int(cfg.rebalance.candle_close_delay_seconds))
-                asof0 = close_ts0 - timedelta(days=1)
                 last_done = None
-                if state_path.exists():
+                if rb_state_path.exists():
                     try:
-                        st = orjson.loads(state_path.read_bytes())
+                        st = orjson.loads(rb_state_path.read_bytes())
                         last_done = st.get("last_rebalance_day")
                     except Exception:
                         last_done = None
-                # Compare with today's date (now0.date()) to match the interval check logic
                 if last_done != now0.date().isoformat():
                     logger.warning(
-                        "Missed scheduled rebalance time earlier today (scheduled_today={} now={}). "
-                        "Catching up immediately for asof_bar={} (interval check will still apply).",
+                        "Missed scheduled rebalance time earlier today (scheduled_today={} now={}). Catching up immediately.",
                         scheduled_today.isoformat(),
                         now0.isoformat(),
-                        asof0.date().isoformat(),
                     )
                     _rebalance_once()
         except Exception as e:
             logger.warning("Startup catch-up check failed (continuing with normal scheduler): {}", e)
 
+        # Scheduler: daily rebalance + optional intraday exit-only loop between rebalances.
         while True:
             now = now_utc()
-            nxt = next_run_time(now, cfg.rebalance.time_utc, grace_seconds=int(cfg.rebalance.startup_grace_seconds))
-            sleep_s = max(1.0, (nxt - now).total_seconds())
-            logger.info("Next rebalance scheduled at {} (sleep {:.1f}s)", nxt.isoformat(), sleep_s)
+            nxt_rb = next_run_time(now, cfg.rebalance.time_utc, grace_seconds=int(cfg.rebalance.startup_grace_seconds))
+
+            if intraday_cfg.enabled and next_intraday_ts is None:
+                next_intraday_ts = now + timedelta(minutes=int(intraday_cfg.interval_minutes))
+
+            # If we're within the daily rebalance window, run rebalance.
+            if now >= nxt_rb:
+                _rebalance_once()
+                # Reset intraday schedule after a rebalance to avoid clustering.
+                if intraday_cfg.enabled:
+                    next_intraday_ts = now_utc() + timedelta(minutes=int(intraday_cfg.interval_minutes))
+                continue
+
+            # Intraday exits between rebalances
+            if intraday_cfg.enabled and next_intraday_ts is not None and now >= next_intraday_ts:
+                _intraday_exits_cycle()
+                next_intraday_ts = now_utc() + timedelta(minutes=int(intraday_cfg.interval_minutes))
+                continue
+
+            # Sleep until the next event
+            next_events: list[datetime] = [nxt_rb]
+            if intraday_cfg.enabled and next_intraday_ts is not None:
+                next_events.append(next_intraday_ts)
+            wake = min(next_events)
+            sleep_s = max(1.0, (wake - now).total_seconds())
+            logger.info("Next event scheduled at {} (sleep {:.1f}s)", wake.isoformat(), sleep_s)
             time.sleep(sleep_s)
-            _rebalance_once()
-            # After running (or skipping), ensure we schedule for tomorrow's scheduled time
-            # This prevents the scheduler from looping every second when within the grace window
-            now_after = now_utc()
-            t = parse_hhmm(cfg.rebalance.time_utc)
-            today = utc_day_start(now_after)
-            scheduled_today = datetime.combine(today.date(), t, tzinfo=UTC)
-            if now_after >= scheduled_today:
-                # We've already run for today, wait until tomorrow's scheduled time
-                scheduled_tomorrow = scheduled_today + timedelta(days=1)
-                sleep_until_tomorrow = max(1.0, (scheduled_tomorrow - now_after).total_seconds())
-                logger.info("Already ran today, next rebalance scheduled for tomorrow at {} (sleep {:.1f}s)", scheduled_tomorrow.isoformat(), sleep_until_tomorrow)
-                time.sleep(sleep_until_tomorrow)
     finally:
         client.close()
-
 

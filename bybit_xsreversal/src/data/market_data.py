@@ -180,7 +180,46 @@ class MarketData:
         self._instrument_cache[symbol] = meta
         return meta
 
-    # -------- Candles (daily) with caching --------
+    # -------- Candles (any interval) with caching --------
+    def get_candles(
+        self,
+        symbol: str,
+        interval: str,
+        start: datetime,
+        end: datetime,
+        *,
+        use_cache: bool = True,
+        cache_write: bool = True,
+    ) -> pd.DataFrame:
+        """
+        Returns klines for [start, end] (inclusive-ish), indexed by UTC timestamp.
+
+        Intervals follow Bybit v5 kline intervals, e.g. "D", "60" (1H), "240" (4H).
+        """
+        symbol = normalize_symbol(symbol)
+        interval = str(interval).strip()
+        start = start.astimezone(UTC)
+        end = end.astimezone(UTC)
+
+        cached = load_cached_candles(self.cache_dir, symbol, interval) if use_cache else None
+        if cached is not None and not cached.empty:
+            have_start = cached.index.min()
+            have_end = cached.index.max()
+            if have_start <= start and have_end >= end:
+                return cached.loc[start:end].copy()
+
+        df = self._fetch_candles_remote(symbol=symbol, interval=interval, start=start, end=end)
+        # If remote returned nothing (API gap/outage), fall back to cache to keep behavior stable.
+        if (df is None) or df.empty:
+            if cached is not None and not cached.empty:
+                df = cached
+        if cached is not None and not cached.empty:
+            df = pd.concat([cached, df]).sort_index()
+            df = df[~df.index.duplicated(keep="last")]
+        if cache_write:
+            save_cached_candles(self.cache_dir, symbol, interval, df)
+        return df.loc[start:end].copy()
+
     def get_daily_candles(
         self,
         symbol: str,
@@ -190,51 +229,28 @@ class MarketData:
         use_cache: bool = True,
         cache_write: bool = True,
     ) -> pd.DataFrame:
-        """
-        Returns daily candles for [start, end] (inclusive by day), indexed by UTC timestamp (day start).
-        Bybit returns klines with startTime in ms; daily candle ts is 00:00:00 UTC of that day.
-        """
-        symbol = normalize_symbol(symbol)
+        # Backwards compatible wrapper.
+        # Align daily windows to day starts to match prior behavior.
         start = start.astimezone(UTC)
         end = end.astimezone(UTC)
-
-        # Align to day starts
         start_day = datetime(start.year, start.month, start.day, tzinfo=UTC)
         end_day = datetime(end.year, end.month, end.day, tzinfo=UTC)
+        return self.get_candles(symbol, "D", start_day, end_day, use_cache=use_cache, cache_write=cache_write)
 
-        cached = load_cached_candles(self.cache_dir, symbol, "D") if use_cache else None
-        if cached is not None and not cached.empty:
-            have_start = cached.index.min()
-            have_end = cached.index.max()
-            if have_start <= start_day and have_end >= end_day:
-                return cached.loc[start_day:end_day].copy()
-
-        df = self._fetch_daily_candles_remote(symbol=symbol, start=start_day, end=end_day)
-        # If remote returned nothing (API gap/outage), fall back to cache to avoid noisy warnings and keep behavior stable.
-        if (df is None) or df.empty:
-            if cached is not None and not cached.empty:
-                df = cached
-        if cached is not None and not cached.empty:
-            # Avoid FutureWarning when concatenating with an empty frame by guarding above.
-            df = pd.concat([cached, df]).sort_index()
-            df = df[~df.index.duplicated(keep="last")]
-        if cache_write:
-            save_cached_candles(self.cache_dir, symbol, "D", df)
-        return df.loc[start_day:end_day].copy()
-
-    def _fetch_daily_candles_remote(self, *, symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
+    def _fetch_candles_remote(self, *, symbol: str, interval: str, start: datetime, end: datetime) -> pd.DataFrame:
         # Bybit kline end is exclusive-ish; request with small buffer.
         start_ms = int(start.timestamp() * 1000)
-        end_ms = int((end + timedelta(days=1)).timestamp() * 1000)
+        # Add 1 interval buffer for non-daily; daily handled similarly.
+        end_ms = int((end + timedelta(days=1)).timestamp() * 1000) if interval == "D" else int((end.timestamp() * 1000) + 1)
 
         all_rows: list[list[str]] = []
         cursor_end = end_ms
         # Bybit returns newest-first, so we page backwards by end timestamp.
-        for _ in range(20):
+        for _ in range(40):
             chunk = self.client.get_kline(
                 category=self.config.exchange.category,
                 symbol=symbol,
-                interval="D",
+                interval=interval,
                 start_ms=start_ms,
                 end_ms=cursor_end,
                 limit=1000,
@@ -247,15 +263,15 @@ class MarketData:
                 break
             cursor_end = oldest_ts - 1
 
-        # Fallback: some instruments (new listings, edge cases) can return empty when a very old start_ms is provided.
-        # Try fetching the most recent candles (no start constraint) and then slice to our target window.
+        # Fallback: some instruments can return empty when a very old start_ms is provided.
+        # Fetch most recent candles and slice locally.
         if not all_rows:
             cursor_end = end_ms
-            for _ in range(20):
+            for _ in range(40):
                 chunk = self.client.get_kline(
                     category=self.config.exchange.category,
                     symbol=symbol,
-                    interval="D",
+                    interval=interval,
                     start_ms=None,
                     end_ms=cursor_end,
                     limit=1000,
@@ -264,15 +280,13 @@ class MarketData:
                     break
                 all_rows.extend(chunk)
                 oldest_ts = int(chunk[-1][0])
-                # Stop if we've gone past the requested start
                 if oldest_ts <= start_ms:
                     break
                 cursor_end = oldest_ts - 1
 
         if not all_rows:
-            raise ValueError(f"No candles returned for {symbol}")
+            raise ValueError(f"No candles returned for {symbol} interval={interval}")
 
-        # Parse; kline format: [startTime, open, high, low, close, volume, turnover]
         rows = []
         for r in all_rows:
             try:
