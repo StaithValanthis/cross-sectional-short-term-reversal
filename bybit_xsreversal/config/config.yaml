@@ -6,7 +6,7 @@ exchange:
   testnet: true
   category: linear
   # Startup-only leverage alignment (opt-in). This only runs at process start.
-  set_leverage_on_startup: false
+  set_leverage_on_startup: true
   leverage: "5"
   leverage_apply_mode: "universe"      # "universe" or "positions"
   leverage_symbols_max: 200
@@ -99,7 +99,7 @@ risk:
     threshold_multiplier: 2.5
 intraday_exits:
   # Exit-only, optional intraday loop that can CLOSE positions between daily rebalances.
-  enabled: false
+  enabled: true
   dry_run: true
   interval_minutes: 60
   category: "linear"
