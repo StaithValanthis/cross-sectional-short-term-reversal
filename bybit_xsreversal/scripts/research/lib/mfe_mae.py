@@ -1,4 +1,3 @@
-ubuntu@instance-20250817-2147:~/cross-sectional-short-term-reversal/bybit_xsreversal/scripts/research/lib$ cat mfe_mae.py
 """
 MFE/MAE over real episode windows using 1H (or 4H fallback) candle HIGH/LOW.
 

@@ -59,13 +59,28 @@ def _load_episodes(out_dir: Path) -> pd.DataFrame | None:
         p = out_dir / name
         if p.exists():
             if p.suffix == ".parquet":
-                return pd.read_parquet(p)
-            df = pd.read_csv(p)
-            for col in ("entry_ts", "exit_ts"):
-                if col in df.columns:
-                    df[col] = pd.to_datetime(df[col], utc=True)
+                df = pd.read_parquet(p)
+            else:
+                df = pd.read_csv(p)
+                for col in ("entry_ts", "exit_ts"):
+                    if col in df.columns:
+                        df[col] = pd.to_datetime(df[col], utc=True)
+            if "closed" in df.columns:
+                df = df[df["closed"] == True].reset_index(drop=True)
             return df
     return None
+
+
+def _load_research_summary(out_dir: Path) -> dict | None:
+    import json
+    p = out_dir / "research_30d_summary.json"
+    if not p.exists():
+        return None
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 def _load_config(config_path: Path):
@@ -86,6 +101,13 @@ def main() -> None:
     out_dir = Path(args.out_dir) if os.path.isabs(args.out_dir) else _REPO_ROOT / args.out_dir
     if not out_dir.exists():
         raise FileNotFoundError(f"Missing {out_dir}. Run trade_forensics_30d.py and counterfactuals first.")
+
+    summary_meta = _load_research_summary(out_dir)
+    if summary_meta:
+        logger.info(
+            "All-fills performance: {} fills, {:.2f} USD realized. Sensitivity uses closed episodes only.",
+            summary_meta.get("n_fills", 0), summary_meta.get("total_realized_pnl_usd", 0),
+        )
 
     config_path = _PACKAGE_DIR / "config" / "config.yaml"
     if not config_path.exists():

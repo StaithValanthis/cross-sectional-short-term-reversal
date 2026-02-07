@@ -585,12 +585,32 @@ def main() -> None:
         logger.info("Wrote trades_enriched ({} rows) to {}", len(trades_df), out_dir)
 
         if args.local:
-            if (out_dir / "episodes.parquet").exists():
-                episodes_df = pd.read_parquet(out_dir / "episodes.parquet")
-                episode_fills_df = pd.read_parquet(out_dir / "episode_fills.parquet") if (out_dir / "episode_fills.parquet").exists() else pd.DataFrame()
+            # Rebuild episodes from trades_enriched so we get closed + open episodes (no stale disk copy).
+            fills_df = episode_recon.trades_to_fills_df(trades_df)
+            if not fills_df.empty:
+                episodes_df, episode_fills_df, _ = episode_recon.reconstruct_episodes(fills_df, {}, include_open_episodes=True)
             else:
                 episodes_df = pd.DataFrame()
                 episode_fills_df = pd.DataFrame()
+
+        # All-fills performance summary (aligns with live bot: total fills, total realized PnL).
+        n_fills = len(trades_df)
+        total_realized_pnl_usd = float(trades_df["realized_pnl_usd"].fillna(0).sum()) if not trades_df.empty and "realized_pnl_usd" in trades_df.columns else 0.0
+        n_episodes_closed = int((episodes_df["closed"] == True).sum()) if not episodes_df.empty and "closed" in episodes_df.columns else (len(episodes_df) if not episodes_df.empty else 0)
+        n_episodes_open = int((episodes_df["closed"] == False).sum()) if not episodes_df.empty and "closed" in episodes_df.columns else 0
+        summary = {
+            "n_fills": n_fills,
+            "total_realized_pnl_usd": total_realized_pnl_usd,
+            "n_episodes_closed": n_episodes_closed,
+            "n_episodes_open": n_episodes_open,
+            "n_episodes_total": n_episodes_closed + n_episodes_open,
+        }
+        with open(out_dir / "research_30d_summary.json", "w") as f:
+            json.dump(summary, f, indent=2)
+        logger.info(
+            "Performance (all fills): {} fills, {:.2f} USD realized. Episodes: {} closed, {} open (use all-fills for bot performance).",
+            n_fills, total_realized_pnl_usd, n_episodes_closed, n_episodes_open,
+        )
 
         if not episodes_df.empty:
             if _HAS_PARQUET:

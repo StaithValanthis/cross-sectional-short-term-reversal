@@ -157,14 +157,24 @@ def validate_pnl_reconciliation(
     raw_fetch_meta: dict | None,
 ) -> pd.DataFrame:
     """
-    Sum realized_pnl across episodes per symbol and overall; compare to trades_enriched
-    and to closed_pnl if available in meta.
+    Sum realized_pnl across episodes per symbol and overall; compare to trades_enriched (all-fills).
+    episode_pnl_sum = closed (and optionally open) episodes only; trades_pnl_sum = total realized from all fills (bot performance).
     """
-    rows = []
+    base_cols = ["symbol", "episode_pnl_sum", "trades_pnl_sum", "closed_pnl_sum", "episode_vs_trades_diff", "mismatch_ratio", "note"]
     if episodes_df.empty:
-        return pd.DataFrame(columns=["symbol", "episode_pnl_sum", "trades_pnl_sum", "closed_pnl_sum", "episode_vs_trades_diff", "mismatch_ratio", "note"])
-    ep_sum_total = episodes_df["realized_pnl_usd"].fillna(0).sum()
-    ep_by_sym = episodes_df.fillna(0).groupby("symbol")["realized_pnl_usd"].sum()
+        all_fills_pnl = float(trades_df["realized_pnl_usd"].fillna(0).sum()) if trades_df is not None and not trades_df.empty and "realized_pnl_usd" in trades_df.columns else None
+        return pd.DataFrame([{"symbol": "_TOTAL", "episode_pnl_sum": None, "trades_pnl_sum": all_fills_pnl, "closed_pnl_sum": None, "episode_vs_trades_diff": None, "mismatch_ratio": None, "note": "No episodes; trades_pnl_sum = all-fills realized (bot performance)."}])
+
+    # When episodes have "closed" column, sum only closed for episode_pnl_sum for apples-to-apples with legacy; total episode sum still reported.
+    if "closed" in episodes_df.columns:
+        ep_closed = episodes_df[episodes_df["closed"] == True]
+        ep_sum_total = ep_closed["realized_pnl_usd"].fillna(0).sum()
+        ep_by_sym = ep_closed.fillna(0).groupby("symbol")["realized_pnl_usd"].sum()
+    else:
+        ep_sum_total = episodes_df["realized_pnl_usd"].fillna(0).sum()
+        ep_by_sym = episodes_df.fillna(0).groupby("symbol")["realized_pnl_usd"].sum()
+
+    rows = []
     for sym in ep_by_sym.index.tolist():
         episode_pnl_sum = float(ep_by_sym[sym])
         trades_pnl_sum = None
@@ -188,14 +198,15 @@ def validate_pnl_reconciliation(
             "mismatch_ratio": mismatch_ratio,
             "note": note,
         })
+    all_fills_pnl = float(trades_df["realized_pnl_usd"].fillna(0).sum()) if trades_df is not None and not trades_df.empty and "realized_pnl_usd" in trades_df.columns else None
     totals_row = {
         "symbol": "_TOTAL",
         "episode_pnl_sum": float(ep_sum_total),
-        "trades_pnl_sum": float(trades_df["realized_pnl_usd"].fillna(0).sum()) if trades_df is not None and not trades_df.empty else None,
+        "trades_pnl_sum": all_fills_pnl,
         "closed_pnl_sum": None,
         "episode_vs_trades_diff": None,
         "mismatch_ratio": None,
-        "note": "closed_pnl not persisted; compare episode vs trades only" if not raw_fetch_meta else "",
+        "note": "episode_pnl = closed episodes only; trades_pnl = all-fills realized (bot performance)." + (" closed_pnl not persisted." if not raw_fetch_meta else ""),
     }
     if totals_row["trades_pnl_sum"] is not None and totals_row["episode_pnl_sum"] is not None:
         totals_row["episode_vs_trades_diff"] = totals_row["episode_pnl_sum"] - totals_row["trades_pnl_sum"]
@@ -373,6 +384,14 @@ def main() -> None:
 
     validation_dir = out_dir / "validation"
     validation_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_meta = _load_json(out_dir, "research_30d_summary.json")
+    if summary_meta:
+        logger.info(
+            "Research summary: {} fills, {:.2f} USD realized (all-fills); {} closed, {} open episodes.",
+            summary_meta.get("n_fills", 0), summary_meta.get("total_realized_pnl_usd", 0),
+            summary_meta.get("n_episodes_closed", 0), summary_meta.get("n_episodes_open", 0),
+        )
 
     episodes_df = _load_df(out_dir, "episodes.parquet")
     episode_fills_df = _load_df(out_dir, "episode_fills.parquet")

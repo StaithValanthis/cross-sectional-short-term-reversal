@@ -84,6 +84,19 @@ def _load_episodes(out_dir: Path) -> pd.DataFrame | None:
     return None
 
 
+def _load_research_summary(out_dir: Path) -> dict | None:
+    """Load research_30d_summary.json if present (n_fills, total_realized_pnl_usd, etc.)."""
+    p = out_dir / "research_30d_summary.json"
+    if not p.exists():
+        return None
+    try:
+        import json
+        with open(p) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
 def _load_candles(out_dir: Path, interval: str) -> dict[str, pd.DataFrame]:
     base = out_dir / "candles" / interval
     result = {}
@@ -670,6 +683,7 @@ def main() -> None:
     parser.add_argument("--warmup_days", type=int, default=120)
     parser.add_argument("--out_dir", type=str, default="outputs/research_30d")
     parser.add_argument("--category", type=str, default=None, help="Bybit category (default: linear; enforced linear for research)")
+    parser.add_argument("--include-open-episodes", action="store_true", help="Run counterfactuals on open episodes too (default: closed only)")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir) if os.path.isabs(args.out_dir) else _REPO_ROOT / args.out_dir
@@ -693,7 +707,24 @@ def main() -> None:
         base_slippage_bps = base_slip
         slippage_bps = base_slip
 
+    summary_meta = _load_research_summary(out_dir)
+    if summary_meta:
+        logger.info(
+            "Total bot activity (all fills): {} fills, {:.2f} USD realized. Use this for performance; counterfactuals below are episode-based.",
+            summary_meta.get("n_fills", 0), summary_meta.get("total_realized_pnl_usd", 0),
+        )
+
     episodes_df = _load_episodes(out_dir)
+    if episodes_df is not None and not episodes_df.empty and "closed" in episodes_df.columns:
+        closed_only = episodes_df[episodes_df["closed"] == True]
+        n_open = (episodes_df["closed"] == False).sum()
+        if args.include_open_episodes:
+            logger.info("Using all episodes: {} closed, {} open", len(closed_only), n_open)
+        else:
+            episodes_df = closed_only.reset_index(drop=True)
+            if n_open > 0:
+                logger.info("Using closed episodes only ({}). {} open episodes excluded; use --include-open-episodes to include.", len(episodes_df), n_open)
+
     candles_1h = _load_candles(out_dir, "1H")
     candles_4h = _load_candles(out_dir, "4H")
     if not candles_4h:
