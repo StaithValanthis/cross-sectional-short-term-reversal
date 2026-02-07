@@ -462,6 +462,14 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
             }
 
             try:
+                logger.info(
+                    "Intraday exits cycle starting: interval_minutes={} dry_run={} order_type={} trigger_interval={} atr_interval={}",
+                    int(intraday_cfg.interval_minutes),
+                    bool(intraday_cfg.dry_run),
+                    str(intraday_cfg.exit_order_type),
+                    str(intraday_cfg.candle_interval_trigger),
+                    str(intraday_cfg.atr_interval),
+                )
                 equity = fetch_equity_usdt(client=client)
                 ok_risk, risk_info = risk.check(equity)
                 if not ok_risk:
@@ -603,6 +611,7 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
 
             if intraday_cfg.enabled and next_intraday_ts is None:
                 next_intraday_ts = now + timedelta(minutes=int(intraday_cfg.interval_minutes))
+                logger.info("Intraday exits enabled: first cycle scheduled at {}", next_intraday_ts.isoformat())
 
             # If we're within the daily rebalance window, run rebalance.
             if now >= nxt_rb:
@@ -624,7 +633,15 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                 next_events.append(next_intraday_ts)
             wake = min(next_events)
             sleep_s = max(1.0, (wake - now).total_seconds())
-            logger.info("Next event scheduled at {} (sleep {:.1f}s)", wake.isoformat(), sleep_s)
+            if intraday_cfg.enabled and next_intraday_ts is not None:
+                logger.info(
+                    "Next events: rebalance_at={} intraday_at={} (sleep {:.1f}s until next)",
+                    nxt_rb.isoformat(),
+                    next_intraday_ts.isoformat(),
+                    sleep_s,
+                )
+            else:
+                logger.info("Next rebalance scheduled at {} (sleep {:.1f}s)", nxt_rb.isoformat(), sleep_s)
             time.sleep(sleep_s)
     finally:
         client.close()
