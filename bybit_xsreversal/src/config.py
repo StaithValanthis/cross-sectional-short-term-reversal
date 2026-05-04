@@ -46,10 +46,16 @@ class UniverseConfig(BaseModel):
 
 
 class SignalConfig(BaseModel):
-    lookback_days: Literal[1, 2, 3, 5] = 1
+    lookback_days: Literal[1, 2, 3, 4, 5] = 1
     long_quantile: float = 0.1
     short_quantile: float = 0.1
     long_only: bool = False
+
+    # Second-horizon filter: require 1-day return to confirm reversal direction
+    # Longs: only keep symbols where 1d return <= ret_1d_long_max (e.g. 0.0 or 0.03)
+    # Shorts: only keep symbols where 1d return >= ret_1d_short_min (e.g. 0.0 or -0.03)
+    ret_1d_long_max: float | None = None
+    ret_1d_short_min: float | None = None
 
     @model_validator(mode="after")
     def _validate_quantiles(self) -> "SignalConfig":

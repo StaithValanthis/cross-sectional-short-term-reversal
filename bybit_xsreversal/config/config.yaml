@@ -5,19 +5,18 @@ exchange:
   api_secret_env: BYBIT_API_SECRET
   testnet: true
   category: linear
-  # Startup-only leverage alignment (opt-in). This only runs at process start.
   set_leverage_on_startup: true
   leverage: "5"
   leverage_apply_mode: "universe"      # "universe" or "positions"
   leverage_symbols_max: 200
   leverage_state_path: "outputs/state/leverage_state.json"
 universe:
-  top_n_by_volume: 80
+  top_n_by_volume: 60
   exclude_symbols: []
   include_symbols: []
   min_24h_quote_volume: 0.0
   min_open_interest: 0.0
-  min_history_days: 60
+  min_history_days: 55
   liquidity_bucket:
     enabled: false
     exclude_top_k: 0
@@ -25,26 +24,24 @@ universe:
     max_rank: 9999
 signal:
   lookback_days: 3
-  long_quantile: 0.2
-  short_quantile: 0.2
+  long_quantile: 0.24
+  short_quantile: 0.24
   long_only: false
+  ret_1d_long_max: 0.00   # Long only if 1d return <= 3%
+  ret_1d_short_min: 0.00  # Short only if 1d return >= -3%
 rebalance:
   frequency: daily
   time_utc: 00:05
   candle_close_delay_seconds: 30
   startup_grace_seconds: 300
-  interval_days: 1
-  rebalance_fraction: 0.25
-  min_weight_change_bps: 200.0
-  # Optional turnover/fee guardrail applied per rebalance to NON-risk orders.
-  # - null disables.
-  # - cap = mult * equity_usdt.
-  # - mode "scale" scales deltas down; "skip" drops all non-risk orders.
+  interval_days: 3
+  rebalance_fraction: 0.61
+  min_weight_change_bps: 20
   max_turnover_per_rebalance_equity_mult: null
   turnover_cap_mode: "scale"
 sizing:
-  target_gross_leverage: 1.5
-  vol_lookback_days: 7
+  target_gross_leverage: 1.54
+  vol_lookback_days: 14
   max_leverage_per_symbol: 0.2
   max_notional_per_symbol: 25000.0
   min_notional_per_symbol: 5.0
@@ -53,7 +50,7 @@ filters:
   min_orderbook_depth_usd: 5000.0
   depth_band_bps: 15.0
   regime_filter:
-    enabled: false
+    enabled: true
     use_market_regime: true
     market_proxy_symbol: BTCUSDT
     market_adx_threshold: 25.0
@@ -61,7 +58,7 @@ filters:
     ema_fast: 20
     ema_slow: 50
     action: switch_to_momentum
-    scale_factor: 0.25
+    scale_factor: 0.35
     log_actions: false
     dynamic_gross_scale_enabled: false
     dynamic_gross_scale_min: 1.0
@@ -69,8 +66,8 @@ filters:
 funding:
   model_in_backtest: true
   filter:
-    enabled: false
-    max_abs_daily_funding_rate: 0.002
+    enabled: true
+    max_abs_daily_funding_rate: 0.001
     use_mainnet_data_even_on_testnet: true
 execution:
   order_type: limit
@@ -90,7 +87,7 @@ risk:
   max_turnover: 2.0
   kill_switch_enabled: true
   max_consecutive_loss_days: 0
-  max_hold_days: 2
+  max_hold_days: 1
   max_loss_per_position_pct_equity: 3.0
   cooldown_days_after_forced_exit: 2
   stop_new_trades_on_vol_spike:
@@ -98,7 +95,6 @@ risk:
     lookback_days: 14
     threshold_multiplier: 2.5
 intraday_exits:
-  # Exit-only, optional intraday loop that can CLOSE positions between daily rebalances.
   enabled: false
   dry_run: true
   interval_minutes: 60

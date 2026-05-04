@@ -156,6 +156,35 @@ def compute_targets_from_daily_candles(
             selected_longs = ranked[-k_long:]
             selected_shorts = ranked[:k_short] if not config.signal.long_only else []
 
+    # Second-horizon filter: require 1-day return to confirm reversal direction
+    ret_1d: dict[str, float] = {}
+    ret_1d_long_max = getattr(config.signal, "ret_1d_long_max", None)
+    ret_1d_short_min = getattr(config.signal, "ret_1d_short_min", None)
+    
+    if ret_1d_long_max is not None or ret_1d_short_min is not None:
+        # Compute 1-day return for each symbol in universe
+        for sym in universe:
+            df = candles.get(sym)
+            if df is None:
+                continue
+            df = df.sort_index()
+            if asof not in df.index:
+                continue
+            sub = df.loc[:asof].copy()
+            if len(sub) >= 2:
+                close = sub["close"].astype(float)
+                ret_1d_val = float(close.iloc[-1] / close.iloc[-2] - 1.0)
+                if np.isfinite(ret_1d_val):
+                    ret_1d[sym] = ret_1d_val
+        
+        # Filter longs: only keep symbols where 1d return <= ret_1d_long_max
+        if ret_1d_long_max is not None and ret_1d:
+            selected_longs = [s for s in selected_longs if ret_1d.get(s, 0.0) <= ret_1d_long_max]
+        
+        # Filter shorts: only keep symbols where 1d return >= ret_1d_short_min
+        if ret_1d_short_min is not None and ret_1d:
+            selected_shorts = [s for s in selected_shorts if ret_1d.get(s, 0.0) >= ret_1d_short_min]
+
     # Inverse vol scores (equal risk)
     long_scores = {s: 1.0 / vol[s] for s in selected_longs}
     short_scores = {s: 1.0 / vol[s] for s in selected_shorts}
@@ -231,27 +260,32 @@ def compute_targets_from_daily_candles(
     final_weights = {k: float(v) for k, v in final_weights.items() if abs(float(v)) > 1e-8}
 
     # Turnover controls: partial rebalance + thresholding (shared with live/backtest)
+    # When current book is flat (no positions), use full target weights so notionals can exceed
+    # min_notional_per_symbol. Otherwise rebalance_fraction would scale everything down and all
+    # notionals can end up below min -> empty target book.
     if current_weights is not None:
-        frac = float(config.rebalance.rebalance_fraction)
-        frac = max(0.0, min(1.0, frac))
-        thresh = float(config.rebalance.min_weight_change_bps) / 10_000.0
-        union = set(current_weights) | set(final_weights)
-        blended: dict[str, float] = {}
-        for s in union:
-            cur = float(current_weights.get(s, 0.0))
-            tgt = float(final_weights.get(s, 0.0))
-            new = cur + frac * (tgt - cur)
-            if abs(new - cur) < thresh:
-                new = cur
-            if abs(new) > 1e-10:
-                blended[s] = new
-        # Safety: don't exceed target gross; scale down only (never scale up)
-        gross = sum(abs(v) for v in blended.values())
-        cap = float(config.sizing.target_gross_leverage)
-        if gross > cap and gross > 0:
-            scale = cap / gross
-            blended = {k: v * scale for k, v in blended.items()}
-        final_weights = blended
+        current_gross = sum(abs(float(current_weights.get(s, 0.0))) for s in current_weights)
+        if current_gross >= 1e-6:
+            frac = float(config.rebalance.rebalance_fraction)
+            frac = max(0.0, min(1.0, frac))
+            thresh = float(config.rebalance.min_weight_change_bps) / 10_000.0
+            union = set(current_weights) | set(final_weights)
+            blended: dict[str, float] = {}
+            for s in union:
+                cur = float(current_weights.get(s, 0.0))
+                tgt = float(final_weights.get(s, 0.0))
+                new = cur + frac * (tgt - cur)
+                if abs(new - cur) < thresh:
+                    new = cur
+                if abs(new) > 1e-10:
+                    blended[s] = new
+            # Safety: don't exceed target gross; scale down only (never scale up)
+            gross = sum(abs(v) for v in blended.values())
+            cap = float(config.sizing.target_gross_leverage)
+            if gross > cap and gross > 0:
+                scale = cap / gross
+                blended = {k: v * scale for k, v in blended.items()}
+            final_weights = blended
 
     notionals = weights_to_notionals(
         final_weights,
@@ -292,5 +326,3 @@ def compute_targets_from_daily_candles(
         logger.debug("All targets filtered out; no notionals to trade.")
 
     return PortfolioTargets(weights=final_weights, notionals_usd=notionals, meta=meta), snap
-
-
