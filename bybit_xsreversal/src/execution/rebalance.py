@@ -1093,7 +1093,7 @@ def run_rebalance(
         except Exception:
             pass
     
-    # Store actual positions BEFORE adjustment (needed for closing positions outside universe)
+    # Store actual positions BEFORE adjustment for risk-state accounting and observability.
     positions_actual = positions_final.copy()
 
     # ---------- Risk exits (soft forced closes) ----------
@@ -1197,9 +1197,11 @@ def run_rebalance(
                 adjusted_positions_final[sym] = Position(symbol=sym, size=adj, mark_price=mark)
         positions_final = adjusted_positions_final
 
+    # Use pending-order-adjusted exposure for order planning so existing open orders count toward the target.
+    positions_for_planning = positions_final
+
     # Identify positions outside the target universe (should be closed)
-    # CRITICAL: Use ACTUAL positions (before adjustment) to identify positions that need closing
-    # The adjustment is only for calculating deltas, not for determining if a position exists
+    # Use actual positions for observability so we still log what is physically open on the exchange.
     positions_outside_universe: list[tuple[str, float]] = []
     for sym, pos in positions_actual.items():
         tgt_notional = planning_targets.get(sym, 0.0)
@@ -1232,14 +1234,12 @@ def run_rebalance(
     else:
         logger.info("All open positions match the target universe ({} symbols)", len(positions_final))
 
-    # CRITICAL: For plan_rebalance_orders, use ACTUAL positions (before adjustment) to ensure
-    # positions outside the universe are always identified and closed, regardless of pending orders.
-    # The adjustment is only used for calculating deltas to avoid over-trading, but we need to
-    # use actual positions to determine which positions exist and need to be closed.
+    # Plan against effective exposure, which includes remaining open-order quantity.
+    # This avoids duplicating exposure when current position plus pending orders already reaches the target.
     orders = plan_rebalance_orders(
         cfg=cfg,
         md=md,
-        current_positions=positions_actual,
+        current_positions=positions_for_planning,
         target_notionals=planning_targets,
         force_close_reasons=force_close_reasons,
     )

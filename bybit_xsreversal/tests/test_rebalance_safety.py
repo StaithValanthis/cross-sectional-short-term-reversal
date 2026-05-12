@@ -93,6 +93,26 @@ class PendingOrderExposureTests(unittest.TestCase):
         res = run_rebalance(cfg=cfg, client=client, md=_StubMD(), target_notionals={"AAAUSDT": 200.0}, dry_run=True)
         self.assertEqual(res["orders"], [])
 
+    def test_pending_sell_order_reduces_effective_long_exposure(self) -> None:
+        cfg = BotConfig.model_validate(
+            {
+                "exchange": {"testnet": True, "category": "linear"},
+                "execution": {"ioc_fallback": False, "cancel_open_orders": "none"},
+                "risk": {"max_hold_days": 0, "max_loss_per_position_pct_equity": 0.0, "cooldown_days_after_forced_exit": 0},
+                "backtest": {"start_date": "2023-01-01", "end_date": "2023-01-02"},
+            }
+        )
+        client = _StubClient(
+            positions=[{"symbol": "AAAUSDT", "side": "Buy", "size": "3", "markPrice": "100", "positionIdx": 0}],
+            open_orders_by_symbol={
+                "AAAUSDT": [
+                    {"symbol": "AAAUSDT", "side": "Sell", "qty": "2", "cumExecQty": "1", "orderStatus": "PartiallyFilled"}
+                ]
+            },
+        )
+        res = run_rebalance(cfg=cfg, client=client, md=_StubMD(), target_notionals={"AAAUSDT": 200.0}, dry_run=True)
+        self.assertEqual(res["orders"], [])
+
 
 class EmptyTargetFlattenTests(unittest.TestCase):
     def _cfg(self, *, flatten_on_empty_targets: bool) -> BotConfig:
