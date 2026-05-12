@@ -71,7 +71,9 @@ class BacktesterPhase2Tests(unittest.TestCase):
     def test_symbols_with_insufficient_history_are_excluded(self) -> None:
         dates = pd.date_range("2023-01-01", periods=45, freq="D", tz="UTC")
         candles = {sym: _make_daily_frame(dates, base=100.0 + idx) for idx, sym in enumerate(["AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT", "EEEUSDT"])}
-        candles["SHORTUSDT"] = _make_daily_frame(dates[-4:], base=111.0)
+        # Include the backtest dates, but with less than min_history_days of lookback so exclusion reason is
+        # specifically "insufficient_history" rather than "missing_asof_bar".
+        candles["SHORTUSDT"] = _make_daily_frame(dates[-20:], base=111.0)
         md = _FakeMD(candles)
         cfg = self._base_cfg()
         seen_universes: list[set[str]] = []
