@@ -49,8 +49,8 @@ class _FakeMD:
 class BacktesterPhase2Tests(unittest.TestCase):
     def _base_cfg(self, **backtest_overrides) -> BotConfig:
         backtest = {
-            "start_date": "2023-01-07",
-            "end_date": "2023-01-10",
+            "start_date": "2023-02-04",
+            "end_date": "2023-02-09",
             "initial_equity": 10000.0,
             "slippage_bps": 0.0,
             "allow_partial_fills": False,
@@ -59,7 +59,7 @@ class BacktesterPhase2Tests(unittest.TestCase):
         return BotConfig.model_validate(
             {
                 "exchange": {"testnet": True, "category": "linear"},
-                "universe": {"top_n_by_volume": 6, "min_history_days": 5},
+                "universe": {"top_n_by_volume": 6, "min_history_days": 30},
                 "signal": {"lookback_days": 1, "long_quantile": 0.2, "short_quantile": 0.2},
                 "filters": {"regime_filter": {"enabled": False, "use_market_regime": False}},
                 "funding": {"model_in_backtest": False, "filter": {"enabled": False}},
@@ -69,7 +69,7 @@ class BacktesterPhase2Tests(unittest.TestCase):
         )
 
     def test_symbols_with_insufficient_history_are_excluded(self) -> None:
-        dates = pd.date_range("2023-01-01", periods=12, freq="D", tz="UTC")
+        dates = pd.date_range("2023-01-01", periods=45, freq="D", tz="UTC")
         candles = {sym: _make_daily_frame(dates, base=100.0 + idx) for idx, sym in enumerate(["AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT", "EEEUSDT"])}
         candles["SHORTUSDT"] = _make_daily_frame(dates[-4:], base=111.0)
         md = _FakeMD(candles)
@@ -91,9 +91,9 @@ class BacktesterPhase2Tests(unittest.TestCase):
         self.assertGreaterEqual(res.meta["data_quality"]["excluded_counts"].get("insufficient_history", 0), 1)
 
     def test_recent_gaps_are_excluded_from_historical_universe(self) -> None:
-        dates = pd.date_range("2023-01-01", periods=12, freq="D", tz="UTC")
+        dates = pd.date_range("2023-01-01", periods=45, freq="D", tz="UTC")
         candles = {sym: _make_daily_frame(dates, base=100.0 + idx) for idx, sym in enumerate(["AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT", "EEEUSDT"])}
-        gap_dates = dates.delete(4)
+        gap_dates = dates.delete(20)
         candles["GAPUSDT"] = _make_daily_frame(gap_dates, base=120.0)
         md = _FakeMD(candles)
         cfg = self._base_cfg()
@@ -114,7 +114,7 @@ class BacktesterPhase2Tests(unittest.TestCase):
         self.assertGreaterEqual(res.meta["data_quality"]["excluded_counts"].get("recent_gap", 0), 1)
 
     def test_allow_partial_fills_true_is_rejected_as_unsupported(self) -> None:
-        dates = pd.date_range("2023-01-01", periods=12, freq="D", tz="UTC")
+        dates = pd.date_range("2023-01-01", periods=45, freq="D", tz="UTC")
         candles = {sym: _make_daily_frame(dates, base=100.0 + idx) for idx, sym in enumerate(["AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT", "EEEUSDT"])}
         md = _FakeMD(candles)
         cfg = self._base_cfg(allow_partial_fills=True)
@@ -124,7 +124,7 @@ class BacktesterPhase2Tests(unittest.TestCase):
                 run_backtest(cfg, md, td)
 
     def test_borrow_cost_reduces_short_backtest_equity(self) -> None:
-        dates = pd.date_range("2023-01-01", periods=12, freq="D", tz="UTC")
+        dates = pd.date_range("2023-01-01", periods=45, freq="D", tz="UTC")
         candles = {sym: _make_daily_frame(dates, base=100.0 + idx) for idx, sym in enumerate(["AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT", "EEEUSDT"])}
         md = _FakeMD(candles)
         cfg0 = self._base_cfg(borrow_cost_bps=0.0)
@@ -140,7 +140,7 @@ class BacktesterPhase2Tests(unittest.TestCase):
         self.assertLess(float(res1.equity.iloc[-1]), float(res0.equity.iloc[-1]))
 
     def test_execution_scenarios_change_costs_conservatively(self) -> None:
-        dates = pd.date_range("2023-01-01", periods=12, freq="D", tz="UTC")
+        dates = pd.date_range("2023-01-01", periods=45, freq="D", tz="UTC")
         candles = {sym: _make_daily_frame(dates, base=100.0 + idx) for idx, sym in enumerate(["AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT", "EEEUSDT"])}
         md = _FakeMD(candles)
         targets = PortfolioTargets(weights={"AAAUSDT": 0.5, "BBBUSDT": -0.5}, notionals_usd={"AAAUSDT": 5000.0, "BBBUSDT": -5000.0}, meta={})
@@ -161,7 +161,7 @@ class BacktesterPhase2Tests(unittest.TestCase):
         self.assertGreater(float(res_mix.equity.iloc[-1]), float(res_tak.equity.iloc[-1]))
 
     def test_backtest_meta_warns_about_survivorship_and_latency_limits(self) -> None:
-        dates = pd.date_range("2023-01-01", periods=12, freq="D", tz="UTC")
+        dates = pd.date_range("2023-01-01", periods=45, freq="D", tz="UTC")
         candles = {sym: _make_daily_frame(dates, base=100.0 + idx) for idx, sym in enumerate(["AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT", "EEEUSDT"])}
         md = _FakeMD(candles)
         cfg = self._base_cfg()

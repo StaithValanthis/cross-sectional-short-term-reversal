@@ -32,7 +32,7 @@ class _FakeMD:
 
 class BacktesterRegressionTests(unittest.TestCase):
     def test_signal_change_updates_holdings_and_turnover(self) -> None:
-        dates = pd.date_range("2023-01-01", periods=6, freq="D", tz="UTC")
+        dates = pd.date_range("2023-01-01", periods=45, freq="D", tz="UTC")
         candles_by_symbol: dict[str, pd.DataFrame] = {}
         for idx, sym in enumerate(["AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT", "EEEUSDT"]):
             closes = [100 + idx + i for i in range(len(dates))]
@@ -51,11 +51,12 @@ class BacktesterRegressionTests(unittest.TestCase):
         cfg = BotConfig.model_validate(
             {
                 "exchange": {"testnet": True, "category": "linear"},
+                "universe": {"min_history_days": 30},
                 "signal": {"lookback_days": 1, "long_quantile": 0.2, "short_quantile": 0.2},
                 "filters": {"regime_filter": {"enabled": False, "use_market_regime": False}},
                 "funding": {"model_in_backtest": False, "filter": {"enabled": False}},
                 "rebalance": {"interval_days": 1},
-                "backtest": {"start_date": "2023-01-01", "end_date": "2023-01-06", "initial_equity": 10000.0},
+                "backtest": {"start_date": "2023-02-04", "end_date": "2023-02-09", "initial_equity": 10000.0},
             }
         )
         md = _FakeMD(candles_by_symbol)
@@ -77,7 +78,7 @@ class BacktesterRegressionTests(unittest.TestCase):
         self.assertGreater(float(res.daily_turnover.iloc[1]), 0.0)
 
     def test_universe_too_small_holds_previous_weights_instead_of_skipping_day(self) -> None:
-        dates = pd.date_range("2023-01-01", periods=6, freq="D", tz="UTC")
+        dates = pd.date_range("2023-01-01", periods=45, freq="D", tz="UTC")
         candles_by_symbol: dict[str, pd.DataFrame] = {}
         for idx, sym in enumerate(["AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT", "EEEUSDT"]):
             closes = [100 + idx + i for i in range(len(dates))]
@@ -96,11 +97,12 @@ class BacktesterRegressionTests(unittest.TestCase):
         cfg = BotConfig.model_validate(
             {
                 "exchange": {"testnet": True, "category": "linear"},
+                "universe": {"min_history_days": 30},
                 "signal": {"lookback_days": 1, "long_quantile": 0.2, "short_quantile": 0.2},
                 "filters": {"regime_filter": {"enabled": False, "use_market_regime": False}},
                 "funding": {"model_in_backtest": False, "filter": {"enabled": False}},
                 "rebalance": {"interval_days": 1},
-                "backtest": {"start_date": "2023-01-01", "end_date": "2023-01-06", "initial_equity": 10000.0},
+                "backtest": {"start_date": "2023-02-04", "end_date": "2023-02-09", "initial_equity": 10000.0},
             }
         )
         md = _FakeMD(candles_by_symbol)
