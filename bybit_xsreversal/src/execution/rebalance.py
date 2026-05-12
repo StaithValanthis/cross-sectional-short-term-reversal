@@ -152,6 +152,52 @@ def _wallet_equity_usdt(wallet: dict[str, Any]) -> float:
         return 0.0
 
 
+def _normalize_order_status(status: Any) -> str:
+    return str(status or "").strip().upper().replace("_", "")
+
+
+def _signed_open_order_pending_qty(open_orders: list[dict[str, Any]]) -> float:
+    """
+    Sum only the REMAINING open quantity for active orders.
+
+    - Fully filled / cancelled / rejected orders contribute 0
+    - Partially filled orders contribute only remaining quantity
+    - Missing status is treated as open because get_open_orders() should already scope to active orders
+    """
+    pending_qty = 0.0
+    for o in open_orders or []:
+        status = _normalize_order_status(o.get("orderStatus"))
+        if status not in ("", "NEW", "PARTIALLYFILLED", "UNTRIGGERED"):
+            continue
+
+        side = str(o.get("side", "")).upper()
+        qty = float(o.get("qty") or o.get("orderQty") or 0.0)
+        filled = float(o.get("cumExecQty") or 0.0)
+        remaining = max(0.0, qty - filled)
+        if remaining <= 1e-12:
+            continue
+
+        if side == "BUY":
+            pending_qty += remaining
+        elif side == "SELL":
+            pending_qty -= remaining
+    return pending_qty
+
+
+def _positions_to_notionals(*, positions: dict[str, Position], md: MarketData) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for sym, pos in positions.items():
+        px = 0.0
+        try:
+            px = float(md.get_orderbook_stats(sym).mid)
+        except Exception:
+            px = float(pos.mark_price) if pos.mark_price > 0 else 0.0
+        if px <= 0:
+            continue
+        out[sym] = float(pos.size) * float(px)
+    return out
+
+
 def apply_turnover_cap(
     *,
     cfg: BotConfig,
@@ -851,15 +897,7 @@ def run_rebalance(
             open_orders = client.get_open_orders(category=cfg.exchange.category, symbol=sym)
             if not open_orders:
                 continue
-            # Sum pending order quantities (positive for buys, negative for sells)
-            pending_qty = 0.0
-            for o in open_orders:
-                side = str(o.get("side", "")).upper()
-                qty = float(o.get("qty") or o.get("orderQty") or 0.0)
-                if side == "BUY":
-                    pending_qty += qty
-                elif side == "SELL":
-                    pending_qty -= qty
+            pending_qty = _signed_open_order_pending_qty(open_orders)
             if abs(pending_qty) > 1e-8:
                 pending_order_adjustments[sym] = pending_qty
                 logger.debug(
@@ -1049,14 +1087,7 @@ def run_rebalance(
             open_orders = client.get_open_orders(category=cfg.exchange.category, symbol=sym)
             if not open_orders:
                 continue
-            pending_qty = 0.0
-            for o in open_orders:
-                side = str(o.get("side", "")).upper()
-                qty = float(o.get("qty") or o.get("orderQty") or 0.0)
-                if side == "BUY":
-                    pending_qty += qty
-                elif side == "SELL":
-                    pending_qty -= qty
+            pending_qty = _signed_open_order_pending_qty(open_orders)
             if abs(pending_qty) > 1e-8:
                 pending_qty_by_symbol[sym] = pending_qty
         except Exception:
@@ -1132,6 +1163,17 @@ def run_rebalance(
     )
     if turnover_cap_info is not None:
         logger.warning("Turnover cap applied: {}", turnover_cap_info)
+
+    flatten_empty_targets = bool(not target_notionals_eff and bool(getattr(cfg.rebalance, "flatten_on_empty_targets", False)))
+    planning_targets = dict(target_notionals_eff)
+    preserve_empty_targets = (
+        not target_notionals_eff
+        and not flatten_empty_targets
+        and not force_close_symbols
+    )
+    if preserve_empty_targets:
+        logger.info("Target book empty and rebalance.flatten_on_empty_targets=false; preserving current positions.")
+        planning_targets = _positions_to_notionals(positions=positions_actual, md=md)
     
     # Adjust positions to account for pending orders
     if pending_qty_by_symbol:
@@ -1160,7 +1202,7 @@ def run_rebalance(
     # The adjustment is only for calculating deltas, not for determining if a position exists
     positions_outside_universe: list[tuple[str, float]] = []
     for sym, pos in positions_actual.items():
-        tgt_notional = target_notionals_eff.get(sym, 0.0)
+        tgt_notional = planning_targets.get(sym, 0.0)
         if abs(tgt_notional) < 1e-8 and abs(pos.size) > 1e-8:
             # Position exists but target is zero (outside universe)
             positions_outside_universe.append((sym, pos.size))
@@ -1198,10 +1240,10 @@ def run_rebalance(
         cfg=cfg,
         md=md,
         current_positions=positions_actual,
-        target_notionals=target_notionals_eff,
+        target_notionals=planning_targets,
         force_close_reasons=force_close_reasons,
     )
-    reconcile_top = _summarize_reconcile(positions=positions_final, target_notionals=target_notionals_eff, md=md, limit=12)
+    reconcile_top = _summarize_reconcile(positions=positions_final, target_notionals=planning_targets, md=md, limit=12)
     if reconcile_top:
         logger.info("Reconcile (top diffs): {}", reconcile_top)
 
@@ -1216,13 +1258,13 @@ def run_rebalance(
             "positions": {k: v.__dict__ for k, v in positions_final.items()},
             "reconcile_top": reconcile_top,
             "canceled_open_orders": canceled,
-            "targets_effective": target_notionals_eff,
+            "targets_effective": planning_targets,
             "risk_exits": {
                 "force_close_reasons": force_close_reasons,
                 "risk_events": [e.__dict__ for e in risk_events],
                 "cooldown_events": [e.__dict__ for e in cooldown_events],
             },
-            "summary": {"target_symbols": len(target_notionals_eff), "current_symbols": len(positions_final), "planned_orders": 0},
+            "summary": {"target_symbols": len(planning_targets), "current_symbols": len(positions_final), "planned_orders": 0},
         }
 
     logger.info("Planned {} orders", len(orders))
@@ -1232,11 +1274,11 @@ def run_rebalance(
         logger.info("Execution quality: {}", ex.execution_quality())
 
     # Summary of position reconciliation
-    positions_in_universe = [s for s in positions_final.keys() if abs(target_notionals_eff.get(s, 0.0)) > 1e-8]
-    positions_outside = [s for s in positions_final.keys() if abs(target_notionals_eff.get(s, 0.0)) < 1e-8]
+    positions_in_universe = [s for s in positions_final.keys() if abs(planning_targets.get(s, 0.0)) > 1e-8]
+    positions_outside = [s for s in positions_final.keys() if abs(planning_targets.get(s, 0.0)) < 1e-8]
     targets_not_open = [
         s
-        for s in target_notionals_eff.keys()
+        for s in planning_targets.keys()
         if s not in positions_final or abs(positions_final.get(s, Position(symbol=s, size=0.0, mark_price=0.0)).size) < 1e-8
     ]
     
@@ -1245,7 +1287,7 @@ def run_rebalance(
         len(positions_final),
         len(positions_in_universe),
         len(positions_outside),
-        len(target_notionals_eff),
+        len(planning_targets),
         len(targets_not_open),
     )
 
@@ -1254,7 +1296,7 @@ def run_rebalance(
         "positions": {k: v.__dict__ for k, v in positions_final.items()},
         "reconcile_top": reconcile_top,
         "canceled_open_orders": canceled,
-        "targets_effective": target_notionals_eff,
+        "targets_effective": planning_targets,
         "risk_exits": {
             "force_close_reasons": force_close_reasons,
             "risk_events": [e.__dict__ for e in risk_events],
@@ -1263,7 +1305,7 @@ def run_rebalance(
         "turnover_cap": turnover_cap_info,
         "execution_quality": ex.execution_quality(),
         "summary": {
-            "target_symbols": len(target_notionals_eff),
+            "target_symbols": len(planning_targets),
             "current_symbols": len(positions_final),
             "positions_in_universe": len(positions_in_universe),
             "positions_outside_universe": len(positions_outside),

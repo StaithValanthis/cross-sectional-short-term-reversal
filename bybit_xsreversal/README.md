@@ -53,6 +53,92 @@ bybit-xsreversal live --config config/config.yaml
 
 Live snapshots are written to `bybit_xsreversal/outputs/live/<timestamp>/rebalance_snapshot.json`.
 
+## Phase 1 test verification
+
+Do not use live trading until the Phase 1 tests pass.
+
+These tests are local unit and regression tests only:
+- They use fakes, mocks, temp directories, and file-content checks.
+- They do not require API keys.
+- They do not place orders.
+- They do not call live exchange endpoints.
+
+### Fastest local command
+
+From `bybit_xsreversal/`:
+
+```bash
+./scripts/test_phase1.sh
+```
+
+Windows PowerShell:
+
+```powershell
+.\scripts\test_phase1.ps1
+```
+
+Equivalent direct command:
+
+```bash
+python -m unittest -v \
+  bybit_xsreversal.tests.test_rebalance_safety \
+  bybit_xsreversal.tests.test_risk_manager \
+  bybit_xsreversal.tests.test_live_interval_risk_exit \
+  bybit_xsreversal.tests.test_backtester_regression \
+  bybit_xsreversal.tests.test_scripts
+```
+
+### What Phase 1 tests cover
+
+- Pending-order exposure and remaining open quantity handling
+- Empty-target flatten and preserve behavior
+- Daily loss reset and persistent drawdown high-water behavior
+- Interval-skip risk-exit-only reconcile behavior
+- Backtester target-weight regression
+- Wrapper-script CLI passthrough for `--dry-run`
+
+### Expected result
+
+Passing output should end with something like:
+
+```text
+Ran 10 tests in ...
+
+OK
+```
+
+Any failure should be treated as a stop sign for live trading.
+
+### Safe Windows PowerShell setup
+
+Python requirement:
+- Python `3.11`
+
+From the repo root:
+
+```powershell
+cd .\bybit_xsreversal
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -e .
+.\scripts\test_phase1.ps1
+```
+
+### Automated verification in GitHub Actions
+
+This repo includes a CI workflow at `.github/workflows/phase1-tests.yml`.
+It runs the Phase 1 test script on push, pull request, or manual dispatch using Python `3.11`.
+It does not use live secrets and will fail if any Phase 1 regression test fails.
+
+### Dry-run only
+
+After tests pass, keep validation in dry-run mode until you are ready for a separate live-readiness step:
+
+```bash
+bybit-xsreversal live --config config/config.yaml --dry-run --run-once
+```
+
 ### Run optimizer manually
 
 The optimizer runs in two stages:
@@ -174,6 +260,7 @@ Operational notes:
   - `BYBIT_TESTNET=true|false` (if set) overrides the config at runtime and is logged on startup
 - If you want the bot to **flatten all existing positions** when the strategy produces an empty target book, set:
   - `rebalance.flatten_on_empty_targets: true`
+  - If `rebalance.flatten_on_empty_targets: false`, an empty target book will preserve current positions rather than flattening them.
 
 ---
 

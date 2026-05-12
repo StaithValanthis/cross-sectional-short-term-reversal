@@ -165,6 +165,61 @@ def _cancel_existing_exit_orders(*, client: BybitClient, symbols: list[str]) -> 
     return canceled
 
 
+def _current_position_targets_from_raw_positions(*, raw_positions: list[dict[str, Any]], md: MarketData) -> dict[str, float]:
+    targets: dict[str, float] = {}
+    for p in raw_positions or []:
+        sym = normalize_symbol(str(p.get("symbol", "")))
+        if not sym:
+            continue
+        side = str(p.get("side", ""))
+        size = float(p.get("size") or 0.0)
+        px = 0.0
+        try:
+            px = float(md.get_orderbook_stats(sym).mid)
+        except Exception:
+            px = float(p.get("markPrice") or p.get("avgPrice") or 0.0)
+        if size == 0.0 or px <= 0.0:
+            continue
+        signed = size if side == "Buy" else -size
+        targets[sym] = float(signed) * float(px)
+    return targets
+
+
+def _run_risk_exit_only_reconcile(
+    *,
+    cfg: BotConfig,
+    client: BybitClient,
+    md: MarketData,
+    risk: RiskManager,
+    dry_run: bool,
+) -> dict[str, Any] | None:
+    equity = fetch_equity_usdt(client=client)
+    if float(equity) <= 0.0:
+        logger.error("Risk-exit-only reconcile skipped: equity is <= 0 USDT.")
+        return None
+
+    ok_risk, risk_info = risk.check(equity)
+    if not ok_risk:
+        logger.error("Risk-exit-only reconcile skipped: risk kill-switch active: {}", risk_info)
+        return None
+
+    raw_positions = client.get_positions(category="linear", settle_coin="USDT")
+    if _has_hedge_mode_positions(raw_positions):
+        logger.warning("Risk-exit-only reconcile skipped: hedge-mode positions detected.")
+        return None
+
+    current_targets = _current_position_targets_from_raw_positions(raw_positions=raw_positions, md=md)
+    if not current_targets:
+        logger.info("Risk-exit-only reconcile skipped: no open positions.")
+        return None
+
+    logger.info(
+        "Scheduled rebalance skipped by interval_days; running risk-exit-only reconcile for {} open symbols.",
+        len(current_targets),
+    )
+    return run_rebalance(cfg=cfg, client=client, md=md, target_notionals=current_targets, dry_run=dry_run)
+
+
 def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bool = False) -> None:
     console = Console()
 
@@ -240,6 +295,13 @@ def run_live(cfg: BotConfig, *, dry_run: bool, run_once: bool = False, force: bo
                                     last_dt.date().isoformat(),
                                     rb_now.date().isoformat(),
                                     days_since_last,
+                                )
+                                _run_risk_exit_only_reconcile(
+                                    cfg=cfg,
+                                    client=client,
+                                    md=md,
+                                    risk=risk,
+                                    dry_run=bool(dry_run),
                                 )
                                 return
                     except Exception as e:

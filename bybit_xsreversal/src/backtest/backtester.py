@@ -148,9 +148,8 @@ def run_backtest(cfg: BotConfig, md: MarketData, outputs_dir: str | Path) -> Bac
                 # Hold prior weights; treat as "no rebalance possible today"
                 continue
             raise
-            w = targets.weights
         else:
-            w = dict(prev_weights)
+            w = dict(targets.weights)
 
         # Turnover in weight space
         syms = set(prev_weights) | set(w)

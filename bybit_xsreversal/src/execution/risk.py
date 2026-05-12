@@ -15,7 +15,7 @@ from src.config import RiskConfig
 class RiskState:
     day: str  # YYYY-MM-DD UTC
     start_equity: float
-    high_water: float
+    high_water: float  # persistent portfolio high-water mark across days
     kill_switch: bool
     # observability / multi-day controls
     consecutive_loss_days: int = 0
@@ -58,10 +58,11 @@ class RiskManager:
                 prev_pnl = prev_last_f - prev_start
                 prev_cons = int(raw.get("consecutive_loss_days", 0) or 0)
                 cons = (prev_cons + 1) if float(prev_pnl) < 0 else 0
+                prev_high_water = float(raw.get("high_water", prev_start) or prev_start)
                 self.state = RiskState(
                     day=day,
                     start_equity=float(current_equity),
-                    high_water=float(current_equity),
+                    high_water=max(prev_high_water, float(current_equity)),
                     kill_switch=False,
                     consecutive_loss_days=int(cons),
                     last_seen_equity=float(current_equity),
