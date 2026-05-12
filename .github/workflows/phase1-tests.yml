@@ -32,4 +32,4 @@ jobs:
           pip install -e .
 
       - name: Run Phase 1 verification tests
-        run: ./scripts/test_phase1.sh
+        run: bash ./scripts/test_phase1.sh
