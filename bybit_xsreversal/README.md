@@ -80,12 +80,7 @@ Windows PowerShell:
 Equivalent direct command:
 
 ```bash
-python -m unittest -v \
-  bybit_xsreversal.tests.test_rebalance_safety \
-  bybit_xsreversal.tests.test_risk_manager \
-  bybit_xsreversal.tests.test_live_interval_risk_exit \
-  bybit_xsreversal.tests.test_backtester_regression \
-  bybit_xsreversal.tests.test_scripts
+python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
 ### What Phase 1 tests cover
@@ -138,6 +133,34 @@ After tests pass, keep validation in dry-run mode until you are ready for a sepa
 ```bash
 bybit-xsreversal live --config config/config.yaml --dry-run --run-once
 ```
+
+## Backtest realism notes
+
+The backtest now applies tighter correctness guardrails before any strategy tuning work:
+
+- Historical symbol eligibility is date-aware within the downloaded candle set.
+- Daily ranking uses historical liquidity proxy data from each backtest date instead of blindly using today’s top symbols at every historical point.
+- This reduces survivorship bias, but does not fully remove it because the backtest still starts from the current downloadable symbol seed.
+- `backtest.allow_partial_fills` is not modeled and must remain `false`.
+- `backtest.execution_scenario` controls fee realism:
+  - `optimistic_maker`
+  - `mixed`
+  - `conservative_taker`
+- `backtest.borrow_cost_bps` applies a daily short borrow drag when set above `0`.
+- `slippage_bps` remains the main proxy for spread and execution latency costs.
+
+Recommended conservative verification command:
+
+```bash
+python -m unittest -v tests.test_backtester_regression tests.test_backtester_phase2
+```
+
+Backtest outputs now include:
+- `gross_daily_returns.csv`
+- `daily_costs.csv`
+- `symbol_contributions.csv`
+
+Do not treat backtest results as live-ready unless the test suite passes and the warnings in `metrics.json` are acceptable for the intended use.
 
 ### Run optimizer manually
 

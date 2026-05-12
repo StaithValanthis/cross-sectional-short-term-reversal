@@ -229,8 +229,9 @@ class BacktestConfig(BaseModel):
     taker_fee_bps: float = 6.0
     maker_fee_bps: float = 1.0
     slippage_bps: float = 3.0
+    execution_scenario: Literal["optimistic_maker", "mixed", "conservative_taker"] = "mixed"
     borrow_cost_bps: float = 0.0
-    allow_partial_fills: bool = True
+    allow_partial_fills: bool = False
     cache_dir: str = "data_cache"
 
 

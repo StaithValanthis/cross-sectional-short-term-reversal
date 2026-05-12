@@ -136,6 +136,7 @@ backtest:
   taker_fee_bps: 6.0
   maker_fee_bps: 1.0
   slippage_bps: 5.0
+  execution_scenario: mixed
   borrow_cost_bps: 0.0
-  allow_partial_fills: true
+  allow_partial_fills: false
   cache_dir: data_cache
