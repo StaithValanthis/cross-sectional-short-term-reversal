@@ -13,6 +13,7 @@ from loguru import logger
 from src.backtest.metrics import BacktestMetrics, compute_metrics
 from src.config import BotConfig
 from src.data.market_data import MarketData
+from src.strategy.portfolio import PortfolioTargets
 from src.strategy.xs_reversal import compute_targets_from_daily_candles
 
 
@@ -164,6 +165,16 @@ class BacktestResult:
 
 
 def run_backtest(cfg: BotConfig, md: MarketData, outputs_dir: str | Path) -> BacktestResult:
+    return run_backtest_with_target_transform(cfg=cfg, md=md, outputs_dir=outputs_dir)
+
+
+def run_backtest_with_target_transform(
+    *,
+    cfg: BotConfig,
+    md: MarketData,
+    outputs_dir: str | Path,
+    target_transform: Any | None = None,
+) -> BacktestResult:
     if bool(getattr(cfg.backtest, "allow_partial_fills", False)):
         raise ValueError(
             "backtest.allow_partial_fills is exposed in config but not modeled in the backtester; set it to false."
@@ -301,6 +312,18 @@ def run_backtest(cfg: BotConfig, md: MarketData, outputs_dir: str | Path) -> Bac
                     else:
                         raise
                 else:
+                    if target_transform is not None:
+                        transformed = target_transform(
+                            weights=dict(targets.weights),
+                            notionals=dict(targets.notionals_usd),
+                            equity_usd=float(equity),
+                            cfg=cfg,
+                            asof=asof.to_pydatetime(),
+                            meta=dict(targets.meta),
+                        )
+                        if not isinstance(transformed, PortfolioTargets):
+                            raise TypeError("target_transform must return PortfolioTargets")
+                        targets = transformed
                     w = dict(targets.weights)
                     rebalance_count += 1
 

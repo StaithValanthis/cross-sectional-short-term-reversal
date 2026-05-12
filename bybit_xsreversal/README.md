@@ -162,6 +162,55 @@ Backtest outputs now include:
 
 Do not treat backtest results as live-ready unless the test suite passes and the warnings in `metrics.json` are acceptable for the intended use.
 
+## Phase 3 research
+
+Phase 3 is research-only. It does not change production defaults or live trading behavior.
+
+The strategy review harness maps the current strategy, runs ablations, evaluates parameter sensitivity, and writes:
+- `phase3_ablation_results.csv`
+- `phase3_sensitivity_results.csv`
+- `phase3_regime_breakdown.csv`
+- `phase3_strategy_review.md`
+
+Example:
+
+```bash
+python scripts/research/phase3_strategy_review.py --config config/config.yaml
+```
+
+Outputs are written under:
+
+```text
+outputs/research/phase3/<timestamp>/
+```
+
+Research mechanics tests:
+
+```bash
+python -m unittest -v tests.test_phase3_research
+```
+
+Fast local runner scripts:
+
+```bash
+./scripts/test_phase3.sh
+```
+
+```powershell
+.\scripts\test_phase3.ps1
+```
+
+The CI-safe smoke coverage is included in `tests.test_phase3_research`:
+- it patches the research runner
+- writes the expected output files
+- verifies:
+  - `phase3_ablation_results.csv`
+  - `phase3_sensitivity_results.csv`
+  - `phase3_regime_breakdown.csv`
+  - `phase3_strategy_review.md`
+
+Phase 3 does not change production defaults. Treat it as diagnostics and reporting only.
+
 ### Run optimizer manually
 
 The optimizer runs in two stages:
