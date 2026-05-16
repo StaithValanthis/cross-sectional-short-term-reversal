@@ -338,7 +338,7 @@ def _run_regime_breakdown(*, cfg: BotConfig, md: MarketData, results: dict[str, 
     proxy_df = md.get_daily_candles(proxy, baseline.daily_returns.index.min(), baseline.daily_returns.index.max(), use_cache=True, cache_write=False)
     close = proxy_df["close"].astype(float).reindex(baseline.daily_returns.index).dropna()
     btc_returns = close.pct_change().dropna()
-    btc_vol = btc_returns.rolling(14, min_periods=5).std(ddof=0).fillna(method="bfill")
+    btc_vol = btc_returns.rolling(14, min_periods=5).std(ddof=0).bfill()
 
     funding_proxy = None
     try:
