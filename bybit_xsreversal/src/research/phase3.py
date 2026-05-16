@@ -219,7 +219,7 @@ def _variant_by_name(variants: list[ResearchVariant], name: str) -> ResearchVari
 def _worst_month(daily_returns: pd.Series) -> tuple[str | None, float]:
     if daily_returns.empty:
         return None, 0.0
-    monthly = daily_returns.groupby(pd.Grouper(freq="M")).apply(lambda s: float((1.0 + s).prod() - 1.0))
+    monthly = daily_returns.groupby(pd.Grouper(freq="ME")).apply(lambda s: float((1.0 + s).prod() - 1.0))
     if monthly.empty:
         return None, 0.0
     idx = monthly.idxmin()
